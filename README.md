@@ -81,7 +81,7 @@ For every batch, Rustium writes to the sink first, persists the source position 
 Requirements:
 
 - Rust `1.88.0` or newer
-- CMake, OpenSSL, and Cyrus SASL development packages for the Kafka client build (`cmake`, `libssl-dev`, and `libsasl2-dev` on Ubuntu)
+- CMake, OpenSSL, libcurl, and Cyrus SASL development packages for the Kafka client build (`cmake`, `libssl-dev`, `libcurl4-openssl-dev`, and `libsasl2-dev` on Ubuntu)
 - Access to PostgreSQL 14+ with logical replication for the ignored PostgreSQL integration test
 - Access to SQL Server 2017+ with CDC and SQL Server Agent for the ignored SQL Server external integration test
 - Docker for the ignored MySQL and SQL Server container integration tests
@@ -472,7 +472,7 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 环境要求：
 
 - Rust `1.88.0` 或更高版本
-- Kafka 客户端构建所需的 CMake、OpenSSL 和 Cyrus SASL 开发包（Ubuntu 上为 `cmake`、`libssl-dev` 和 `libsasl2-dev`）
+- Kafka 客户端构建所需的 CMake、OpenSSL、libcurl 和 Cyrus SASL 开发包（Ubuntu 上为 `cmake`、`libssl-dev`、`libcurl4-openssl-dev` 和 `libsasl2-dev`）
 - 运行被忽略的 PostgreSQL 集成测试时，需要可访问已启用逻辑复制的 PostgreSQL 14+
 - 运行被忽略的 SQL Server 外部集成测试时，需要可访问已启用 CDC 和 SQL Server Agent 的 SQL Server 2017+
 - 运行被忽略的 MySQL 和 SQL Server 容器集成测试时需要 Docker
