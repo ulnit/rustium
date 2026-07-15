@@ -23,6 +23,11 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio-postgres.workspace = true
 
 [lints]
 workspace = true
+
+[[test]]
+name = "postgresql_external"
+path = "tests/postgresql_external.rs"

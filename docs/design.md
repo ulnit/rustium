@@ -62,7 +62,7 @@ The workspace contains a runnable alpha service.
 | SQLite state | Implemented |
 | Native and Debezium JSON | Implemented |
 | stdout and Kafka sinks | Implemented |
-| PostgreSQL source | Implemented and manually integration-tested |
+| PostgreSQL source | Implemented and externally integration-tested with PostgreSQL 17 |
 | MySQL source | Implemented and Docker integration-tested |
 | SQL Server source | Implemented and linked; real-instance verification pending |
 | CLI and HTTP management | Implemented |
@@ -223,7 +223,6 @@ The slot retains changes committed during the snapshot, so no handoff gap exists
 
 #### 9.4 Remaining PostgreSQL gates
 
-- automated PostgreSQL Docker integration test;
 - durable schema history and complete DDL refresh;
 - incremental snapshots and signaling;
 - tombstone records;
@@ -365,6 +364,19 @@ The ignored MySQL Docker test is runnable with:
 cargo test -p rustium-mysql --test mysql_docker -- --ignored --nocapture
 ```
 
+The ignored external PostgreSQL test reads connection settings from the environment and does not contain repository credentials:
+
+```bash
+RUSTIUM_POSTGRES_TEST_HOST=postgres.example.com \
+RUSTIUM_POSTGRES_TEST_PORT=5432 \
+RUSTIUM_POSTGRES_TEST_USER=postgres \
+RUSTIUM_POSTGRES_TEST_PASSWORD='replace-me' \
+RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo \
+cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
+```
+
+This gate creates isolated table/publication/slot names and verifies snapshot rows, snapshot completion, ordered transactional create/update/delete events, the commit boundary, checkpoint restart without snapshot replay, and cleanup. It has passed against PostgreSQL 17 with `wal_level=logical`.
+
 The pending SQL Server Docker gate is runnable where the Microsoft image is available:
 
 ```bash
@@ -373,7 +385,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. Roadmap
 
-1. Close PostgreSQL automated integration, schema, tombstone, incremental-snapshot, and Kafka gates.
+1. Close PostgreSQL schema, tombstone, incremental-snapshot, type/failure-fixture, and Kafka gates.
 2. Close MySQL historical-schema, retry, signaling, TLS-store, type, and Kafka gates.
 3. Complete real-instance verification and failure fixtures for SQL Server CDC snapshot, streaming, recovery, and cleanup handling.
 4. Only then consider additional databases.
@@ -431,7 +443,7 @@ Workspace 已包含可运行的 alpha 服务。
 | SQLite 状态 | 已实现 |
 | 原生和 Debezium JSON | 已实现 |
 | stdout 和 Kafka Sink | 已实现 |
-| PostgreSQL Source | 已实现并完成手工集成验证 |
+| PostgreSQL Source | 已实现并通过 PostgreSQL 17 外部集成测试 |
 | MySQL Source | 已实现并通过 Docker 集成测试 |
 | SQL Server Source | 已实现并接入；真实实例验证待完成 |
 | CLI 和 HTTP 管理 | 已实现 |
@@ -592,7 +604,6 @@ Slot 会保留快照期间提交的变更，因此切换不存在缺口。
 
 #### 9.4 PostgreSQL 剩余门槛
 
-- 自动化 PostgreSQL Docker 集成测试；
 - 持久历史 schema 和完整 DDL 刷新；
 - 增量快照和信号；
 - tombstone；
@@ -734,6 +745,19 @@ stdout 是 best-effort，仅用于开发。Kafka 使用 `librdkafka`，支持可
 cargo test -p rustium-mysql --test mysql_docker -- --ignored --nocapture
 ```
 
+被忽略的 PostgreSQL 外部测试从环境变量读取连接配置，仓库中不包含测试凭据：
+
+```bash
+RUSTIUM_POSTGRES_TEST_HOST=postgres.example.com \
+RUSTIUM_POSTGRES_TEST_PORT=5432 \
+RUSTIUM_POSTGRES_TEST_USER=postgres \
+RUSTIUM_POSTGRES_TEST_PASSWORD='replace-me' \
+RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo \
+cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
+```
+
+该门槛使用隔离的表/publication/slot 名称，验证快照记录、快照完成边界、同一事务内有序的 create/update/delete 事件、commit 边界、checkpoint 重启不重复快照，以及资源清理。测试已在启用 `wal_level=logical` 的 PostgreSQL 17 上通过。
+
 在可以访问 Microsoft 镜像的环境中，可运行待验证 SQL Server Docker 门槛：
 
 ```bash
@@ -742,7 +766,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. 路线图
 
-1. 补齐 PostgreSQL 自动集成、schema、tombstone、增量快照和 Kafka 门槛。
+1. 补齐 PostgreSQL schema、tombstone、增量快照、类型/故障样例和 Kafka 门槛。
 2. 补齐 MySQL 历史 schema、重试、信号、TLS store、类型和 Kafka 门槛。
 3. 完成 SQL Server CDC 快照、流式捕获、恢复和 cleanup 的真实实例验证与故障样例。
 4. 只有完成前三项后才考虑其他数据库。

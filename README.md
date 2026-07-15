@@ -41,7 +41,7 @@ The repository contains a runnable alpha implementation.
 | Native JSON and Debezium-compatible JSON | Implemented |
 | stdout sink | Implemented |
 | Kafka sink with idempotent producer settings | Implemented; end-to-end Kafka test pending |
-| PostgreSQL 14+ snapshot and `pgoutput` streaming | Implemented; manually verified with PostgreSQL 16 |
+| PostgreSQL 14+ snapshot and `pgoutput` streaming | Implemented; external integration test passes with PostgreSQL 17 |
 | MySQL 8+ snapshot and row-binlog streaming | Implemented; Docker integration test passes with MySQL 8.4 |
 | SQL Server CDC | Implemented and linked; real SQL Server integration verification pending |
 | CLI, health, status, stop, and Prometheus endpoints | Implemented |
@@ -82,7 +82,8 @@ Requirements:
 
 - Rust `1.88.0` or newer
 - CMake and OpenSSL development packages for the Kafka client build
-- Docker only for the ignored MySQL integration test
+- Access to PostgreSQL 14+ with logical replication for the ignored PostgreSQL integration test
+- Docker for the ignored MySQL and SQL Server integration tests
 
 ```bash
 cargo build --workspace
@@ -95,6 +96,19 @@ Run the real MySQL 8.4 integration test:
 ```bash
 cargo test -p rustium-mysql --test mysql_docker -- --ignored --nocapture
 ```
+
+Run the external PostgreSQL 14+ integration test without storing credentials in the repository:
+
+```bash
+export RUSTIUM_POSTGRES_TEST_HOST=postgres.example.com
+export RUSTIUM_POSTGRES_TEST_PORT=5432
+export RUSTIUM_POSTGRES_TEST_USER=postgres
+export RUSTIUM_POSTGRES_TEST_PASSWORD='replace-me'
+export RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo
+cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
+```
+
+The test creates uniquely named tables, publications, and managed replication slots. It covers snapshot handoff, transaction ordering and boundaries, checkpoint restart without a repeated snapshot, and resource cleanup.
 
 ### CLI
 
@@ -130,7 +144,7 @@ Implemented behavior:
 
 The source requires `wal_level=logical`, an existing publication, and a user with the required replication and table-read permissions. See [examples/postgresql.yaml](examples/postgresql.yaml).
 
-Known PostgreSQL gaps include incremental snapshots/signaling, tombstones, complete DDL-driven schema refresh, broader type fixtures, and an automated Docker integration test.
+Known PostgreSQL gaps include incremental snapshots/signaling, tombstones, complete DDL-driven schema refresh, broader type and failure fixtures, and Kafka end-to-end recovery coverage.
 
 ### MySQL
 
@@ -286,9 +300,9 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 | 原生 JSON 与 Debezium 兼容 JSON | 已实现 |
 | stdout Sink | 已实现 |
 | 带幂等 Producer 设置的 Kafka Sink | 已实现；Kafka 端到端测试待补 |
-| PostgreSQL 14+ 快照与 `pgoutput` 流式捕获 | 已实现；已用 PostgreSQL 16 手工验证 |
+| PostgreSQL 14+ 快照与 `pgoutput` 流式捕获 | 已实现；PostgreSQL 17 外部集成测试通过 |
 | MySQL 8+ 快照与行级 binlog 流式捕获 | 已实现；MySQL 8.4 Docker 集成测试通过 |
-| SQL Server CDC | 下一个连接器；已有配置模型，运行时尚未接入 |
+| SQL Server CDC | 已实现并接入；真实 SQL Server 集成验证待完成 |
 | CLI、健康、状态、停止和 Prometheus 端点 | 已实现 |
 | 容器镜像、Helm Chart、已发布 crate | 尚未发布 |
 
@@ -327,7 +341,8 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 
 - Rust `1.88.0` 或更高版本
 - Kafka 客户端构建所需的 CMake 和 OpenSSL 开发包
-- 仅在运行被忽略的 MySQL 集成测试时需要 Docker
+- 运行被忽略的 PostgreSQL 集成测试时，需要可访问已启用逻辑复制的 PostgreSQL 14+
+- 运行被忽略的 MySQL 和 SQL Server 集成测试时需要 Docker
 
 ```bash
 cargo build --workspace
@@ -340,6 +355,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```bash
 cargo test -p rustium-mysql --test mysql_docker -- --ignored --nocapture
 ```
+
+运行外部 PostgreSQL 14+ 集成测试，凭据无需存入仓库：
+
+```bash
+export RUSTIUM_POSTGRES_TEST_HOST=postgres.example.com
+export RUSTIUM_POSTGRES_TEST_PORT=5432
+export RUSTIUM_POSTGRES_TEST_USER=postgres
+export RUSTIUM_POSTGRES_TEST_PASSWORD='replace-me'
+export RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo
+cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
+```
+
+测试会创建唯一命名的表、publication 和托管 replication slot，覆盖快照切换、事务顺序与边界、从 checkpoint 重启且不重复快照，以及资源清理。
 
 ### CLI
 
@@ -375,7 +403,7 @@ PostgreSQL 连接器使用逻辑复制和 `pgoutput` 协议版本 2。
 
 Source 需要 `wal_level=logical`、已存在的 publication，以及具备复制和表读取权限的用户。配置示例见 [examples/postgresql.yaml](examples/postgresql.yaml)。
 
-PostgreSQL 已知缺口包括增量快照/信号、tombstone、完整的 DDL 驱动 schema 刷新、更广的类型测试样例，以及自动化 Docker 集成测试。
+PostgreSQL 已知缺口包括增量快照/信号、tombstone、完整的 DDL 驱动 schema 刷新、更广的类型与故障样例，以及 Kafka 端到端恢复覆盖。
 
 ### MySQL
 
