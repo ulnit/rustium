@@ -492,6 +492,65 @@ impl SourceConnector for PostgresSource {
                             );
                         }
                     }
+                    let event_lsn = event.lsn.value();
+                    let transaction_id = match &event.event_type {
+                        EventType::Begin { transaction_id, .. }
+                        | EventType::StreamStart { transaction_id, .. }
+                        | EventType::StreamCommit { transaction_id, .. } => {
+                            Some(u64::from(*transaction_id))
+                        }
+                        _ => state
+                            .transaction
+                            .as_ref()
+                            .map(|transaction| u64::from(transaction.id)),
+                    };
+                    let transaction_commit = matches!(
+                        &event.event_type,
+                        EventType::Commit { .. } | EventType::StreamCommit { .. }
+                    );
+                    if self.config.read_only {
+                        if transaction_commit {
+                            if let Some(transaction_id) = transaction_id {
+                                loop {
+                                    if let Some(closed) =
+                                        incremental.observe_read_only_commit(transaction_id)?
+                                    {
+                                        send_incremental_window(
+                                            &mut state,
+                                            &context.output,
+                                            event_lsn,
+                                            &self.connector_name,
+                                            &self.config,
+                                            closed,
+                                        )
+                                        .await?;
+                                    }
+                                    if !incremental
+                                        .prepare_read_only_continuation(
+                                            &self.config,
+                                            &state.schemas,
+                                        )
+                                        .await?
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        } else if let Some(transaction_id) = transaction_id
+                            && let Some(closed) =
+                                incremental.observe_read_only_event(transaction_id)?
+                        {
+                            send_incremental_window(
+                                &mut state,
+                                &context.output,
+                                event_lsn,
+                                &self.connector_name,
+                                &self.config,
+                                closed,
+                            )
+                            .await?;
+                        }
+                    }
                     if let EventType::Insert { schema, table, data, .. } = &event.event_type
                         && is_signal_table(&self.config, schema, table)
                     {
@@ -503,14 +562,15 @@ impl SourceConnector for PostgresSource {
                             .handle_signal(signal, &self.config, &state.schemas)
                             .await?
                         {
-                            for record in state.incremental_snapshot_records(
-                                event.lsn.value(),
+                            send_incremental_window(
+                                &mut state,
+                                &context.output,
+                                event_lsn,
                                 &self.connector_name,
                                 &self.config,
                                 closed,
-                            ) {
-                                context.output.send(Ok(record)).await.map_err(|_| Error::Cancelled)?;
-                            }
+                            )
+                            .await?;
                         }
                         continue;
                     }
@@ -542,6 +602,23 @@ impl SourceConnector for PostgresSource {
             }
         }
     }
+}
+
+async fn send_incremental_window(
+    state: &mut StreamingState,
+    output: &mpsc::Sender<Result<SourceRecord>>,
+    lsn: u64,
+    connector_name: &str,
+    config: &PostgresSourceConfig,
+    closed: ClosedWindow,
+) -> Result<()> {
+    for record in state.incremental_snapshot_records(lsn, connector_name, config, closed) {
+        output
+            .send(Ok(record))
+            .await
+            .map_err(|_| Error::Cancelled)?;
+    }
+    Ok(())
 }
 
 fn heartbeat_timer(interval: Duration) -> Option<tokio::time::Interval> {
@@ -1781,6 +1858,7 @@ mod tests {
             signal_data_collection: None,
             incremental_snapshot_chunk_size: 1_024,
             incremental_snapshot_watermarking_strategy: "insert_insert".into(),
+            read_only: false,
         };
         let mut source = PostgresSource::new(
             "inventory-postgresql",

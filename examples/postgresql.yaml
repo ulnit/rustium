@@ -20,6 +20,7 @@ source:
   ssl_mode: prefer
   heartbeat_interval: 0s
   heartbeat_topics_prefix: __debezium-heartbeat
+  read_only: false
 
 snapshot:
   mode: initial

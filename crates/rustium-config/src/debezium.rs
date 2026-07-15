@@ -128,6 +128,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 .get("incremental.snapshot.watermarking.strategy")
                 .cloned()
                 .unwrap_or_else(default_incremental_snapshot_watermarking_strategy),
+            read_only: bool_value(&properties, "read.only", false)?,
         }),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -665,6 +666,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "incremental.snapshot.chunk.size",
         "incremental.snapshot.allow.schema.changes",
         "incremental.snapshot.watermarking.strategy",
+        "read.only",
         "offset.storage.file.filename",
         "bootstrap.servers",
         "rustium.sink.type",
@@ -721,6 +723,7 @@ signal.enabled.channels=source
 incremental.snapshot.chunk.size=128
 incremental.snapshot.allow.schema.changes=false
 incremental.snapshot.watermarking.strategy=insert_insert
+read.only=true
 max.queue.size=4096
 max.batch.size=1000
 "#,
@@ -750,6 +753,7 @@ max.batch.size=1000
             source.incremental_snapshot_watermarking_strategy,
             "insert_insert"
         );
+        assert!(source.read_only);
         assert!(!config.format.tombstones_on_delete);
         assert!(
             config

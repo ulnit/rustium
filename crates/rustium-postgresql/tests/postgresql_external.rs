@@ -70,6 +70,7 @@ impl TestSettings {
             signal_data_collection: None,
             incremental_snapshot_chunk_size: 1_024,
             incremental_snapshot_watermarking_strategy: "insert_insert".into(),
+            read_only: false,
         }
     }
 }
@@ -806,6 +807,176 @@ async fn controls_and_deduplicates_filtered_incremental_snapshot() -> TestResult
             return Err(cleanup_error);
         }
         eprintln!("PostgreSQL control test cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn runs_incremental_snapshot_with_read_only_table_permissions() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_readonly_{}", &suffix[..12]);
+    let signal_table = format!("rustium_pg_readonly_signal_{}", &suffix[..12]);
+    let publication = format!("rustium_readonly_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_readonly_slot_{}", &suffix[..12]);
+    let role_name = format!("rustium_readonly_{}", &suffix[..12]);
+    let role_password = format!("RustiumReadOnly{}", &suffix[..16]);
+    let connector_name = format!("postgresql-readonly-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (\
+                    id BIGINT PRIMARY KEY, value TEXT NOT NULL\
+                 ); \
+                 INSERT INTO public.{table_name} \
+                    SELECT id, 'value-' || id::text FROM generate_series(1, 5) AS id; \
+                 CREATE TABLE public.{signal_table} (\
+                    id VARCHAR(128), type VARCHAR(32), data VARCHAR(4096)\
+                 ); \
+                 CREATE PUBLICATION {publication} FOR TABLE \
+                    public.{table_name}, public.{signal_table}; \
+                 CREATE ROLE {role_name} WITH LOGIN REPLICATION PASSWORD '{role_password}'; \
+                 GRANT USAGE ON SCHEMA public TO {role_name}; \
+                 GRANT SELECT ON TABLE public.{table_name}, public.{signal_table} TO {role_name};"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        config.username = role_name.clone();
+        config.password = role_password.clone();
+        config.signal_data_collection = Some(format!("public.{signal_table}"));
+        config.incremental_snapshot_chunk_size = 2;
+        config.read_only = true;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+
+        wait_for_active_slot(&client, &slot_name).await?;
+        let (mut concurrent_client, concurrent_connection_task) = connect(&settings).await?;
+        let concurrent_transaction = concurrent_client.transaction().await?;
+        concurrent_transaction
+            .execute(
+                &format!(
+                    "UPDATE public.{table_name} SET value = value || '-concurrent' WHERE id = 2"
+                ),
+                &[],
+            )
+            .await?;
+        insert_execute_snapshot_signal(&client, &signal_table, &table_name).await?;
+        let capture_result: TestResult = async {
+            loop {
+                let record = receive(&mut output).await?;
+                require(
+                    record.event.is_none(),
+                    "read-only window closed before its in-progress transaction committed",
+                )?;
+                if record.boundary == RecordBoundary::TransactionCommit
+                    && record
+                        .connector_state
+                        .as_ref()
+                        .is_some_and(|state| state.payload.get("incremental_snapshot").is_some())
+                {
+                    break;
+                }
+            }
+            concurrent_transaction.commit().await?;
+
+            let mut snapshot_ids = Vec::new();
+            let mut streaming_update_ids = Vec::new();
+            loop {
+                let record = receive(&mut output).await?;
+                if let Some(event) = record.event {
+                    if event.source.attributes.get("rustium.snapshot.kind")
+                        == Some(&"incremental".into())
+                    {
+                        require_incremental_event(&event, &table_name)?;
+                        snapshot_ids.push(row_id(event.after.as_ref())?);
+                    } else {
+                        require(
+                            event.operation == Operation::Update,
+                            "unexpected read-only streaming event",
+                        )?;
+                        streaming_update_ids.push(row_id(event.after.as_ref())?);
+                    }
+                }
+                if record.boundary == RecordBoundary::TransactionCommit
+                    && record.connector_state.as_ref().is_some_and(|state| {
+                        state.version == 3 && state.payload.get("incremental_snapshot").is_none()
+                    })
+                {
+                    break;
+                }
+            }
+            require(
+                snapshot_ids == [1, 3, 4, 5],
+                "read-only snapshot did not deduplicate its concurrent update",
+            )?;
+            require(
+                streaming_update_ids == [2],
+                "read-only snapshot concurrent WAL update was not emitted exactly once",
+            )?;
+            let signal_counts = client
+                .query_one(
+                    &format!(
+                        "SELECT count(*)::bigint, \
+                                count(*) FILTER (WHERE type LIKE 'snapshot-window-%')::bigint \
+                         FROM public.{signal_table}"
+                    ),
+                    &[],
+                )
+                .await?;
+            require(
+                signal_counts.get::<_, i64>(0) == 1,
+                "read-only incremental snapshot wrote unexpected signal records",
+            )?;
+            require(
+                signal_counts.get::<_, i64>(1) == 0,
+                "read-only incremental snapshot wrote watermark records",
+            )
+        }
+        .await;
+
+        let stop_result = stop_source(cancellation, source_task).await;
+        concurrent_connection_task.abort();
+        combine_capture_and_stop(capture_result, stop_result)
+    }
+    .await;
+
+    let cleanup_result = cleanup(
+        &client,
+        &publication,
+        &slot_name,
+        &[&table_name, &signal_table],
+    )
+    .await;
+    let role_cleanup = client
+        .batch_execute(&format!(
+            "DROP OWNED BY {role_name}; DROP ROLE IF EXISTS {role_name};"
+        ))
+        .await;
+    connection_task.abort();
+
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL read-only cleanup also failed: {cleanup_error}");
+    }
+    if let Err(cleanup_error) = role_cleanup {
+        if outcome.is_ok() {
+            return Err(cleanup_error.into());
+        }
+        eprintln!("PostgreSQL read-only role cleanup also failed: {cleanup_error}");
     }
     outcome
 }

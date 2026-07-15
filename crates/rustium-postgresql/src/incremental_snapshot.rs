@@ -56,6 +56,19 @@ pub(crate) struct ClosedWindow {
     pub(crate) rows: Vec<Row>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PgSnapshot {
+    xmin: u64,
+    xmax: u64,
+    in_progress: Vec<u64>,
+}
+
+#[derive(Debug)]
+struct ReadOnlyWatermarks {
+    low: PgSnapshot,
+    high: PgSnapshot,
+}
+
 pub(crate) struct IncrementalSnapshotController {
     progress: Option<IncrementalSnapshotProgress>,
     connection: Option<PgReplicationConnection>,
@@ -67,6 +80,7 @@ pub(crate) struct IncrementalSnapshotController {
     window_open: bool,
     state_dirty: bool,
     prepare_after_commit: bool,
+    read_only_watermarks: Option<ReadOnlyWatermarks>,
 }
 
 impl IncrementalSnapshotController {
@@ -82,6 +96,7 @@ impl IncrementalSnapshotController {
             window_open: false,
             state_dirty: false,
             prepare_after_commit: false,
+            read_only_watermarks: None,
         }
     }
 
@@ -226,30 +241,24 @@ impl IncrementalSnapshotController {
                 Ok(None)
             }
             Signal::WindowOpen { id } => {
+                if config.read_only {
+                    return Ok(None);
+                }
                 if self.expected_watermark_id("open").as_deref() == Some(id.as_str()) {
                     self.window_open = true;
                 }
                 Ok(None)
             }
             Signal::WindowClose { id } => {
+                if config.read_only {
+                    return Ok(None);
+                }
                 if self.expected_watermark_id("close").as_deref() != Some(id.as_str())
                     || !self.window_open
                 {
                     return Ok(None);
                 }
-                let schema = self.current_schema.take().ok_or_else(|| {
-                    Error::Invariant("incremental snapshot close has no current schema".into())
-                })?;
-                let rows = self.window.drain(..).map(|(_, row)| row).collect();
-                self.window_open = false;
-                self.current_chunk_id = None;
-                self.advance_progress();
-                self.state_dirty = true;
-                self.prepare_after_commit = self
-                    .progress
-                    .as_ref()
-                    .is_some_and(|progress| !progress.paused);
-                Ok(Some(ClosedWindow { schema, rows }))
+                self.close_current_window().map(Some)
             }
             Signal::Unsupported { .. } => Ok(None),
         }
@@ -282,10 +291,51 @@ impl IncrementalSnapshotController {
         config: &PostgresSourceConfig,
         schemas: &HashMap<(String, String), TableSchema>,
     ) -> Result<()> {
-        if std::mem::take(&mut self.prepare_after_commit) {
+        if !config.read_only && std::mem::take(&mut self.prepare_after_commit) {
             self.prepare_current_chunk(config, schemas).await?;
         }
         Ok(())
+    }
+
+    pub(crate) fn observe_read_only_event(
+        &mut self,
+        transaction_id: u64,
+    ) -> Result<Option<ClosedWindow>> {
+        let Some(watermarks) = self.read_only_watermarks.as_ref() else {
+            return Ok(None);
+        };
+        if !self.window_open && transaction_id >= watermarks.low.xmin {
+            self.window_open = true;
+        }
+        if self.window_open && transaction_id > watermarks.high.xmax.max(watermarks.low.xmax) {
+            return self.close_current_window().map(Some);
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn observe_read_only_commit(
+        &mut self,
+        transaction_id: u64,
+    ) -> Result<Option<ClosedWindow>> {
+        let Some(watermarks) = self.read_only_watermarks.as_ref() else {
+            return Ok(None);
+        };
+        if transaction_id == watermarks.high.xmax || transaction_id <= watermarks.high.xmin {
+            return self.close_current_window().map(Some);
+        }
+        Ok(None)
+    }
+
+    pub(crate) async fn prepare_read_only_continuation(
+        &mut self,
+        config: &PostgresSourceConfig,
+        schemas: &HashMap<(String, String), TableSchema>,
+    ) -> Result<bool> {
+        if config.read_only && std::mem::take(&mut self.prepare_after_commit) {
+            self.prepare_current_chunk(config, schemas).await?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub(crate) async fn resume(
@@ -340,13 +390,14 @@ impl IncrementalSnapshotController {
             signal_data_collection: config
                 .signal_data_collection
                 .clone()
-                .ok_or_else(|| Error::Configuration("signal_data_collection is not set".into()))?,
+                .filter(|_| !config.read_only),
             schema: schema.clone(),
             last_key: progress.last_key.clone(),
             maximum_key: progress.maximum_key.clone(),
             additional_condition: progress.additional_conditions.get(collection).cloned(),
             chunk_size: config.incremental_snapshot_chunk_size,
             chunk_id: chunk_id.clone(),
+            read_only: config.read_only,
         };
         let connection = self.connection.take();
         let (connection, prepared) =
@@ -377,6 +428,7 @@ impl IncrementalSnapshotController {
         self.current_chunk_id = Some(chunk_id);
         self.current_schema = Some(schema);
         self.window_open = false;
+        self.read_only_watermarks = prepared.read_only_watermarks;
         Ok(())
     }
 
@@ -401,6 +453,23 @@ impl IncrementalSnapshotController {
         if progress.current_collection >= progress.data_collections.len() {
             self.progress = None;
         }
+    }
+
+    fn close_current_window(&mut self) -> Result<ClosedWindow> {
+        let schema = self.current_schema.take().ok_or_else(|| {
+            Error::Invariant("incremental snapshot close has no current schema".into())
+        })?;
+        let rows = self.window.drain(..).map(|(_, row)| row).collect();
+        self.window_open = false;
+        self.current_chunk_id = None;
+        self.read_only_watermarks = None;
+        self.advance_progress();
+        self.state_dirty = true;
+        self.prepare_after_commit = self
+            .progress
+            .as_ref()
+            .is_some_and(|progress| !progress.paused);
+        Ok(ClosedWindow { schema, rows })
     }
 
     fn stop_snapshot(&mut self, signal_id: &str, patterns: &[String]) -> Result<()> {
@@ -464,6 +533,7 @@ impl IncrementalSnapshotController {
         self.current_chunk_id = None;
         self.window_open = false;
         self.prepare_after_commit = false;
+        self.read_only_watermarks = None;
     }
 }
 
@@ -497,13 +567,14 @@ struct ControlSnapshotData {
 
 struct PrepareChunkInput {
     connection_url: String,
-    signal_data_collection: String,
+    signal_data_collection: Option<String>,
     schema: TableSchema,
     last_key: Option<Vec<String>>,
     maximum_key: Option<Vec<String>>,
     additional_condition: Option<String>,
     chunk_size: usize,
     chunk_id: String,
+    read_only: bool,
 }
 
 struct PreparedChunk {
@@ -511,6 +582,7 @@ struct PreparedChunk {
     chunk_end: Option<Vec<String>>,
     maximum_key: Option<Vec<String>>,
     complete: bool,
+    read_only_watermarks: Option<ReadOnlyWatermarks>,
 }
 
 fn prepare_chunk(
@@ -522,13 +594,24 @@ fn prepare_chunk(
         None => PgReplicationConnection::connect(&input.connection_url)
             .map_err(|error| Error::Source(error.to_string()))?,
     };
-    let signal_table = qualified_name(&input.signal_data_collection)?;
-    insert_watermark(
-        &mut connection,
-        &signal_table,
-        &format!("{}-open", input.chunk_id),
-        WINDOW_OPEN,
-    )?;
+    let (signal_table, low_watermark) = if input.read_only {
+        connection
+            .exec("SELECT pg_current_xact_id()")
+            .map_err(pg_error)?;
+        (None, Some(query_current_snapshot(&mut connection)?))
+    } else {
+        let signal_table =
+            qualified_name(input.signal_data_collection.as_deref().ok_or_else(|| {
+                Error::Configuration("signal_data_collection is not set".into())
+            })?)?;
+        insert_watermark(
+            &mut connection,
+            &signal_table,
+            &format!("{}-open", input.chunk_id),
+            WINDOW_OPEN,
+        )?;
+        (Some(signal_table), None)
+    };
 
     let key_fields = input
         .schema
@@ -609,12 +692,22 @@ fn prepare_chunk(
         .transpose()?;
     let complete = chunk_end.is_none() || chunk_end == maximum_key || rows.len() < input.chunk_size;
 
-    insert_watermark(
-        &mut connection,
-        &signal_table,
-        &format!("{}-close", input.chunk_id),
-        WINDOW_CLOSE,
-    )?;
+    let read_only_watermarks = if let Some(low) = low_watermark {
+        Some(ReadOnlyWatermarks {
+            low,
+            high: query_current_snapshot(&mut connection)?,
+        })
+    } else {
+        insert_watermark(
+            &mut connection,
+            signal_table.as_deref().ok_or_else(|| {
+                Error::Invariant("incremental snapshot signal table is missing".into())
+            })?,
+            &format!("{}-close", input.chunk_id),
+            WINDOW_CLOSE,
+        )?;
+        None
+    };
     Ok((
         connection,
         PreparedChunk {
@@ -622,8 +715,63 @@ fn prepare_chunk(
             chunk_end,
             maximum_key,
             complete,
+            read_only_watermarks,
         },
     ))
+}
+
+fn query_current_snapshot(connection: &mut PgReplicationConnection) -> Result<PgSnapshot> {
+    let result = connection
+        .exec("SELECT pg_current_snapshot()::text")
+        .map_err(pg_error)?;
+    let value = result
+        .get_value(0, 0)
+        .ok_or_else(|| Error::Source("pg_current_snapshot() returned no value".into()))?;
+    parse_pg_snapshot(&value)
+}
+
+fn parse_pg_snapshot(value: &str) -> Result<PgSnapshot> {
+    let mut parts = value.split(':');
+    let xmin = parse_snapshot_xid(parts.next(), value, "xmin")?;
+    let xmax = parse_snapshot_xid(parts.next(), value, "xmax")?;
+    let in_progress = parts
+        .next()
+        .unwrap_or_default()
+        .split(',')
+        .filter(|xid| !xid.is_empty())
+        .map(|xid| {
+            xid.parse::<u64>().map_err(|error| {
+                Error::Source(format!(
+                    "invalid PostgreSQL snapshot in-progress xid {xid:?} in {value:?}: {error}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if parts.next().is_some() {
+        return Err(Error::Source(format!(
+            "invalid PostgreSQL snapshot {value:?}: too many fields"
+        )));
+    }
+    Ok(PgSnapshot {
+        xmin,
+        xmax,
+        in_progress,
+    })
+}
+
+fn parse_snapshot_xid(value: Option<&str>, snapshot: &str, field: &str) -> Result<u64> {
+    value
+        .ok_or_else(|| {
+            Error::Source(format!(
+                "invalid PostgreSQL snapshot {snapshot:?}: missing {field}"
+            ))
+        })?
+        .parse()
+        .map_err(|error| {
+            Error::Source(format!(
+                "invalid PostgreSQL snapshot {field} in {snapshot:?}: {error}"
+            ))
+        })
 }
 
 fn signal_column(row: &RowData, name: &str) -> Result<String> {
@@ -944,6 +1092,27 @@ mod tests {
         );
         assert!(controller.prepare_after_commit);
         assert!(controller.take_state_dirty());
+    }
+
+    #[test]
+    fn parses_postgres_transaction_snapshots() {
+        assert_eq!(
+            parse_pg_snapshot("100:105:101,103").unwrap(),
+            PgSnapshot {
+                xmin: 100,
+                xmax: 105,
+                in_progress: vec![101, 103],
+            }
+        );
+        assert_eq!(
+            parse_pg_snapshot("200:200:").unwrap(),
+            PgSnapshot {
+                xmin: 200,
+                xmax: 200,
+                in_progress: Vec::new(),
+            }
+        );
+        assert!(parse_pg_snapshot("invalid").is_err());
     }
 
     #[test]

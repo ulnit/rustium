@@ -183,16 +183,17 @@ impl SourceConfig {
                     &config.heartbeat_topics_prefix,
                     config.heartbeat_topic_name.as_deref(),
                 );
-                if let Some(signal_data_collection) = &config.signal_data_collection {
+                if config.signal_data_collection.is_some() || config.read_only {
                     semantic
                         .as_object_mut()
                         .expect("source semantic is an object")
                         .insert(
                             "incremental_snapshot".into(),
                             serde_json::json!({
-                                "signal_data_collection": signal_data_collection,
+                                "signal_data_collection": config.signal_data_collection,
                                 "chunk_size": config.incremental_snapshot_chunk_size,
                                 "watermarking_strategy": config.incremental_snapshot_watermarking_strategy,
+                                "read_only": config.read_only,
                             }),
                         );
                 }
@@ -256,6 +257,8 @@ pub struct PostgresSourceConfig {
     pub incremental_snapshot_chunk_size: usize,
     #[serde(default = "default_incremental_snapshot_watermarking_strategy")]
     pub incremental_snapshot_watermarking_strategy: String,
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 impl PostgresSourceConfig {
@@ -1071,7 +1074,7 @@ sink:
         let config = Config::from_yaml(
             &CONFIG.replace(
                 "  password: secret\n",
-                "  password: secret\n  heartbeat_interval: 5s\n  heartbeat_action_query: UPDATE public.heartbeat SET touched_at = now()\n  heartbeat_topics_prefix: __heartbeat\n  heartbeat_topic_name: shared-heartbeat\n",
+                "  password: secret\n  heartbeat_interval: 5s\n  heartbeat_action_query: UPDATE public.heartbeat SET touched_at = now()\n  heartbeat_topics_prefix: __heartbeat\n  heartbeat_topic_name: shared-heartbeat\n  read_only: true\n",
             ),
         )
         .unwrap();
@@ -1086,6 +1089,7 @@ sink:
             source.heartbeat_topic_name.as_deref(),
             Some("shared-heartbeat")
         );
+        assert!(source.read_only);
         assert!(default.source.semantic_config().get("heartbeat").is_none());
         assert_ne!(default.fingerprint(), config.fingerprint());
     }
