@@ -82,9 +82,10 @@ impl Sink for KafkaSink {
                     value: Some(value),
                 });
             }
-            let mut record = FutureRecord::to(&event.destination)
-                .payload(event.payload.as_ref())
-                .headers(headers);
+            let mut record = FutureRecord::to(&event.destination).headers(headers);
+            if let Some(payload) = &event.payload {
+                record = record.payload(payload.as_ref());
+            }
             if let Some(key) = &event.key {
                 record = record.key(key.as_ref());
             }

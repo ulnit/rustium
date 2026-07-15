@@ -276,7 +276,7 @@ impl ConnectorRuntime {
                     .transition(ConnectorState::Snapshotting, None)
                     .await;
             }
-            encoded.push(self.encoder.encode(event)?);
+            encoded.extend(self.encoder.encode_batch(event)?);
         }
         *highest_position = Some(record.position);
         if let Some(state) = record.connector_state {
@@ -381,12 +381,20 @@ impl ConnectorRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
 
     use async_trait::async_trait;
+    use bytes::Bytes;
+    use chrono::Utc;
 
     use super::*;
-    use crate::{ChangeEvent, ConnectorStateEnvelope, Durability, MySqlPosition, RecordBoundary};
+    use crate::{
+        ChangeEvent, ConnectorStateEnvelope, Durability, EventId, EventSchema, MySqlPosition,
+        Operation, RecordBoundary, SourceMetadata,
+    };
 
     struct StateSource {
         record: SourceRecord,
@@ -448,6 +456,64 @@ mod tests {
         }
 
         async fn write(&mut self, _batch: &DeliveryBatch) -> Result<()> {
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BatchEncoder;
+
+    impl EventEncoder for BatchEncoder {
+        fn content_type(&self) -> &'static str {
+            "application/test"
+        }
+
+        fn encode(&self, _event: &ChangeEvent) -> Result<EncodedEvent> {
+            Err(Error::Invariant(
+                "batch encoder must be invoked through encode_batch".into(),
+            ))
+        }
+
+        fn encode_batch(&self, event: &ChangeEvent) -> Result<Vec<EncodedEvent>> {
+            let encoded = |id: EventId, payload| EncodedEvent {
+                id,
+                destination: "orders".into(),
+                key: Some(Bytes::from_static(b"1")),
+                payload,
+                headers: BTreeMap::new(),
+            };
+            Ok(vec![
+                encoded(event.id.clone(), Some(Bytes::from_static(br#"{"op":"d"}"#))),
+                encoded(event.id.derived("tombstone"), None),
+            ])
+        }
+    }
+
+    struct RecordingSink {
+        batch_sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait]
+    impl Sink for RecordingSink {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn durability(&self) -> Durability {
+            Durability::Durable
+        }
+
+        async fn validate(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn write(&mut self, batch: &DeliveryBatch) -> Result<()> {
+            self.batch_sizes.lock().unwrap().push(batch.events.len());
+            assert!(batch.events[0].payload.is_some());
+            assert!(batch.events[1].payload.is_none());
             Ok(())
         }
 
@@ -518,5 +584,79 @@ mod tests {
         assert_eq!(checkpoint.schema_version, CHECKPOINT_SCHEMA_VERSION);
         assert_eq!(checkpoint.source_position, position);
         assert_eq!(checkpoint.connector_state, Some(connector_state));
+    }
+
+    #[tokio::test]
+    async fn checkpoints_after_all_encoded_records_are_delivered_together() {
+        let position = SourcePosition::MySql(MySqlPosition {
+            binlog_filename: "mysql-bin.000001".into(),
+            binlog_position: 256,
+            gtid_set: None,
+            server_id: 1,
+            event_serial: 1,
+            snapshot: false,
+        });
+        let event = ChangeEvent {
+            id: EventId::deterministic("orders", "mysql", &position, "app.orders", 1),
+            source: SourceMetadata {
+                connector: "mysql".into(),
+                connector_name: "orders".into(),
+                database: "app".into(),
+                schema: None,
+                table: Some("orders".into()),
+                snapshot: false,
+                version: "test".into(),
+                attributes: BTreeMap::new(),
+            },
+            position: position.clone(),
+            transaction: None,
+            operation: Operation::Delete,
+            before: None,
+            after: None,
+            schema: EventSchema {
+                name: "orders".into(),
+                version: 1,
+                fields: Vec::new(),
+            },
+            source_time: None,
+            observed_time: Utc::now(),
+        };
+        let source = StateSource {
+            record: SourceRecord {
+                event: Some(event),
+                position: position.clone(),
+                boundary: RecordBoundary::TransactionCommit,
+                connector_state: None,
+            },
+        };
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let status = RuntimeStatus::new("runtime-batch-test");
+        let runtime = ConnectorRuntime::new(
+            ConnectorIdentity::new("runtime-batch-test"),
+            Box::new(source),
+            Arc::new(BatchEncoder),
+            Box::new(RecordingSink {
+                batch_sizes: batch_sizes.clone(),
+            }),
+            store.clone(),
+            RuntimeConfig::default(),
+            status.clone(),
+        );
+
+        runtime.run(CancellationToken::new()).await.unwrap();
+
+        assert_eq!(*batch_sizes.lock().unwrap(), [2]);
+        assert_eq!(
+            store
+                .checkpoint
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .source_position,
+            position
+        );
+        assert_eq!(status.snapshot().await.delivered_events, 2);
     }
 }

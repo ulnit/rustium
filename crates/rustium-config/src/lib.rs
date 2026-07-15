@@ -491,6 +491,8 @@ pub struct FormatConfig {
     pub kind: FormatType,
     #[serde(default = "default_unavailable_value")]
     pub unavailable_value: String,
+    #[serde(default = "default_true")]
+    pub tombstones_on_delete: bool,
 }
 
 impl Default for FormatConfig {
@@ -498,6 +500,7 @@ impl Default for FormatConfig {
         Self {
             kind: FormatType::DebeziumJson,
             unavailable_value: default_unavailable_value(),
+            tombstones_on_delete: true,
         }
     }
 }
@@ -845,6 +848,7 @@ sink:
         let config = Config::from_yaml(CONFIG).unwrap();
         assert_eq!(config.metadata.name, "orders-cdc");
         assert_eq!(config.runtime.max_batch_size, 512);
+        assert!(config.format.tombstones_on_delete);
         assert!(
             config
                 .source
@@ -867,5 +871,14 @@ sink:
         let first = Config::from_yaml(CONFIG).unwrap();
         let second = Config::from_yaml(&CONFIG.replace("secret", "rotated")).unwrap();
         assert_eq!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[test]
+    fn parses_native_tombstone_override() {
+        let config = Config::from_yaml(
+            &CONFIG.replace("sink:\n", "format:\n  tombstones_on_delete: false\nsink:\n"),
+        )
+        .unwrap();
+        assert!(!config.format.tombstones_on_delete);
     }
 }

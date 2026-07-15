@@ -32,7 +32,11 @@ impl Sink for StdoutSink {
 
     async fn write(&mut self, batch: &DeliveryBatch) -> Result<()> {
         for event in &batch.events {
-            self.writer.write_all(&event.payload).await?;
+            if let Some(payload) = &event.payload {
+                self.writer.write_all(payload).await?;
+            } else {
+                self.writer.write_all(b"null").await?;
+            }
             self.writer.write_all(b"\n").await?;
         }
         self.writer.flush().await?;

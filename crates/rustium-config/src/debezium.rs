@@ -243,14 +243,6 @@ fn assemble_config(
     let topic_prefix = required(properties, "topic.prefix")?.to_string();
     let sink = sink_config(properties, &topic_prefix)?;
     warnings.extend(unsupported_warnings(properties));
-    if properties
-        .get("tombstones.on.delete")
-        .is_some_and(|value| value != "false")
-    {
-        warnings.push(
-            "tombstones.on.delete is accepted but tombstone emission is not implemented yet".into(),
-        );
-    }
 
     let config = Config {
         api_version: API_VERSION.into(),
@@ -267,6 +259,7 @@ fn assemble_config(
                 .get("unavailable.value.placeholder")
                 .cloned()
                 .unwrap_or_else(default_unavailable_value),
+            tombstones_on_delete: bool_value(properties, "tombstones.on.delete", true)?,
         },
         sink,
         state: StateConfig {
@@ -626,6 +619,7 @@ slot.name=orders_slot
 publication.name=orders_pub
 table.include.list=public\\.(orders|customers)
 snapshot.mode=initial
+tombstones.on.delete=false
 max.queue.size=4096
 max.batch.size=1000
 "#,
@@ -636,6 +630,13 @@ max.batch.size=1000
         let source = config.source.as_postgresql().unwrap();
         assert!(source.tables.includes("public", "orders"));
         assert!(!source.tables.includes("public", "products"));
+        assert!(!config.format.tombstones_on_delete);
+        assert!(
+            config
+                .compatibility_warnings
+                .iter()
+                .all(|warning| !warning.contains("tombstone"))
+        );
     }
 
     #[test]
@@ -693,5 +694,6 @@ streaming.fetch.size=2048
         assert_eq!(source.databases, ["inventory"]);
         assert_eq!(source.streaming_fetch_size, 2048);
         assert_eq!(source.snapshot_isolation_mode, "snapshot");
+        assert!(config.format.tombstones_on_delete);
     }
 }

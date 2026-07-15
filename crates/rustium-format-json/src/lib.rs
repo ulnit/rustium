@@ -11,6 +11,7 @@ use rustium_core::{
 pub struct JsonEncoderConfig {
     pub topic_prefix: String,
     pub unavailable_value: String,
+    pub tombstones_on_delete: bool,
 }
 
 pub struct RustiumJsonEncoder {
@@ -80,6 +81,29 @@ impl EventEncoder for DebeziumJsonEncoder {
         });
         build_encoded(event, &self.config, payload)
     }
+
+    fn encode_batch(&self, event: &ChangeEvent) -> Result<Vec<EncodedEvent>> {
+        let encoded = self.encode(event)?;
+        if event.operation != Operation::Delete || !self.config.tombstones_on_delete {
+            return Ok(vec![encoded]);
+        }
+
+        let tombstone_id = event.id.derived("debezium-tombstone");
+        let mut tombstone = EncodedEvent {
+            id: tombstone_id.clone(),
+            destination: encoded.destination.clone(),
+            key: encoded.key.clone(),
+            payload: None,
+            headers: encoded.headers.clone(),
+        };
+        tombstone
+            .headers
+            .insert("rustium.event.id".into(), tombstone_id.0);
+        tombstone
+            .headers
+            .insert("rustium.record.type".into(), "tombstone".into());
+        Ok(vec![encoded, tombstone])
+    }
 }
 
 fn build_encoded(
@@ -121,7 +145,7 @@ fn build_encoded(
         id: event.id.clone(),
         destination,
         key,
-        payload: Bytes::from(serde_json::to_vec(&payload)?),
+        payload: Some(Bytes::from(serde_json::to_vec(&payload)?)),
         headers,
     })
 }
@@ -274,13 +298,59 @@ mod tests {
         let encoded = DebeziumJsonEncoder::new(JsonEncoderConfig {
             topic_prefix: "app".into(),
             unavailable_value: "__unavailable".into(),
+            tombstones_on_delete: true,
         })
         .encode(&event())
         .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&encoded.payload).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(encoded.payload.as_ref().unwrap()).unwrap();
         assert_eq!(encoded.destination, "app.app.public.customers");
         assert_eq!(value["op"], "c");
         assert_eq!(value["after"]["name"], "Alice");
         assert!(encoded.key.is_some());
+    }
+
+    #[test]
+    fn emits_delete_envelope_and_null_tombstone() {
+        let mut event = event();
+        event.operation = Operation::Delete;
+        event.before = event.after.take();
+
+        let encoded = DebeziumJsonEncoder::new(JsonEncoderConfig {
+            topic_prefix: "app".into(),
+            unavailable_value: "__unavailable".into(),
+            tombstones_on_delete: true,
+        })
+        .encode_batch(&event)
+        .unwrap();
+
+        assert_eq!(encoded.len(), 2);
+        assert_eq!(encoded[0].destination, encoded[1].destination);
+        assert_eq!(encoded[0].key, encoded[1].key);
+        assert!(encoded[0].payload.is_some());
+        assert!(encoded[1].payload.is_none());
+        assert_ne!(encoded[0].id, encoded[1].id);
+        assert_eq!(
+            encoded[1].headers.get("rustium.record.type"),
+            Some(&"tombstone".into())
+        );
+    }
+
+    #[test]
+    fn can_disable_delete_tombstones() {
+        let mut event = event();
+        event.operation = Operation::Delete;
+        event.before = event.after.take();
+
+        let encoded = DebeziumJsonEncoder::new(JsonEncoderConfig {
+            topic_prefix: "app".into(),
+            unavailable_value: "__unavailable".into(),
+            tombstones_on_delete: false,
+        })
+        .encode_batch(&event)
+        .unwrap();
+
+        assert_eq!(encoded.len(), 1);
+        assert!(encoded[0].payload.is_some());
     }
 }

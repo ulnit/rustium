@@ -49,6 +49,10 @@ pub trait SourceConnector: Send {
 pub trait EventEncoder: Send + Sync {
     fn content_type(&self) -> &'static str;
     fn encode(&self, event: &ChangeEvent) -> Result<EncodedEvent>;
+
+    fn encode_batch(&self, event: &ChangeEvent) -> Result<Vec<EncodedEvent>> {
+        Ok(vec![self.encode(event)?])
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

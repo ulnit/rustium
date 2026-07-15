@@ -38,7 +38,7 @@ The repository contains a runnable alpha implementation.
 | Bounded Tokio pipeline and graceful shutdown | Implemented |
 | At-least-once sink/checkpoint/source acknowledgement ordering | Implemented |
 | SQLite checkpoint v2 with versioned connector state | Implemented and unit tested; v1 JSON remains readable |
-| Native JSON and Debezium-compatible JSON | Implemented |
+| Native JSON and Debezium-compatible JSON, including delete tombstones | Implemented |
 | stdout sink | Implemented |
 | Kafka sink with idempotent producer settings | Implemented; end-to-end Kafka test pending |
 | PostgreSQL 14+ snapshot, `pgoutput`, and persistent schema history | Implemented; destructive-DDL restart gate passes with PostgreSQL 17 |
@@ -141,6 +141,92 @@ cargo test -p rustium-sqlserver --test sqlserver_external -- --ignored --nocaptu
 
 The test creates a uniquely named table and capture instance. It verifies snapshot rows, CDC initialization, ordered transactional create/update/delete events, the commit boundary, checkpoint restart without snapshot replay, and cleanup.
 
+### Embed Rustium in a Rust Project
+
+Running the `rustium` CLI as a separate process is the recommended production boundary. Applications that need in-process lifecycle control or a custom `Sink` can assemble the same public crates used by the CLI.
+
+The crates are not published to crates.io yet, so add the required workspace packages as Git dependencies. Cargo records the resolved commit in `Cargo.lock`; use a `rev` instead of `branch` when your release process requires an explicit source pin.
+
+```toml
+[dependencies]
+rustium-config = { git = "https://github.com/ulnit/rustium", branch = "main" }
+rustium-core = { git = "https://github.com/ulnit/rustium", branch = "main" }
+rustium-format-json = { git = "https://github.com/ulnit/rustium", branch = "main" }
+rustium-postgresql = { git = "https://github.com/ulnit/rustium", branch = "main" }
+rustium-sink-stdout = { git = "https://github.com/ulnit/rustium", branch = "main" }
+rustium-state = { git = "https://github.com/ulnit/rustium", branch = "main" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio-util = "0.7"
+```
+
+Load the same YAML or Debezium `.properties` file used by the CLI, construct the source, encoder, sink, and checkpoint store, then run `ConnectorRuntime` with a cancellation token:
+
+```rust,no_run
+use std::sync::Arc;
+
+use rustium_config::Config;
+use rustium_core::{
+    CheckpointStore, ConnectorIdentity, ConnectorRuntime, Error, EventEncoder, Result,
+    RuntimeConfig, RuntimeStatus,
+};
+use rustium_format_json::{DebeziumJsonEncoder, JsonEncoderConfig};
+use rustium_postgresql::PostgresSource;
+use rustium_sink_stdout::StdoutSink;
+use rustium_state::SqliteCheckpointStore;
+use tokio_util::sync::CancellationToken;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config = Config::load("rustium.yaml")?;
+    let source_config = config.source.as_postgresql().cloned().ok_or_else(|| {
+        Error::Configuration("this application expects a PostgreSQL source".into())
+    })?;
+
+    let source = Box::new(PostgresSource::new(
+        &config.metadata.name,
+        source_config,
+        config.snapshot.clone(),
+    ));
+    let encoder: Arc<dyn EventEncoder> = Arc::new(DebeziumJsonEncoder::new(
+        JsonEncoderConfig {
+            topic_prefix: config.sink.topic_prefix().into(),
+            unavailable_value: config.format.unavailable_value.clone(),
+            tombstones_on_delete: config.format.tombstones_on_delete,
+        },
+    ));
+    let checkpoints: Arc<dyn CheckpointStore> =
+        Arc::new(SqliteCheckpointStore::open(&config.state.path).await?);
+    let status = RuntimeStatus::new(&config.metadata.name);
+    let runtime = ConnectorRuntime::new(
+        ConnectorIdentity::new(&config.metadata.name),
+        source,
+        encoder,
+        Box::new(StdoutSink::default()),
+        checkpoints,
+        RuntimeConfig {
+            channel_capacity: config.runtime.channel_capacity,
+            max_batch_size: config.runtime.max_batch_size,
+            flush_interval: config.runtime.flush_interval,
+            shutdown_timeout: config.runtime.shutdown_timeout,
+            config_fingerprint: config.fingerprint(),
+        },
+        status,
+    );
+
+    let cancellation = CancellationToken::new();
+    let signal_cancellation = cancellation.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        signal_cancellation.cancel();
+    });
+    runtime.run(cancellation).await
+}
+```
+
+The checked source is [crates/rustium-cli/examples/embed_postgresql.rs](crates/rustium-cli/examples/embed_postgresql.rs). Place the connector configuration at `rustium.yaml` and run it with `cargo run -p rustium --example embed_postgresql`.
+
+For MySQL or SQL Server, depend on `rustium-mysql` or `rustium-sqlserver` and construct `MySqlSource` or `SqlServerSource` with the corresponding `SourceConfig` value. Replace `StdoutSink` with `KafkaSink` from `rustium-sink-kafka` for durable Kafka delivery, or implement the async `Sink` trait for application-specific delivery. A custom sink must return from `write` only after the batch is durably accepted; Rustium checkpoints and acknowledges the database source afterward.
+
 ### CLI
 
 ```bash
@@ -179,7 +265,7 @@ The source requires `wal_level=logical`, an existing publication, and a user wit
 
 Checkpoint v1 JSON remains readable, but a completed PostgreSQL v1 checkpoint has no historical Relation baseline and is rejected for resume. Reset it and run one new initial snapshot to establish checkpoint v2 schema history.
 
-Known PostgreSQL gaps include incremental snapshots/signaling, tombstones, transient-column optionality/default reconstruction beyond what `Relation` carries, broader type and failure fixtures, and Kafka end-to-end recovery coverage.
+Known PostgreSQL gaps include incremental snapshots/signaling, transient-column optionality/default reconstruction beyond what `Relation` carries, broader type and failure fixtures, and Kafka end-to-end recovery coverage.
 
 ### MySQL
 
@@ -213,7 +299,7 @@ DDL parsing failures stop the connector by default. Debezium-compatible `schema.
 
 Checkpoint v1 JSON remains readable, but a completed MySQL v1 checkpoint has no historical schema baseline and is rejected for resume. Reset that checkpoint and run a new initial snapshot once to establish checkpoint v2 schema history.
 
-Known MySQL gaps include GTID source include/exclude filters, periodic heartbeat and signaling records, custom trust/key stores, tombstones, incremental snapshots, and wider DDL/type fixtures. Partial JSON updates are marked unavailable when the server enables `binlog_row_value_options=PARTIAL_JSON`.
+Known MySQL gaps include GTID source include/exclude filters, periodic heartbeat and signaling records, custom trust/key stores, incremental snapshots, and wider DDL/type fixtures. Partial JSON updates are marked unavailable when the server enables `binlog_row_value_options=PARTIAL_JSON`.
 
 ### SQL Server
 
@@ -273,6 +359,8 @@ Currently mapped SQL Server properties include:
 - `snapshot.mode`, `snapshot.fetch.size`, `snapshot.isolation.mode`
 - `data.query.mode=direct`, `streaming.fetch.size`
 - `max.queue.size`, `max.batch.size`, `poll.interval.ms`
+
+Common Debezium format properties include `unavailable.value.placeholder` and `tombstones.on.delete`. Tombstones default to enabled in `debezium_json`: each delete envelope is followed in the same delivery batch by the same key with a null value. Set `tombstones.on.delete=false` or native YAML `format.tombstones_on_delete: false` to disable them.
 
 Unsupported properties are reported as compatibility warnings instead of being silently treated as implemented. Rustium-specific source retry, sink, state, server, logging, and Kafka producer settings use the `rustium.*` prefix.
 
@@ -341,7 +429,7 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 | 有界 Tokio 流水线与优雅关闭 | 已实现 |
 | Sink/checkpoint/Source 确认顺序的 at-least-once 语义 | 已实现 |
 | 带版本化连接器状态的 SQLite checkpoint v2 | 已实现并通过单元测试；仍可读取 v1 JSON |
-| 原生 JSON 与 Debezium 兼容 JSON | 已实现 |
+| 原生 JSON 与 Debezium 兼容 JSON，包括 delete tombstone | 已实现 |
 | stdout Sink | 已实现 |
 | 带幂等 Producer 设置的 Kafka Sink | 已实现；Kafka 端到端测试待补 |
 | PostgreSQL 14+ 快照、`pgoutput` 与持久 schema history | 已实现；PostgreSQL 17 破坏性 DDL 重启门槛通过 |
@@ -444,6 +532,92 @@ cargo test -p rustium-sqlserver --test sqlserver_external -- --ignored --nocaptu
 
 测试会创建唯一命名的表和 capture instance，验证快照记录、CDC 初始化、同一事务内有序的 create/update/delete 事件、commit 边界、checkpoint 重启不重复快照，以及资源清理。
 
+### 在 Rust 项目中嵌入 Rustium
+
+生产环境优先推荐将 `rustium` CLI 作为独立进程运行。需要进程内生命周期控制或自定义 `Sink` 的应用，可以直接组装 CLI 使用的公开 crate。
+
+这些 crate 尚未发布到 crates.io，因此先通过 Git 依赖引入所需 workspace package。Cargo 会把实际解析的提交记录在 `Cargo.lock` 中；发布流程需要显式锁定源码时，请将 `branch` 改为具体 `rev`。
+
+```toml
+[dependencies]
+rustium-config = { git = "https://github.com/ulnit/rustium", branch = "main" }
+rustium-core = { git = "https://github.com/ulnit/rustium", branch = "main" }
+rustium-format-json = { git = "https://github.com/ulnit/rustium", branch = "main" }
+rustium-postgresql = { git = "https://github.com/ulnit/rustium", branch = "main" }
+rustium-sink-stdout = { git = "https://github.com/ulnit/rustium", branch = "main" }
+rustium-state = { git = "https://github.com/ulnit/rustium", branch = "main" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio-util = "0.7"
+```
+
+加载 CLI 使用的同一份 YAML 或 Debezium `.properties` 配置，构造 Source、Encoder、Sink 和 checkpoint store，再通过 cancellation token 运行 `ConnectorRuntime`：
+
+```rust,no_run
+use std::sync::Arc;
+
+use rustium_config::Config;
+use rustium_core::{
+    CheckpointStore, ConnectorIdentity, ConnectorRuntime, Error, EventEncoder, Result,
+    RuntimeConfig, RuntimeStatus,
+};
+use rustium_format_json::{DebeziumJsonEncoder, JsonEncoderConfig};
+use rustium_postgresql::PostgresSource;
+use rustium_sink_stdout::StdoutSink;
+use rustium_state::SqliteCheckpointStore;
+use tokio_util::sync::CancellationToken;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config = Config::load("rustium.yaml")?;
+    let source_config = config.source.as_postgresql().cloned().ok_or_else(|| {
+        Error::Configuration("this application expects a PostgreSQL source".into())
+    })?;
+
+    let source = Box::new(PostgresSource::new(
+        &config.metadata.name,
+        source_config,
+        config.snapshot.clone(),
+    ));
+    let encoder: Arc<dyn EventEncoder> = Arc::new(DebeziumJsonEncoder::new(
+        JsonEncoderConfig {
+            topic_prefix: config.sink.topic_prefix().into(),
+            unavailable_value: config.format.unavailable_value.clone(),
+            tombstones_on_delete: config.format.tombstones_on_delete,
+        },
+    ));
+    let checkpoints: Arc<dyn CheckpointStore> =
+        Arc::new(SqliteCheckpointStore::open(&config.state.path).await?);
+    let status = RuntimeStatus::new(&config.metadata.name);
+    let runtime = ConnectorRuntime::new(
+        ConnectorIdentity::new(&config.metadata.name),
+        source,
+        encoder,
+        Box::new(StdoutSink::default()),
+        checkpoints,
+        RuntimeConfig {
+            channel_capacity: config.runtime.channel_capacity,
+            max_batch_size: config.runtime.max_batch_size,
+            flush_interval: config.runtime.flush_interval,
+            shutdown_timeout: config.runtime.shutdown_timeout,
+            config_fingerprint: config.fingerprint(),
+        },
+        status,
+    );
+
+    let cancellation = CancellationToken::new();
+    let signal_cancellation = cancellation.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        signal_cancellation.cancel();
+    });
+    runtime.run(cancellation).await
+}
+```
+
+仓库中持续编译校验的源码位于 [crates/rustium-cli/examples/embed_postgresql.rs](crates/rustium-cli/examples/embed_postgresql.rs)。将连接器配置保存为 `rustium.yaml` 后，可通过 `cargo run -p rustium --example embed_postgresql` 运行。
+
+MySQL 或 SQL Server 项目分别依赖 `rustium-mysql` 或 `rustium-sqlserver`，并使用对应 `SourceConfig` 构造 `MySqlSource` 或 `SqlServerSource`。需要持久 Kafka 投递时，用 `rustium-sink-kafka` 的 `KafkaSink` 替换 `StdoutSink`；应用也可以实现异步 `Sink` trait。自定义 Sink 的 `write` 只有在批次已经持久接收后才能返回，之后 Rustium 才会保存 checkpoint 并确认数据库 Source。
+
 ### CLI
 
 ```bash
@@ -482,7 +656,7 @@ Source 需要 `wal_level=logical`、已存在的 publication，以及具备复�
 
 Checkpoint v1 JSON 仍可读取，但已完成的 PostgreSQL v1 checkpoint 不含历史 Relation 基线，因此会拒绝恢复。升级后需要重置该 checkpoint 并执行一次新的 initial snapshot，以建立 checkpoint v2 schema history。
 
-PostgreSQL 已知缺口包括增量快照/信号、tombstone、超出 `Relation` 信息范围的短暂历史列可空性/default 重建、更广的类型与故障样例，以及 Kafka 端到端恢复覆盖。
+PostgreSQL 已知缺口包括增量快照/信号、超出 `Relation` 信息范围的短暂历史列可空性/default 重建、更广的类型与故障样例，以及 Kafka 端到端恢复覆盖。
 
 ### MySQL
 
@@ -516,7 +690,7 @@ DDL 默认解析失败即停止连接器。可使用 Debezium 兼容参数 `sche
 
 Checkpoint v1 JSON 仍可读取，但已完成的 MySQL v1 checkpoint 不含历史 schema 基线，因此会拒绝恢复。升级后需要重置该 checkpoint 并执行一次新的 initial snapshot，以建立 checkpoint v2 schema history。
 
-MySQL 已知缺口包括 GTID source include/exclude 过滤、周期 heartbeat 和信号记录、自定义 trust/key store、tombstone、增量快照，以及更广的 DDL/类型样例。当服务端启用 `binlog_row_value_options=PARTIAL_JSON` 时，部分 JSON 更新会标记为 unavailable。
+MySQL 已知缺口包括 GTID source include/exclude 过滤、周期 heartbeat 和信号记录、自定义 trust/key store、增量快照，以及更广的 DDL/类型样例。当服务端启用 `binlog_row_value_options=PARTIAL_JSON` 时，部分 JSON 更新会标记为 unavailable。
 
 ### Debezium 配置兼容
 
@@ -553,6 +727,8 @@ Rustium 同时接受严格的原生 YAML 和 Debezium 风格 Java `.properties`�
 - `snapshot.mode`、`snapshot.fetch.size`、`snapshot.isolation.mode`
 - `data.query.mode=direct`、`streaming.fetch.size`
 - `max.queue.size`、`max.batch.size`、`poll.interval.ms`
+
+通用 Debezium 格式参数包括 `unavailable.value.placeholder` 和 `tombstones.on.delete`。在 `debezium_json` 中 tombstone 默认启用：每条 delete envelope 后会在同一个投递批次中追加一条 key 相同、value 为 null 的记录。可通过 `tombstones.on.delete=false` 或原生 YAML 的 `format.tombstones_on_delete: false` 关闭。
 
 未支持的参数会输出兼容性警告，不会被静默伪装成已实现。Rustium 自身的 Source 重试、Sink、状态、Server、日志和 Kafka Producer 设置使用 `rustium.*` 前缀。
 

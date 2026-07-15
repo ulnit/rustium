@@ -210,6 +210,15 @@ impl EventId {
         hasher.update(ordinal.to_be_bytes());
         Self(hex::encode(hasher.finalize()))
     }
+
+    #[must_use]
+    pub fn derived(&self, discriminator: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(self.0.as_bytes());
+        hasher.update([0]);
+        hasher.update(discriminator.as_bytes());
+        Self(hex::encode(hasher.finalize()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,7 +320,7 @@ pub struct EncodedEvent {
     pub id: EventId,
     pub destination: String,
     pub key: Option<Bytes>,
-    pub payload: Bytes,
+    pub payload: Option<Bytes>,
     pub headers: BTreeMap<String, String>,
 }
 

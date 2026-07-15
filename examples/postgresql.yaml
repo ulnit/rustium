@@ -25,6 +25,7 @@ snapshot:
 
 format:
   type: debezium_json
+  tombstones_on_delete: true
 
 sink:
   type: stdout

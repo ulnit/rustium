@@ -171,6 +171,7 @@ fn build_encoder(config: &Config) -> Arc<dyn EventEncoder> {
     let encoder_config = JsonEncoderConfig {
         topic_prefix: config.sink.topic_prefix().into(),
         unavailable_value: config.format.unavailable_value.clone(),
+        tombstones_on_delete: config.format.tombstones_on_delete,
     };
     match config.format.kind {
         FormatType::RustiumJson => Arc::new(RustiumJsonEncoder::new(encoder_config)),
