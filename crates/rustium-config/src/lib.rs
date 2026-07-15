@@ -125,6 +125,7 @@ pub struct Metadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum SourceConfig {
     Postgresql(Box<PostgresSourceConfig>),
     Mysql(MySqlSourceConfig),
@@ -234,6 +235,9 @@ impl SourceConfig {
                     "databases": config.databases,
                     "server_id": config.server_id,
                     "tables": config.tables,
+                    "ssl_ca": config.ssl_ca,
+                    "ssl_cert": config.ssl_cert,
+                    "ssl_key": config.ssl_key,
                     "schema_history_skip_unparseable_ddl": config.schema_history_skip_unparseable_ddl,
                     "gtid_source_includes": config.gtid_source_includes,
                     "gtid_source_excludes": config.gtid_source_excludes,
@@ -491,6 +495,12 @@ pub struct MySqlSourceConfig {
     pub tables: TableSelection,
     #[serde(default = "default_mysql_ssl_mode")]
     pub ssl_mode: String,
+    #[serde(default)]
+    pub ssl_ca: Option<String>,
+    #[serde(default)]
+    pub ssl_cert: Option<String>,
+    #[serde(default)]
+    pub ssl_key: Option<String>,
     #[serde(default = "default_connect_timeout")]
     #[serde(with = "humantime_serde")]
     pub connect_timeout: Duration,
@@ -554,7 +564,19 @@ impl MySqlSourceConfig {
         ) {
             return Err(Error::Configuration(
                 "source.ssl_mode must be one of disabled, preferred, required, verify_ca, or verify_identity"
-                    .into(),
+                .into(),
+            ));
+        }
+        if self.ssl_cert.is_some() != self.ssl_key.is_some() {
+            return Err(Error::Configuration(
+                "source.ssl_cert and source.ssl_key must be configured together".into(),
+            ));
+        }
+        if self.ssl_mode == "disabled"
+            && (self.ssl_ca.is_some() || self.ssl_cert.is_some() || self.ssl_key.is_some())
+        {
+            return Err(Error::Configuration(
+                "source.ssl_ca/ssl_cert/ssl_key require an enabled MySQL TLS mode".into(),
             ));
         }
         if self

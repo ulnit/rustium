@@ -275,6 +275,9 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
                 .get("database.ssl.mode")
                 .cloned()
                 .unwrap_or_else(default_mysql_ssl_mode),
+            ssl_ca: properties.get("database.ssl.ca").cloned(),
+            ssl_cert: properties.get("database.ssl.cert").cloned(),
+            ssl_key: properties.get("database.ssl.key").cloned(),
             connect_timeout: duration_ms(
                 properties,
                 "connect.timeout.ms",
@@ -721,6 +724,9 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "database.server.id",
         "database.server.id.offset",
         "database.ssl.mode",
+        "database.ssl.ca",
+        "database.ssl.cert",
+        "database.ssl.key",
         "database.include.list",
         "database.exclude.list",
         "gtid.source.includes",
@@ -990,6 +996,9 @@ database.hostname=mysql
 database.user=rustium
 database.password=secret
 database.server.id=7001
+database.ssl.ca=/etc/mysql/ca.pem
+database.ssl.cert=/etc/mysql/client.pem
+database.ssl.key=/etc/mysql/client-key.pem
 database.include.list=inventory
 table.include.list=inventory\.(orders|customers)
 topic.prefix=inventory
@@ -1009,6 +1018,9 @@ topic.heartbeat.name=shared-heartbeat
         .unwrap();
         let source = config.source.as_mysql().unwrap();
         assert_eq!(source.server_id, 7001);
+        assert_eq!(source.ssl_ca.as_deref(), Some("/etc/mysql/ca.pem"));
+        assert_eq!(source.ssl_cert.as_deref(), Some("/etc/mysql/client.pem"));
+        assert_eq!(source.ssl_key.as_deref(), Some("/etc/mysql/client-key.pem"));
         assert_eq!(source.databases, ["inventory"]);
         assert!(!source.connect_keep_alive);
         assert_eq!(
@@ -1099,6 +1111,47 @@ signal.consumer.security.protocol=SASL_SSL
                 .compatibility_warnings
                 .iter()
                 .any(|warning| { warning.contains("signal.consumer.*") })
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_mysql_tls_material() {
+        let config = parse(
+            r#"
+name=mysql
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+database.ssl.mode=required
+database.ssl.cert=/etc/mysql/client.pem
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            config
+                .to_string()
+                .contains("source.ssl_cert and source.ssl_key")
+        );
+
+        let config = parse(
+            r#"
+name=mysql
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+database.ssl.mode=disabled
+database.ssl.ca=/etc/mysql/ca.pem
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            config
+                .to_string()
+                .contains("require an enabled MySQL TLS mode")
         );
     }
 
