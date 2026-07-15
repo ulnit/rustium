@@ -565,8 +565,8 @@ async fn resumes_signal_incremental_snapshot_from_chunk_checkpoint() -> TestResu
                         test_error("completed incremental snapshot has no connector state")
                     })?;
                     require(
-                        state.version == 2,
-                        "PostgreSQL connector state did not upgrade to version 2",
+                        state.version == 3,
+                        "PostgreSQL connector state did not upgrade to version 3",
                     )?;
                     require(
                         state.payload.get("incremental_snapshot").is_none(),
@@ -604,6 +604,212 @@ async fn resumes_signal_incremental_snapshot_from_chunk_checkpoint() -> TestResu
     outcome
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn controls_and_deduplicates_filtered_incremental_snapshot() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_control_{}", &suffix[..12]);
+    let signal_table = format!("rustium_pg_control_signal_{}", &suffix[..12]);
+    let trigger_function = format!("rustium_pg_control_fn_{}", &suffix[..12]);
+    let publication = format!("rustium_control_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_control_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-control-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome = async {
+        client
+            .batch_execute(&format!(
+                r#"CREATE TABLE public.{table_name} (
+                       id BIGINT PRIMARY KEY, value TEXT NOT NULL
+                   );
+                   INSERT INTO public.{table_name}
+                       SELECT id, 'value-' || id::text FROM generate_series(1, 10) AS id;
+                   CREATE TABLE public.{signal_table} (
+                       id VARCHAR(128), type VARCHAR(32), data VARCHAR(4096)
+                   );
+                   CREATE FUNCTION public.{trigger_function}() RETURNS trigger AS $function$
+                   BEGIN
+                       IF NEW.type = 'snapshot-window-open' AND NEW.id LIKE '%-1-open' THEN
+                           UPDATE public.{table_name}
+                           SET value = value || '-updated'
+                           WHERE id = 2;
+                       ELSIF NEW.type = 'snapshot-window-close' AND NEW.id LIKE '%-1-close' THEN
+                           INSERT INTO public.{signal_table} (id, type, data)
+                           VALUES ('pause-from-trigger', 'pause-snapshot', '{{"type":"incremental"}}');
+                       ELSIF NEW.type = 'snapshot-window-close' AND NEW.id LIKE '%-2-close' THEN
+                           INSERT INTO public.{signal_table} (id, type, data)
+                           VALUES (
+                               'stop-from-trigger',
+                               'stop-snapshot',
+                               '{{"type":"incremental","data-collections":["public\\.{table_name}"]}}'
+                           );
+                       END IF;
+                       RETURN NEW;
+                   END;
+                   $function$ LANGUAGE plpgsql;
+                   CREATE TRIGGER rustium_control_signal_trigger
+                   AFTER INSERT ON public.{signal_table}
+                   FOR EACH ROW EXECUTE FUNCTION public.{trigger_function}();
+                   CREATE PUBLICATION {publication} FOR TABLE
+                       public.{table_name}, public.{signal_table};"#
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        config.signal_data_collection = Some(format!("public.{signal_table}"));
+        config.incremental_snapshot_chunk_size = 2;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+
+        wait_for_active_slot(&client, &slot_name).await?;
+        let execute_data = serde_json::json!({
+            "type": "incremental",
+            "data-collections": [format!(r"public\.{table_name}")],
+            "additional-conditions": [{
+                "data-collection": format!(r"public\.{table_name}"),
+                "filter": "id % 2 = 0"
+            }]
+        })
+        .to_string();
+        insert_signal(
+            &client,
+            &signal_table,
+            "controlled-snapshot",
+            "execute-snapshot",
+            &execute_data,
+        )
+        .await?;
+
+        let capture_result: TestResult = async {
+            let mut snapshot_ids = Vec::new();
+            let mut streaming_update_ids = Vec::new();
+            loop {
+                let record = receive(&mut output).await?;
+                if let Some(event) = record.event {
+                    require(
+                        event.source.table.as_deref() == Some(table_name.as_str()),
+                        "PostgreSQL control signal table leaked as a business event",
+                    )?;
+                    if event.source.attributes.get("rustium.snapshot.kind")
+                        == Some(&"incremental".into())
+                    {
+                        snapshot_ids.push(row_id(event.after.as_ref())?);
+                    } else {
+                        require(
+                            event.operation == Operation::Update,
+                            "unexpected streaming event during incremental snapshot",
+                        )?;
+                        streaming_update_ids.push(row_id(event.after.as_ref())?);
+                    }
+                }
+                if record.boundary == RecordBoundary::TransactionCommit
+                    && record.connector_state.as_ref().is_some_and(|state| {
+                        state
+                            .payload
+                            .pointer("/incremental_snapshot/paused")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                    })
+                {
+                    break;
+                }
+            }
+            require(
+                snapshot_ids == [4],
+                "first filtered chunk was not deduplicated against its WAL update",
+            )?;
+            require(
+                streaming_update_ids == [2],
+                "concurrent WAL update was not emitted exactly once",
+            )?;
+
+            require(
+                tokio::time::timeout(Duration::from_millis(300), output.recv())
+                    .await
+                    .is_err(),
+                "paused PostgreSQL incremental snapshot continued reading chunks",
+            )?;
+            insert_signal(
+                &client,
+                &signal_table,
+                "resume-from-test",
+                "resume-snapshot",
+                r#"{"type":"incremental"}"#,
+            )
+            .await?;
+
+            let mut resumed_ids = Vec::new();
+            loop {
+                let record = receive(&mut output).await?;
+                if let Some(event) = record.event {
+                    require_incremental_event(&event, &table_name)?;
+                    resumed_ids.push(row_id(event.after.as_ref())?);
+                }
+                if record.boundary == RecordBoundary::TransactionCommit
+                    && record.connector_state.as_ref().is_some_and(|state| {
+                        state.version == 3
+                            && state.payload.get("incremental_snapshot").is_none()
+                    })
+                {
+                    break;
+                }
+            }
+            require(
+                resumed_ids == [6, 8],
+                "resume or scoped stop produced the wrong filtered rows",
+            )?;
+            require(
+                tokio::time::timeout(Duration::from_millis(300), output.recv())
+                    .await
+                    .is_err(),
+                "stopped PostgreSQL incremental snapshot emitted another chunk",
+            )
+        }
+        .await;
+
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)
+    }
+    .await;
+
+    let function_cleanup = client
+        .batch_execute(&format!(
+            "DROP FUNCTION IF EXISTS public.{trigger_function}() CASCADE"
+        ))
+        .await;
+    let cleanup_result = cleanup(
+        &client,
+        &publication,
+        &slot_name,
+        &[&table_name, &signal_table],
+    )
+    .await;
+    connection_task.abort();
+
+    if let Err(cleanup_error) = function_cleanup {
+        if outcome.is_ok() {
+            return Err(cleanup_error.into());
+        }
+        eprintln!("PostgreSQL control function cleanup also failed: {cleanup_error}");
+    }
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL control test cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
 async fn insert_execute_snapshot_signal(
     client: &Client,
     signal_table: &str,
@@ -616,6 +822,16 @@ async fn insert_execute_snapshot_signal(
         "data-collections": [format!(r"public\.{table_name}")],
     })
     .to_string();
+    insert_signal(client, signal_table, &id, signal_type, &data).await
+}
+
+async fn insert_signal(
+    client: &Client,
+    signal_table: &str,
+    id: &str,
+    signal_type: &str,
+    data: &str,
+) -> TestResult {
     client
         .execute(
             &format!("INSERT INTO public.{signal_table} (id, type, data) VALUES ($1, $2, $3)"),

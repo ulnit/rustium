@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use indexmap::IndexMap;
 use pg_walstream::{
@@ -15,6 +15,9 @@ use crate::{
 };
 
 const EXECUTE_SNAPSHOT: &str = "execute-snapshot";
+const STOP_SNAPSHOT: &str = "stop-snapshot";
+const PAUSE_SNAPSHOT: &str = "pause-snapshot";
+const RESUME_SNAPSHOT: &str = "resume-snapshot";
 const WINDOW_OPEN: &str = "snapshot-window-open";
 const WINDOW_CLOSE: &str = "snapshot-window-close";
 
@@ -23,6 +26,17 @@ pub(crate) enum Signal {
     Execute {
         id: String,
         data_collections: Vec<String>,
+        additional_conditions: Vec<AdditionalCondition>,
+    },
+    Stop {
+        id: String,
+        data_collections: Vec<String>,
+    },
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
     },
     WindowOpen {
         id: String,
@@ -104,10 +118,44 @@ impl IncrementalSnapshotController {
                         "PostgreSQL execute-snapshot signal {id:?} has no data-collections"
                     )));
                 }
+                if request
+                    .surrogate_key
+                    .as_deref()
+                    .is_some_and(|key| !key.trim().is_empty())
+                {
+                    return Err(Error::Source(format!(
+                        "PostgreSQL execute-snapshot signal {id:?} does not yet support surrogate-key"
+                    )));
+                }
+                for condition in &request.additional_conditions {
+                    if condition.data_collection.trim().is_empty()
+                        || condition.filter.trim().is_empty()
+                    {
+                        return Err(Error::Source(format!(
+                            "PostgreSQL execute-snapshot signal {id:?} has an empty additional-condition"
+                        )));
+                    }
+                }
                 Ok(Signal::Execute {
                     id,
                     data_collections: request.data_collections,
+                    additional_conditions: request.additional_conditions,
                 })
+            }
+            STOP_SNAPSHOT => {
+                let request = control_snapshot_data(row, &id)?;
+                Ok(Signal::Stop {
+                    id,
+                    data_collections: request.data_collections,
+                })
+            }
+            PAUSE_SNAPSHOT => {
+                control_snapshot_data(row, &id)?;
+                Ok(Signal::Pause { id })
+            }
+            RESUME_SNAPSHOT => {
+                control_snapshot_data(row, &id)?;
+                Ok(Signal::Resume { id })
             }
             WINDOW_OPEN => Ok(Signal::WindowOpen { id }),
             WINDOW_CLOSE => Ok(Signal::WindowClose { id }),
@@ -125,23 +173,56 @@ impl IncrementalSnapshotController {
             Signal::Execute {
                 id,
                 data_collections,
+                additional_conditions,
             } => {
                 if self.progress.is_some() {
                     return Err(Error::Source(format!(
                         "PostgreSQL execute-snapshot signal {id:?} arrived while another incremental snapshot is active"
                     )));
                 }
-                let expanded = expand_data_collections(&data_collections, schemas)?;
+                let (expanded, additional_conditions) =
+                    expand_data_collections(&data_collections, &additional_conditions, schemas)?;
                 self.progress = Some(IncrementalSnapshotProgress {
                     signal_id: id,
                     data_collections: expanded,
+                    additional_conditions,
                     current_collection: 0,
                     last_key: None,
                     maximum_key: None,
                     chunk_sequence: 1,
+                    paused: false,
                 });
                 self.state_dirty = true;
                 self.prepare_current_chunk(config, schemas).await?;
+                Ok(None)
+            }
+            Signal::Stop {
+                id,
+                data_collections,
+            } => {
+                self.stop_snapshot(&id, &data_collections)?;
+                Ok(None)
+            }
+            Signal::Pause { id } => {
+                if let Some(progress) = self.progress.as_mut()
+                    && !progress.paused
+                {
+                    progress.paused = true;
+                    self.prepare_after_commit = false;
+                    self.state_dirty = true;
+                    tracing::info!(%id, "PostgreSQL incremental snapshot paused");
+                }
+                Ok(None)
+            }
+            Signal::Resume { id } => {
+                if let Some(progress) = self.progress.as_mut()
+                    && progress.paused
+                {
+                    progress.paused = false;
+                    self.prepare_after_commit = self.current_schema.is_none();
+                    self.state_dirty = true;
+                    tracing::info!(%id, "PostgreSQL incremental snapshot resumed");
+                }
                 Ok(None)
             }
             Signal::WindowOpen { id } => {
@@ -164,7 +245,10 @@ impl IncrementalSnapshotController {
                 self.current_chunk_id = None;
                 self.advance_progress();
                 self.state_dirty = true;
-                self.prepare_after_commit = self.progress.is_some();
+                self.prepare_after_commit = self
+                    .progress
+                    .as_ref()
+                    .is_some_and(|progress| !progress.paused);
                 Ok(Some(ClosedWindow { schema, rows }))
             }
             Signal::Unsupported { .. } => Ok(None),
@@ -209,7 +293,11 @@ impl IncrementalSnapshotController {
         config: &PostgresSourceConfig,
         schemas: &HashMap<(String, String), TableSchema>,
     ) -> Result<()> {
-        if self.progress.is_some() {
+        if self
+            .progress
+            .as_ref()
+            .is_some_and(|progress| !progress.paused)
+        {
             self.prepare_current_chunk(config, schemas).await?;
         }
         Ok(())
@@ -256,6 +344,7 @@ impl IncrementalSnapshotController {
             schema: schema.clone(),
             last_key: progress.last_key.clone(),
             maximum_key: progress.maximum_key.clone(),
+            additional_condition: progress.additional_conditions.get(collection).cloned(),
             chunk_size: config.incremental_snapshot_chunk_size,
             chunk_id: chunk_id.clone(),
         };
@@ -313,6 +402,69 @@ impl IncrementalSnapshotController {
             self.progress = None;
         }
     }
+
+    fn stop_snapshot(&mut self, signal_id: &str, patterns: &[String]) -> Result<()> {
+        let Some(progress) = self.progress.as_mut() else {
+            return Ok(());
+        };
+        let patterns = compile_patterns(patterns, "stop-snapshot data-collections")?;
+        let stop_all = patterns.is_empty();
+        let current_index = progress.current_collection;
+        let current = progress.data_collections.get(current_index).cloned();
+        let mut retained_before_current = 0;
+        let mut removed_current = false;
+        let mut removed = false;
+        let mut retained = Vec::with_capacity(progress.data_collections.len());
+
+        for (index, collection) in progress.data_collections.iter().enumerate() {
+            let matches = stop_all || patterns.iter().any(|pattern| pattern.is_match(collection));
+            if matches {
+                removed = true;
+                removed_current |= index == current_index;
+            } else {
+                if index < current_index {
+                    retained_before_current += 1;
+                }
+                retained.push(collection.clone());
+            }
+        }
+        if !removed {
+            return Ok(());
+        }
+
+        progress
+            .additional_conditions
+            .retain(|collection, _| retained.contains(collection));
+        progress.data_collections = retained;
+        if progress.data_collections.is_empty() {
+            self.progress = None;
+            self.clear_current_chunk();
+        } else {
+            progress.current_collection =
+                retained_before_current.min(progress.data_collections.len() - 1);
+            if removed_current || current.as_deref().is_none() {
+                progress.last_key = None;
+                progress.maximum_key = None;
+                progress.chunk_sequence += 1;
+                let paused = progress.paused;
+                self.clear_current_chunk();
+                self.prepare_after_commit = !paused;
+            }
+        }
+        self.state_dirty = true;
+        tracing::info!(%signal_id, "PostgreSQL incremental snapshot collections stopped");
+        Ok(())
+    }
+
+    fn clear_current_chunk(&mut self) {
+        self.window.clear();
+        self.current_schema = None;
+        self.current_chunk_end = None;
+        self.current_chunk_complete = false;
+        self.current_chunk_id = None;
+        self.window_open = false;
+        self.prepare_after_commit = false;
+    }
 }
 
 #[derive(Deserialize)]
@@ -320,6 +472,26 @@ impl IncrementalSnapshotController {
 struct ExecuteSnapshotData {
     #[serde(default, rename = "type")]
     snapshot_type: Option<String>,
+    data_collections: Vec<String>,
+    #[serde(default)]
+    additional_conditions: Vec<AdditionalCondition>,
+    #[serde(default)]
+    surrogate_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct AdditionalCondition {
+    data_collection: String,
+    filter: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ControlSnapshotData {
+    #[serde(default, rename = "type")]
+    snapshot_type: Option<String>,
+    #[serde(default)]
     data_collections: Vec<String>,
 }
 
@@ -329,6 +501,7 @@ struct PrepareChunkInput {
     schema: TableSchema,
     last_key: Option<Vec<String>>,
     maximum_key: Option<Vec<String>>,
+    additional_condition: Option<String>,
     chunk_size: usize,
     chunk_id: String,
 }
@@ -369,13 +542,20 @@ fn prepare_chunk(
         .map(|field| quote_ident(&field.name).map_err(pg_error))
         .collect::<Result<Vec<_>>>()?;
     let table = qualified_table(&input.schema.schema, &input.schema.table)?;
+    let condition = input
+        .additional_condition
+        .as_deref()
+        .map(|condition| format!("({condition})"));
     let maximum_key = match input.maximum_key {
         Some(maximum_key) => Some(maximum_key),
         None => query_key(
             &mut connection,
             &format!(
-                "SELECT {} FROM {table} ORDER BY {} DESC LIMIT 1",
+                "SELECT {} FROM {table}{} ORDER BY {} DESC LIMIT 1",
                 text_projection(&key_fields)?,
+                condition
+                    .as_ref()
+                    .map_or_else(String::new, |condition| format!(" WHERE {condition}")),
                 key_columns.join(", ")
             ),
             key_fields.len(),
@@ -383,7 +563,7 @@ fn prepare_chunk(
     };
 
     let projection = text_projection(&input.schema.event_schema.fields.iter().collect::<Vec<_>>())?;
-    let mut predicates = Vec::new();
+    let mut predicates = condition.into_iter().collect::<Vec<_>>();
     if let Some(last_key) = &input.last_key {
         predicates.push(row_predicate(&key_columns, ">", last_key)?);
     }
@@ -453,18 +633,44 @@ fn signal_column(row: &RowData, name: &str) -> Result<String> {
         .ok_or_else(|| Error::Source(format!("PostgreSQL signal has no text {name} column")))
 }
 
+fn control_snapshot_data(row: &RowData, id: &str) -> Result<ControlSnapshotData> {
+    let data = signal_column(row, "data")?;
+    let request: ControlSnapshotData = serde_json::from_str(&data).map_err(|error| {
+        Error::Source(format!(
+            "PostgreSQL snapshot control signal {id:?} has invalid JSON data: {error}"
+        ))
+    })?;
+    if request
+        .snapshot_type
+        .as_deref()
+        .is_some_and(|kind| !kind.eq_ignore_ascii_case("incremental"))
+    {
+        return Err(Error::Source(format!(
+            "PostgreSQL snapshot control signal {id:?} supports only type=incremental"
+        )));
+    }
+    Ok(request)
+}
+
 fn expand_data_collections(
     patterns: &[String],
+    additional_conditions: &[AdditionalCondition],
     schemas: &HashMap<(String, String), TableSchema>,
-) -> Result<Vec<String>> {
-    let patterns = patterns
+) -> Result<(Vec<String>, BTreeMap<String, String>)> {
+    let patterns = compile_patterns(patterns, "execute-snapshot data-collections")?;
+    let conditions = additional_conditions
         .iter()
-        .map(|pattern| {
-            regex::Regex::new(&format!("^(?:{pattern})$")).map_err(|error| {
-                Error::Source(format!(
-                    "invalid data-collections pattern {pattern:?}: {error}"
-                ))
-            })
+        .map(|condition| {
+            regex::RegexBuilder::new(&format!("^(?:{})$", condition.data_collection))
+                .case_insensitive(true)
+                .build()
+                .map(|pattern| (pattern, condition.filter.clone()))
+                .map_err(|error| {
+                    Error::Source(format!(
+                        "invalid additional-condition data-collection pattern {:?}: {error}",
+                        condition.data_collection
+                    ))
+                })
         })
         .collect::<Result<Vec<_>>>()?;
     let mut matches = schemas
@@ -479,7 +685,27 @@ fn expand_data_collections(
             "execute-snapshot signal selected no captured PostgreSQL tables".into(),
         ));
     }
-    Ok(matches)
+    let expanded_conditions = matches
+        .iter()
+        .filter_map(|collection| {
+            conditions
+                .iter()
+                .find(|(pattern, _)| pattern.is_match(collection))
+                .map(|(_, filter)| (collection.clone(), filter.clone()))
+        })
+        .collect();
+    Ok((matches, expanded_conditions))
+}
+
+fn compile_patterns(patterns: &[String], context: &str) -> Result<Vec<regex::Regex>> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            regex::Regex::new(&format!("^(?:{pattern})$")).map_err(|error| {
+                Error::Source(format!("invalid {context} pattern {pattern:?}: {error}"))
+            })
+        })
+        .collect()
 }
 
 fn row_key(row: &Row, schema: &TableSchema) -> Option<String> {
@@ -636,18 +862,88 @@ mod tests {
 
     #[test]
     fn parses_execute_snapshot_signal() {
-        let mut row = RowData::new();
-        row.push(Arc::from("id"), ColumnValue::text("snapshot-1"));
-        row.push(Arc::from("type"), ColumnValue::text(EXECUTE_SNAPSHOT));
-        row.push(
-            Arc::from("data"),
-            ColumnValue::text(r#"{"type":"incremental","data-collections":["public\\.orders"]}"#),
+        let row = signal_row(
+            "snapshot-1",
+            EXECUTE_SNAPSHOT,
+            r#"{"type":"incremental","data-collections":["public\\.orders"],"additional-conditions":[{"data-collection":"public\\.orders","filter":"status = 'open'"}]}"#,
         );
         assert!(matches!(
             IncrementalSnapshotController::parse_signal(&row).unwrap(),
-            Signal::Execute { id, data_collections }
-                if id == "snapshot-1" && data_collections == ["public\\.orders"]
+            Signal::Execute {
+                id,
+                data_collections,
+                additional_conditions,
+            }
+                if id == "snapshot-1"
+                    && data_collections == ["public\\.orders"]
+                    && additional_conditions.len() == 1
+                    && additional_conditions[0].filter == "status = 'open'"
         ));
+    }
+
+    #[test]
+    fn parses_snapshot_control_signals_and_rejects_surrogate_keys() {
+        assert!(matches!(
+            IncrementalSnapshotController::parse_signal(&signal_row(
+                "pause-1",
+                PAUSE_SNAPSHOT,
+                r#"{"type":"INCREMENTAL"}"#,
+            ))
+            .unwrap(),
+            Signal::Pause { id } if id == "pause-1"
+        ));
+        assert!(matches!(
+            IncrementalSnapshotController::parse_signal(&signal_row(
+                "stop-1",
+                STOP_SNAPSHOT,
+                r#"{"data-collections":["public\\.orders"]}"#,
+            ))
+            .unwrap(),
+            Signal::Stop { data_collections, .. }
+                if data_collections == ["public\\.orders"]
+        ));
+        let error = IncrementalSnapshotController::parse_signal(&signal_row(
+            "snapshot-2",
+            EXECUTE_SNAPSHOT,
+            r#"{"data-collections":["public\\.orders"],"surrogate-key":"created_at"}"#,
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("surrogate-key"));
+    }
+
+    #[test]
+    fn scoped_stop_removes_current_collection_and_preserves_remaining_work() {
+        let progress = IncrementalSnapshotProgress {
+            signal_id: "snapshot-1".into(),
+            data_collections: vec!["public.orders".into(), "public.customers".into()],
+            additional_conditions: BTreeMap::from([
+                ("public.orders".into(), "status = 'open'".into()),
+                ("public.customers".into(), "active".into()),
+            ]),
+            current_collection: 0,
+            last_key: Some(vec!["42".into()]),
+            maximum_key: Some(vec!["100".into()]),
+            chunk_sequence: 3,
+            paused: false,
+        };
+        let mut controller = IncrementalSnapshotController::new(Some(progress));
+
+        controller
+            .stop_snapshot("stop-1", &[r"public\.orders".into()])
+            .unwrap();
+
+        let progress = controller.progress().unwrap();
+        assert_eq!(progress.data_collections, ["public.customers"]);
+        assert_eq!(progress.current_collection, 0);
+        assert_eq!(progress.last_key, None);
+        assert_eq!(progress.maximum_key, None);
+        assert_eq!(progress.chunk_sequence, 4);
+        assert_eq!(
+            progress.additional_conditions,
+            BTreeMap::from([("public.customers".into(), "active".into())])
+        );
+        assert!(controller.prepare_after_commit);
+        assert!(controller.take_state_dirty());
     }
 
     #[test]
@@ -661,5 +957,13 @@ mod tests {
             .unwrap(),
             "ROW(\"tenant\", \"id\") > ROW('acme', 'it''s-safe')"
         );
+    }
+
+    fn signal_row(id: &str, signal_type: &str, data: &str) -> RowData {
+        let mut row = RowData::new();
+        row.push(Arc::from("id"), ColumnValue::text(id));
+        row.push(Arc::from("type"), ColumnValue::text(signal_type));
+        row.push(Arc::from("data"), ColumnValue::text(data));
+        row
     }
 }

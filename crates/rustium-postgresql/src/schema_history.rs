@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use pg_walstream::RelationColumn;
 use rustium_core::{ConnectorStateEnvelope, Error, EventSchema, FieldSchema, Result};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const POSTGRES_SCHEMA_HISTORY_FORMAT: &str = "rustium.postgresql.schema-history";
-const POSTGRES_SCHEMA_HISTORY_VERSION: u32 = 2;
+const POSTGRES_SCHEMA_HISTORY_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PostgresColumnType {
@@ -32,10 +32,14 @@ impl TableSchema {
 pub(crate) struct IncrementalSnapshotProgress {
     pub(crate) signal_id: String,
     pub(crate) data_collections: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) additional_conditions: BTreeMap<String, String>,
     pub(crate) current_collection: usize,
     pub(crate) last_key: Option<Vec<String>>,
     pub(crate) maximum_key: Option<Vec<String>>,
     pub(crate) chunk_sequence: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) paused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,9 +94,9 @@ pub(crate) fn decode_connector_state(
             envelope.format, POSTGRES_SCHEMA_HISTORY_FORMAT
         )));
     }
-    if !matches!(envelope.version, 1 | POSTGRES_SCHEMA_HISTORY_VERSION) {
+    if !(1..=POSTGRES_SCHEMA_HISTORY_VERSION).contains(&envelope.version) {
         return Err(Error::State(format!(
-            "unsupported PostgreSQL schema history version {}; expected 1 or {}",
+            "unsupported PostgreSQL schema history version {}; expected 1 through {}",
             envelope.version, POSTGRES_SCHEMA_HISTORY_VERSION,
         )));
     }
@@ -231,7 +235,7 @@ mod tests {
         let envelope = encode_schema_history(&schemas).unwrap();
 
         assert_eq!(envelope.format, POSTGRES_SCHEMA_HISTORY_FORMAT);
-        assert_eq!(envelope.version, 2);
+        assert_eq!(envelope.version, 3);
         assert!(envelope.payload.get("incremental_snapshot").is_none());
         assert_eq!(decode_schema_history(&envelope).unwrap(), schemas);
     }
@@ -252,24 +256,56 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_version_two_incremental_snapshot_progress() {
+    fn round_trips_version_three_incremental_snapshot_progress() {
         let table = baseline();
         let schemas = HashMap::from([(table.key(), table)]);
         let progress = IncrementalSnapshotProgress {
             signal_id: "snapshot-1".into(),
             data_collections: vec!["public.orders".into(), "public.customers".into()],
+            additional_conditions: BTreeMap::from([(
+                "public.orders".into(),
+                "status = 'open'".into(),
+            )]),
             current_collection: 1,
             last_key: Some(vec!["acme".into(), "42".into()]),
             maximum_key: Some(vec!["zenith".into(), "9000".into()]),
             chunk_sequence: 7,
+            paused: true,
         };
 
         let envelope = encode_connector_state(&schemas, Some(&progress)).unwrap();
         let decoded = decode_connector_state(&envelope).unwrap();
 
-        assert_eq!(envelope.version, 2);
+        assert_eq!(envelope.version, 3);
         assert_eq!(decoded.schemas, schemas);
         assert_eq!(decoded.incremental_snapshot, Some(progress));
+    }
+
+    #[test]
+    fn reads_version_two_incremental_progress_with_new_defaults() {
+        let table = baseline();
+        let envelope = ConnectorStateEnvelope::new(
+            POSTGRES_SCHEMA_HISTORY_FORMAT,
+            2,
+            serde_json::json!({
+                "tables": [table],
+                "incremental_snapshot": {
+                    "signal_id": "snapshot-2",
+                    "data_collections": ["public.orders"],
+                    "current_collection": 0,
+                    "last_key": ["42"],
+                    "maximum_key": ["100"],
+                    "chunk_sequence": 3
+                }
+            }),
+        );
+
+        let progress = decode_connector_state(&envelope)
+            .unwrap()
+            .incremental_snapshot
+            .unwrap();
+        assert!(progress.additional_conditions.is_empty());
+        assert!(!progress.paused);
     }
 
     #[test]
