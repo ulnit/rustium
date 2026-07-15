@@ -485,6 +485,374 @@ async fn keeps_snapshot_and_streaming_type_conversion_identical() -> TestResult 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with installed extension types"]
+async fn keeps_installed_extension_types_identical_across_snapshot_and_wal() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_extensions_{}", &suffix[..12]);
+    let publication = format!("rustium_ext_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_ext_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-extensions-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome = async {
+        let vector_schema = installed_extension_schema(&client, "vector").await?;
+        let postgis_schema = installed_extension_schema(&client, "postgis").await?;
+        if vector_schema.is_none() && postgis_schema.is_none() {
+            eprintln!(
+                "PostgreSQL extension gate skipped: neither vector nor postgis is installed"
+            );
+            return Ok(());
+        }
+
+        let vector_name = vector_schema
+            .as_deref()
+            .map(|schema| qualified_name(schema, "vector"));
+        let halfvec_name = vector_schema
+            .as_deref()
+            .map(|schema| qualified_name(schema, "halfvec"));
+        let sparsevec_name = vector_schema
+            .as_deref()
+            .map(|schema| qualified_name(schema, "sparsevec"));
+        let geometry_name = postgis_schema
+            .as_deref()
+            .map(|schema| qualified_name(schema, "geometry"));
+        let geography_name = postgis_schema
+            .as_deref()
+            .map(|schema| qualified_name(schema, "geography"));
+        let vector_type = type_name_exists(&client, vector_name.as_deref()).await?;
+        let halfvec_type = type_name_exists(&client, halfvec_name.as_deref()).await?;
+        let sparsevec_type = type_name_exists(&client, sparsevec_name.as_deref()).await?;
+        let geometry_type = type_name_exists(&client, geometry_name.as_deref()).await?;
+        let geography_type = type_name_exists(&client, geography_name.as_deref()).await?;
+        require(
+            vector_type || halfvec_type || sparsevec_type || geometry_type || geography_type,
+            "installed PostgreSQL extension has no discoverable test type",
+        )?;
+
+        let mut column_names = vec!["id"];
+        let mut columns = vec!["id BIGINT PRIMARY KEY".to_string()];
+        let mut values = vec!["1".to_string()];
+        if vector_type {
+            let vector_name = vector_name.as_deref().expect("vector type name is present");
+            column_names.push("vector_value");
+            columns.push(format!("vector_value {vector_name}(3) NOT NULL"));
+            values.push(format!("'[1, 2.5, -3]'::{vector_name}"));
+        }
+        if halfvec_type {
+            let halfvec_name = halfvec_name
+                .as_deref()
+                .expect("halfvec type name is present");
+            column_names.push("halfvec_value");
+            columns.push(format!("halfvec_value {halfvec_name}(3) NOT NULL"));
+            values.push(format!("'[1, 2.5, -3]'::{halfvec_name}"));
+        }
+        if sparsevec_type {
+            let sparsevec_name = sparsevec_name
+                .as_deref()
+                .expect("sparsevec type name is present");
+            column_names.push("sparsevec_value");
+            columns.push(format!("sparsevec_value {sparsevec_name}(12) NOT NULL"));
+            values.push(format!("'{{1:1.5, 9:-2}}/12'::{sparsevec_name}"));
+        }
+        if geometry_type {
+            let geometry_name = geometry_name
+                .as_deref()
+                .expect("geometry type name is present");
+            let postgis_schema = postgis_schema
+                .as_deref()
+                .expect("postgis extension schema is present");
+            column_names.push("geometry_value");
+            columns.push(format!(
+                "geometry_value {geometry_name}(Point,4326) NOT NULL"
+            ));
+            values.push(format!(
+                "{}.ST_GeomFromText('POINT(1 2)', 4326)",
+                quote_identifier(postgis_schema)
+            ));
+        }
+        if geography_type {
+            let geography_name = geography_name
+                .as_deref()
+                .expect("geography type name is present");
+            let postgis_schema = postgis_schema
+                .as_deref()
+                .expect("postgis extension schema is present");
+            column_names.push("geography_value");
+            columns.push(format!(
+                "geography_value {geography_name}(Point,4326) NOT NULL"
+            ));
+            values.push(format!(
+                "{}.ST_GeogFromText('SRID=4326;POINT(1 2)')",
+                quote_identifier(postgis_schema)
+            ));
+        }
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} ({}); \
+                 INSERT INTO public.{table_name} ({}) VALUES ({}); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};",
+                columns.join(", "),
+                column_names.join(", "),
+                values.join(", ")
+            ))
+            .await?;
+
+        let config = settings.source_config(&publication, &slot_name, &table_name);
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let capture_result: TestResult<(Row, Row)> = async {
+            let mut snapshot_row = None;
+            loop {
+                let record = receive(&mut output).await?;
+                if record.boundary == RecordBoundary::SnapshotComplete {
+                    break;
+                }
+                require(
+                    record.boundary == RecordBoundary::Data,
+                    "unexpected boundary in PostgreSQL extension snapshot",
+                )?;
+                let event = record
+                    .event
+                    .ok_or_else(|| test_error("extension snapshot record has no event"))?;
+                require(
+                    event.operation == Operation::Read,
+                    "extension snapshot event is not a read",
+                )?;
+                snapshot_row = event.after;
+            }
+            let snapshot_row = snapshot_row
+                .ok_or_else(|| test_error("extension snapshot row was not emitted"))?;
+            wait_for_active_slot(&client, &slot_name).await?;
+            let mut update_values = vec!["2".to_string()];
+            if vector_type {
+                let vector_name = vector_name.as_deref().expect("vector type name is present");
+                update_values.push(format!("'[1, 2.5, -3]'::{vector_name}"));
+            }
+            if halfvec_type {
+                let halfvec_name = halfvec_name
+                    .as_deref()
+                    .expect("halfvec type name is present");
+                update_values.push(format!("'[1, 2.5, -3]'::{halfvec_name}"));
+            }
+            if sparsevec_type {
+                let sparsevec_name = sparsevec_name
+                    .as_deref()
+                    .expect("sparsevec type name is present");
+                update_values.push(format!("'{{1:1.5, 9:-2}}/12'::{sparsevec_name}"));
+            }
+            if geometry_type {
+                let postgis_schema = postgis_schema
+                    .as_deref()
+                    .expect("postgis extension schema is present");
+                update_values.push(format!(
+                    "{}.ST_GeomFromText('POINT(1 2)', 4326)",
+                    quote_identifier(postgis_schema)
+                ));
+            }
+            if geography_type {
+                let postgis_schema = postgis_schema
+                    .as_deref()
+                    .expect("postgis extension schema is present");
+                update_values.push(format!(
+                    "{}.ST_GeogFromText('SRID=4326;POINT(1 2)')",
+                    quote_identifier(postgis_schema)
+                ));
+            }
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO public.{table_name} ({}) VALUES ({})",
+                        column_names.join(", "),
+                        update_values.join(", ")
+                    ),
+                    &[],
+                )
+                .await?;
+            let streaming_row = loop {
+                let record = receive(&mut output).await?;
+                if record.boundary != RecordBoundary::Data {
+                    continue;
+                }
+                let event = record
+                    .event
+                    .ok_or_else(|| test_error("extension streaming record has no event"))?;
+                if event.operation != Operation::Create {
+                    continue;
+                }
+                break event
+                    .after
+                    .ok_or_else(|| test_error("extension streaming row has no after value"))?;
+            };
+            Ok((snapshot_row, streaming_row))
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        let (mut snapshot_row, mut streaming_row) =
+            combine_capture_and_stop(capture_result, stop_result)?;
+        require(
+            snapshot_row.shift_remove("id") == Some(DataValue::Int64(1)),
+            "extension snapshot id is incorrect",
+        )?;
+        require(
+            streaming_row.shift_remove("id") == Some(DataValue::Int64(2)),
+            "extension streaming id is incorrect",
+        )?;
+        require(
+            snapshot_row == streaming_row,
+            "installed PostgreSQL extension conversion differs between snapshot and WAL",
+        )?;
+        if vector_type || halfvec_type {
+            for field in ["vector_value", "halfvec_value"] {
+                if snapshot_row.contains_key(field) {
+                    require(
+                        snapshot_row.get(field)
+                            == Some(&DataValue::Array(vec![
+                                DataValue::Float64(1.0),
+                                DataValue::Float64(2.5),
+                                DataValue::Float64(-3.0),
+                            ])),
+                        "dense pgvector conversion failed",
+                    )?;
+                }
+            }
+        }
+        if sparsevec_type {
+            require(
+                matches!(snapshot_row.get("sparsevec_value"), Some(DataValue::Map(_))),
+                "sparse pgvector conversion failed",
+            )?;
+        }
+        for field in ["geometry_value", "geography_value"] {
+            if snapshot_row.contains_key(field) {
+                require(
+                    matches!(snapshot_row.get(field), Some(DataValue::Bytes(bytes)) if !bytes.is_empty()),
+                    "PostGIS EWKB conversion failed",
+                )?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    let cleanup_result = cleanup(&client, &publication, &slot_name, &[&table_name]).await;
+    connection_task.abort();
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL extension test cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn reconnects_after_replication_backend_termination() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_reconnect_{}", &suffix[..12]);
+    let publication = format!("rustium_reconnect_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_reconnect_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-reconnect-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (id BIGINT PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT INTO public.{table_name} VALUES (1, 'before'); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+        let config = settings.source_config(&publication, &slot_name, &table_name);
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let capture_result: TestResult = async {
+            loop {
+                let record = receive(&mut output).await?;
+                if record.boundary == RecordBoundary::SnapshotComplete {
+                    break;
+                }
+            }
+            let original_pid = wait_for_active_pid(&client, &slot_name).await?;
+            require(
+                client
+                    .query_one("SELECT pg_terminate_backend($1)", &[&original_pid])
+                    .await?
+                    .get::<_, bool>(0),
+                "PostgreSQL did not terminate the replication backend",
+            )?;
+            client
+                .execute(
+                    &format!("INSERT INTO public.{table_name} VALUES (2, 'after-reconnect')"),
+                    &[],
+                )
+                .await?;
+            let mut saw_row = false;
+            loop {
+                let record = receive(&mut output).await?;
+                match record.boundary {
+                    RecordBoundary::Data => {
+                        let event = record
+                            .event
+                            .ok_or_else(|| test_error("reconnect record has no event"))?;
+                        if event.operation == Operation::Create
+                            && event.after.as_ref().and_then(|row| row.get("id"))
+                                == Some(&DataValue::Int64(2))
+                        {
+                            saw_row = true;
+                        }
+                    }
+                    RecordBoundary::TransactionCommit => {
+                        if saw_row {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let reconnected_pid =
+                wait_for_different_active_pid(&client, &slot_name, original_pid).await?;
+            require(
+                reconnected_pid != original_pid,
+                "PostgreSQL replication backend PID did not change after recovery",
+            )
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)
+    }
+    .await;
+
+    let cleanup_result = cleanup(&client, &publication, &slot_name, &[&table_name]).await;
+    connection_task.abort();
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL reconnect test cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
 async fn runs_incremental_snapshot_from_file_signal() -> TestResult {
     let settings = TestSettings::from_env()?;
@@ -2129,6 +2497,80 @@ async fn wait_for_active_slot(client: &Client, slot_name: &str) -> TestResult {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(test_error("replication slot did not become active"))
+}
+
+async fn wait_for_active_pid(client: &Client, slot_name: &str) -> TestResult<i32> {
+    for _ in 0..100 {
+        let active_pid = client
+            .query_opt(
+                "SELECT active_pid FROM pg_replication_slots \
+                 WHERE slot_name = $1 AND active",
+                &[&slot_name],
+            )
+            .await?
+            .and_then(|row| row.get::<_, Option<i32>>(0));
+        if let Some(active_pid) = active_pid {
+            return Ok(active_pid);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(test_error("replication slot has no active backend PID"))
+}
+
+async fn wait_for_different_active_pid(
+    client: &Client,
+    slot_name: &str,
+    previous_pid: i32,
+) -> TestResult<i32> {
+    for _ in 0..300 {
+        let active_pid = client
+            .query_opt(
+                "SELECT active_pid FROM pg_replication_slots \
+                 WHERE slot_name = $1 AND active",
+                &[&slot_name],
+            )
+            .await?
+            .and_then(|row| row.get::<_, Option<i32>>(0));
+        if let Some(active_pid) = active_pid
+            && active_pid != previous_pid
+        {
+            return Ok(active_pid);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(test_error(
+        "replication slot did not reconnect with a different backend PID",
+    ))
+}
+
+async fn installed_extension_schema(client: &Client, name: &str) -> TestResult<Option<String>> {
+    Ok(client
+        .query_opt(
+            "SELECT n.nspname FROM pg_extension e \
+             JOIN pg_namespace n ON n.oid = e.extnamespace \
+             WHERE e.extname = $1",
+            &[&name],
+        )
+        .await?
+        .map(|row| row.get(0)))
+}
+
+async fn type_name_exists(client: &Client, name: Option<&str>) -> TestResult<bool> {
+    let Some(name) = name else {
+        return Ok(false);
+    };
+    Ok(client
+        .query_one("SELECT to_regtype($1) IS NOT NULL", &[&name])
+        .await?
+        .get(0))
+}
+
+fn qualified_name(schema: &str, name: &str) -> String {
+    format!("{}.{}", quote_identifier(schema), quote_identifier(name))
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 async fn connect(
