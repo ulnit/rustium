@@ -9,6 +9,7 @@ use rustium_core::{
 use rustium_format_json::{DebeziumJsonEncoder, JsonEncoderConfig, RustiumJsonEncoder};
 use rustium_mysql::MySqlSource;
 use rustium_postgresql::PostgresSource;
+use rustium_signal_kafka::KafkaSignalChannel;
 use rustium_sink_kafka::KafkaSink;
 use rustium_sink_stdout::StdoutSink;
 use rustium_sqlserver::SqlServerSource;
@@ -81,6 +82,19 @@ async fn run(config: Config) -> Result<()> {
     let status = RuntimeStatus::new(&config.metadata.name);
     let runtime = build_runtime(&config, status.clone()).await?;
     let signal_sender = in_process_signals_enabled(&config).then(|| runtime.signal_sender());
+    let kafka_signal_channel = build_kafka_signal_channel(&config)?;
+    let kafka_signals = kafka_signal_channel.map(|channel| {
+        let sender = runtime.signal_sender();
+        let task_cancel = cancellation.child_token();
+        let shutdown = cancellation.clone();
+        tokio::spawn(async move {
+            let result = channel.run(sender, task_cancel).await;
+            if result.is_err() {
+                shutdown.cancel();
+            }
+            result
+        })
+    });
     let bind: SocketAddr = config.server.bind.parse().map_err(|error| {
         rustium_core::Error::Configuration(format!("invalid server.bind: {error}"))
     })?;
@@ -103,8 +117,15 @@ async fn run(config: Config) -> Result<()> {
     let server_result = server.await.map_err(|error| {
         rustium_core::Error::Source(format!("management server task failed: {error}"))
     })?;
+    let kafka_signal_result = match kafka_signals {
+        Some(task) => task.await.map_err(|error| {
+            rustium_core::Error::Source(format!("Kafka signal task failed: {error}"))
+        })?,
+        None => Ok(()),
+    };
     runtime_result?;
-    server_result
+    server_result?;
+    kafka_signal_result
 }
 
 fn in_process_signals_enabled(config: &Config) -> bool {
@@ -123,8 +144,38 @@ async fn validate(config: Config) -> Result<()> {
     source.validate().await?;
     let mut sink = build_sink(&config)?;
     sink.validate().await?;
+    if let Some(channel) = build_kafka_signal_channel(&config)? {
+        channel.validate().await?;
+    }
     println!("configuration and external dependencies are valid");
     Ok(())
+}
+
+fn build_kafka_signal_channel(config: &Config) -> Result<Option<KafkaSignalChannel>> {
+    let Some(source) = config.source.as_postgresql() else {
+        return Ok(None);
+    };
+    if !source
+        .signal_enabled_channels
+        .iter()
+        .any(|channel| channel == "kafka")
+    {
+        return Ok(None);
+    }
+    let connector_key = config.sink.topic_prefix();
+    let topic = source
+        .signal_kafka_topic
+        .clone()
+        .unwrap_or_else(|| format!("{connector_key}-signal"));
+    KafkaSignalChannel::new(
+        &source.signal_kafka_bootstrap_servers,
+        connector_key,
+        topic,
+        &source.signal_kafka_group_id,
+        source.signal_kafka_poll_timeout,
+        &source.signal_kafka_consumer_properties,
+    )
+    .map(Some)
 }
 
 async fn reset_state(config: Config, confirm: bool) -> Result<()> {
@@ -168,7 +219,7 @@ fn build_source(config: &Config) -> Result<Box<dyn SourceConnector>> {
     match &config.source {
         SourceConfig::Postgresql(source) => Ok(Box::new(PostgresSource::new(
             &config.metadata.name,
-            source.clone(),
+            source.as_ref().clone(),
             config.snapshot.clone(),
         ))),
         SourceConfig::Mysql(source) => Ok(Box::new(MySqlSource::new(

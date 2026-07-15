@@ -15,8 +15,8 @@ use pg_walstream::{
 use rustium_config::{PostgresSourceConfig, SlotOwnership, SnapshotConfig, SnapshotMode};
 use rustium_core::{
     ChangeEvent, DataValue, Error, EventId, EventSchema, FieldSchema, Operation, PostgresPosition,
-    RecordBoundary, Result, Row, SourceConnector, SourceContext, SourceMetadata, SourcePosition,
-    SourceRecord, TransactionMetadata,
+    RecordBoundary, Result, Row, SignalAcknowledgement, SourceConnector, SourceContext,
+    SourceMetadata, SourcePosition, SourceRecord, TransactionMetadata,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -270,6 +270,7 @@ impl PostgresSource {
                     }),
                     boundary: RecordBoundary::SnapshotComplete,
                     connector_state: Some(encode_schema_history(&schemas)?),
+                    signal_acknowledgements: Vec::new(),
                 }))
                 .map_err(|_| Error::Cancelled)?;
             Ok(SnapshotOutcome {
@@ -476,24 +477,27 @@ impl SourceConnector for PostgresSource {
                         &mut incremental,
                         &context.output,
                         last_safe_position.as_ref(),
+                        None,
                     ).await?;
                 }
-                signal = context.signals.recv(),
-                    if signal_channel_enabled(&self.config, "in-process")
+                delivery = context.signals.recv(),
+                    if (signal_channel_enabled(&self.config, "in-process")
+                        || signal_channel_enabled(&self.config, "kafka"))
                         && state.transaction.is_none() =>
                 {
-                    let signal = signal.ok_or_else(|| {
-                        Error::Source("PostgreSQL in-process signal channel closed".into())
+                    let delivery = delivery.ok_or_else(|| {
+                        Error::Source("PostgreSQL runtime signal channel closed".into())
                     })?;
-                    let signal = match IncrementalSnapshotController::parse_external_record(&signal) {
+                    let signal = match IncrementalSnapshotController::parse_external_record(delivery.record()) {
                         Ok(signal) => signal,
                         Err(error) => {
-                            warn!(%error, "invalid PostgreSQL in-process signal ignored");
+                            warn!(%error, "invalid PostgreSQL runtime signal ignored");
+                            delivery.acknowledge();
                             continue;
                         }
                     };
                     if let Signal::Unsupported { id, signal_type } = &signal {
-                        warn!(%id, %signal_type, "unsupported PostgreSQL in-process signal ignored");
+                        warn!(%id, %signal_type, "unsupported PostgreSQL runtime signal ignored");
                     }
                     apply_external_signal(
                         &mut incremental,
@@ -506,6 +510,7 @@ impl SourceConnector for PostgresSource {
                         &mut incremental,
                         &context.output,
                         last_safe_position.as_ref(),
+                        delivery.into_acknowledgement(),
                     ).await?;
                 }
                 event = stream.next_event_with_retry(&context.cancellation) => {
@@ -704,9 +709,13 @@ async fn checkpoint_external_signal_state(
     incremental: &mut IncrementalSnapshotController,
     output: &mpsc::Sender<Result<SourceRecord>>,
     position: Option<&SourcePosition>,
+    acknowledgement: Option<SignalAcknowledgement>,
 ) -> Result<()> {
     let incremental_dirty = incremental.take_state_dirty();
     if !state.schema_dirty && !incremental_dirty {
+        if let Some(acknowledgement) = acknowledgement {
+            acknowledgement.acknowledge();
+        }
         return Ok(());
     }
     let position = position.cloned().ok_or_else(|| {
@@ -721,6 +730,7 @@ async fn checkpoint_external_signal_state(
                 &state.schemas,
                 incremental.progress(),
             )?),
+            signal_acknowledgements: acknowledgement.into_iter().collect(),
         }))
         .await
         .map_err(|_| Error::Cancelled)?;
@@ -897,6 +907,7 @@ fn heartbeat_record(
         position,
         boundary: RecordBoundary::Heartbeat,
         connector_state: None,
+        signal_acknowledgements: Vec::new(),
     }
 }
 
@@ -1268,6 +1279,7 @@ impl StreamingState {
             position,
             boundary: RecordBoundary::TransactionCommit,
             connector_state: None,
+            signal_acknowledgements: Vec::new(),
         }))
     }
 
@@ -2312,6 +2324,11 @@ mod tests {
             signal_enabled_channels: vec!["source".into()],
             signal_file: "file-signals.txt".into(),
             signal_poll_interval: Duration::from_secs(5),
+            signal_kafka_topic: None,
+            signal_kafka_bootstrap_servers: Vec::new(),
+            signal_kafka_group_id: "kafka-signal".into(),
+            signal_kafka_poll_timeout: Duration::from_millis(100),
+            signal_kafka_consumer_properties: BTreeMap::new(),
             incremental_snapshot_chunk_size: 1_024,
             incremental_snapshot_watermarking_strategy: "insert_insert".into(),
             read_only: false,

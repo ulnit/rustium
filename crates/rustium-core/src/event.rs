@@ -301,6 +301,8 @@ pub struct SourceRecord {
     pub boundary: RecordBoundary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connector_state: Option<ConnectorStateEnvelope>,
+    #[serde(skip)]
+    pub signal_acknowledgements: Vec<crate::SignalAcknowledgement>,
 }
 
 impl SourceRecord {
@@ -311,6 +313,7 @@ impl SourceRecord {
             event: Some(event),
             boundary: RecordBoundary::Data,
             connector_state: None,
+            signal_acknowledgements: Vec::new(),
         }
     }
 

@@ -211,6 +211,7 @@ impl SqlServerSource {
                 ),
                 boundary: RecordBoundary::SnapshotComplete,
                 connector_state: None,
+                signal_acknowledgements: Vec::new(),
             }))
             .await
             .map_err(|_| Error::Cancelled)?;
@@ -379,6 +380,7 @@ impl StreamingState {
             ),
             boundary: RecordBoundary::TransactionCommit,
             connector_state: None,
+            signal_acknowledgements: Vec::new(),
         };
         if self.should_skip(&record.position) {
             None
@@ -441,6 +443,7 @@ async fn read_change_batch(
                 ),
                 boundary: RecordBoundary::Heartbeat,
                 connector_state: None,
+                signal_acknowledgements: Vec::new(),
             }]);
         }
         return Ok(Vec::new());

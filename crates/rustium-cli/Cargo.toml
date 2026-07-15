@@ -20,6 +20,7 @@ rustium-format-json = { path = "../rustium-format-json" }
 rustium-mysql = { path = "../rustium-mysql" }
 rustium-postgresql = { path = "../rustium-postgresql" }
 rustium-server = { path = "../rustium-server" }
+rustium-signal-kafka = { path = "../rustium-signal-kafka" }
 rustium-sink-kafka = { path = "../rustium-sink-kafka" }
 rustium-sink-stdout = { path = "../rustium-sink-stdout" }
 rustium-sqlserver = { path = "../rustium-sqlserver" }

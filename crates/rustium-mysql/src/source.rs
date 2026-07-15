@@ -202,6 +202,7 @@ impl MySqlSource {
                     ),
                     boundary: RecordBoundary::SnapshotComplete,
                     connector_state: Some(encode_schema_history(&schemas)?),
+                    signal_acknowledgements: Vec::new(),
                 }))
                 .await
                 .map_err(|_| Error::Cancelled)?;
@@ -480,6 +481,7 @@ impl SourceConnector for MySqlSource {
                     position,
                     boundary: RecordBoundary::Heartbeat,
                     connector_state: Some(encode_schema_history(&self.schemas)?),
+                    signal_acknowledgements: Vec::new(),
                 }))
                 .await
                 .map_err(|_| Error::Cancelled)?;
@@ -648,6 +650,7 @@ fn heartbeat_record(
         position,
         boundary: RecordBoundary::Heartbeat,
         connector_state: None,
+        signal_acknowledgements: Vec::new(),
     }
 }
 
@@ -885,6 +888,7 @@ impl StreamingState {
             position,
             boundary: RecordBoundary::TransactionCommit,
             connector_state: None,
+            signal_acknowledgements: Vec::new(),
         })
     }
 

@@ -126,7 +126,7 @@ pub struct Metadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SourceConfig {
-    Postgresql(PostgresSourceConfig),
+    Postgresql(Box<PostgresSourceConfig>),
     Mysql(MySqlSourceConfig),
     Sqlserver(SqlServerSourceConfig),
 }
@@ -212,6 +212,8 @@ impl SourceConfig {
                                 "enabled_channels": config.signal_enabled_channels,
                                 "file": config.signal_file,
                                 "poll_interval_ms": config.signal_poll_interval.as_millis(),
+                                "kafka_topic": config.signal_kafka_topic,
+                                "kafka_group_id": config.signal_kafka_group_id,
                             }),
                         );
                 }
@@ -285,6 +287,17 @@ pub struct PostgresSourceConfig {
     #[serde(default = "default_signal_poll_interval")]
     #[serde(with = "humantime_serde")]
     pub signal_poll_interval: Duration,
+    #[serde(default)]
+    pub signal_kafka_topic: Option<String>,
+    #[serde(default)]
+    pub signal_kafka_bootstrap_servers: Vec<String>,
+    #[serde(default = "default_signal_kafka_group_id")]
+    pub signal_kafka_group_id: String,
+    #[serde(default = "default_signal_kafka_poll_timeout")]
+    #[serde(with = "humantime_serde")]
+    pub signal_kafka_poll_timeout: Duration,
+    #[serde(default)]
+    pub signal_kafka_consumer_properties: BTreeMap<String, String>,
     #[serde(default = "default_incremental_snapshot_chunk_size")]
     pub incremental_snapshot_chunk_size: usize,
     #[serde(default = "default_incremental_snapshot_watermarking_strategy")]
@@ -344,10 +357,10 @@ impl PostgresSourceConfig {
         }
         if self.signal_enabled_channels.iter().any(|channel| {
             channel.trim().is_empty()
-                || !matches!(channel.as_str(), "source" | "file" | "in-process")
+                || !matches!(channel.as_str(), "source" | "file" | "in-process" | "kafka")
         }) {
             return Err(Error::Configuration(
-                "source.signal_enabled_channels currently supports source, file, and in-process"
+                "source.signal_enabled_channels currently supports source, file, in-process, and kafka"
                     .into(),
             ));
         }
@@ -361,6 +374,49 @@ impl PostgresSourceConfig {
                 "source.signal_file must not be empty when the file signal channel is enabled"
                     .into(),
             ));
+        }
+        if self
+            .signal_enabled_channels
+            .iter()
+            .any(|channel| channel == "kafka")
+        {
+            if self.signal_kafka_bootstrap_servers.is_empty()
+                || self
+                    .signal_kafka_bootstrap_servers
+                    .iter()
+                    .any(|server| server.trim().is_empty())
+            {
+                return Err(Error::Configuration(
+                    "source.signal_kafka_bootstrap_servers must contain at least one server when the kafka signal channel is enabled"
+                        .into(),
+                ));
+            }
+            if self.signal_kafka_group_id.trim().is_empty() {
+                return Err(Error::Configuration(
+                    "source.signal_kafka_group_id must not be empty when the kafka signal channel is enabled"
+                        .into(),
+                ));
+            }
+            if self
+                .signal_kafka_topic
+                .as_deref()
+                .is_some_and(|topic| topic.trim().is_empty())
+            {
+                return Err(Error::Configuration(
+                    "source.signal_kafka_topic must not be empty when configured".into(),
+                ));
+            }
+            for property in ["enable.auto.commit", "enable.auto.offset.store"] {
+                if self
+                    .signal_kafka_consumer_properties
+                    .get(property)
+                    .is_some_and(|value| !value.eq_ignore_ascii_case("false"))
+                {
+                    return Err(Error::Configuration(format!(
+                        "source.signal_kafka_consumer_properties.{property} must be false so signal offsets follow Rustium checkpoints"
+                    )));
+                }
+            }
         }
         if let Some(collection) = &self.signal_data_collection {
             let mut parts = collection.split('.');
@@ -999,6 +1055,12 @@ fn default_signal_file() -> String {
 }
 const fn default_signal_poll_interval() -> Duration {
     Duration::from_secs(5)
+}
+fn default_signal_kafka_group_id() -> String {
+    "kafka-signal".into()
+}
+const fn default_signal_kafka_poll_timeout() -> Duration {
+    Duration::from_millis(100)
 }
 fn default_unavailable_value() -> String {
     "__rustium_unavailable_value".into()

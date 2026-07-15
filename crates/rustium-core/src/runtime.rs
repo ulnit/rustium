@@ -115,7 +115,23 @@ pub struct ConnectorRuntime {
     config: RuntimeConfig,
     status: RuntimeStatus,
     signal_sender: SignalSender,
-    signal_receiver: Option<mpsc::Receiver<crate::SignalRecord>>,
+    signal_receiver: Option<mpsc::Receiver<crate::SignalDelivery>>,
+}
+
+struct PendingBatch {
+    encoded: Vec<EncodedEvent>,
+    highest_position: Option<SourcePosition>,
+    signal_acknowledgements: Vec<crate::SignalAcknowledgement>,
+}
+
+impl PendingBatch {
+    fn new(capacity: usize) -> Self {
+        Self {
+            encoded: Vec::with_capacity(capacity),
+            highest_position: None,
+            signal_acknowledgements: Vec::new(),
+        }
+    }
 }
 
 impl ConnectorRuntime {
@@ -205,8 +221,7 @@ impl ConnectorRuntime {
         );
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        let mut encoded = Vec::with_capacity(self.config.max_batch_size);
-        let mut highest_position: Option<SourcePosition> = None;
+        let mut pending = PendingBatch::new(self.config.max_batch_size);
         let mut snapshot_completed = snapshot_completed;
 
         loop {
@@ -217,8 +232,7 @@ impl ConnectorRuntime {
                 }
                 _ = interval.tick() => {
                     self.flush_batch(
-                        &mut encoded,
-                        &mut highest_position,
+                        &mut pending,
                         snapshot_completed,
                         &connector_state,
                         &ack_tx,
@@ -230,8 +244,7 @@ impl ConnectorRuntime {
                     self.status.set_queue_depth(source_rx.len()).await;
                     self.consume_record(
                         record,
-                        &mut encoded,
-                        &mut highest_position,
+                        &mut pending,
                         &mut snapshot_completed,
                         &mut connector_state,
                         &ack_tx,
@@ -240,14 +253,8 @@ impl ConnectorRuntime {
             }
         }
 
-        self.flush_batch(
-            &mut encoded,
-            &mut highest_position,
-            snapshot_completed,
-            &connector_state,
-            &ack_tx,
-        )
-        .await?;
+        self.flush_batch(&mut pending, snapshot_completed, &connector_state, &ack_tx)
+            .await?;
         self.sink.flush().await?;
         cancellation.cancel();
 
@@ -268,13 +275,12 @@ impl ConnectorRuntime {
     async fn consume_record(
         &mut self,
         record: SourceRecord,
-        encoded: &mut Vec<EncodedEvent>,
-        highest_position: &mut Option<SourcePosition>,
+        pending: &mut PendingBatch,
         snapshot_completed: &mut bool,
         connector_state: &mut Option<ConnectorStateEnvelope>,
         ack_tx: &watch::Sender<Option<SourcePosition>>,
     ) -> Result<()> {
-        if let Some(previous) = highest_position.as_ref()
+        if let Some(previous) = pending.highest_position.as_ref()
             && !record.position.is_after(previous)
             && record.position != *previous
         {
@@ -299,12 +305,15 @@ impl ConnectorRuntime {
                     .transition(ConnectorState::Snapshotting, None)
                     .await;
             }
-            encoded.extend(self.encoder.encode_batch(event)?);
+            pending.encoded.extend(self.encoder.encode_batch(event)?);
         }
-        *highest_position = Some(record.position);
+        pending.highest_position = Some(record.position);
         if let Some(state) = record.connector_state {
             *connector_state = Some(state);
         }
+        pending
+            .signal_acknowledgements
+            .extend(record.signal_acknowledgements);
 
         match record.boundary {
             RecordBoundary::SnapshotComplete => {
@@ -312,44 +321,20 @@ impl ConnectorRuntime {
                 self.status
                     .transition(ConnectorState::Streaming, None)
                     .await;
-                self.flush_batch(
-                    encoded,
-                    highest_position,
-                    *snapshot_completed,
-                    connector_state,
-                    ack_tx,
-                )
-                .await?;
+                self.flush_batch(pending, *snapshot_completed, connector_state, ack_tx)
+                    .await?;
             }
             RecordBoundary::TransactionCommit => {
-                self.flush_batch(
-                    encoded,
-                    highest_position,
-                    *snapshot_completed,
-                    connector_state,
-                    ack_tx,
-                )
-                .await?;
+                self.flush_batch(pending, *snapshot_completed, connector_state, ack_tx)
+                    .await?;
             }
-            RecordBoundary::Data if encoded.len() >= self.config.max_batch_size => {
-                self.flush_batch(
-                    encoded,
-                    highest_position,
-                    *snapshot_completed,
-                    connector_state,
-                    ack_tx,
-                )
-                .await?;
+            RecordBoundary::Data if pending.encoded.len() >= self.config.max_batch_size => {
+                self.flush_batch(pending, *snapshot_completed, connector_state, ack_tx)
+                    .await?;
             }
-            RecordBoundary::Heartbeat if encoded.is_empty() => {
-                self.flush_batch(
-                    encoded,
-                    highest_position,
-                    *snapshot_completed,
-                    connector_state,
-                    ack_tx,
-                )
-                .await?;
+            RecordBoundary::Heartbeat if pending.encoded.is_empty() => {
+                self.flush_batch(pending, *snapshot_completed, connector_state, ack_tx)
+                    .await?;
             }
             _ => {}
         }
@@ -358,20 +343,19 @@ impl ConnectorRuntime {
 
     async fn flush_batch(
         &mut self,
-        encoded: &mut Vec<EncodedEvent>,
-        highest_position: &mut Option<SourcePosition>,
+        pending: &mut PendingBatch,
         snapshot_completed: bool,
         connector_state: &Option<ConnectorStateEnvelope>,
         ack_tx: &watch::Sender<Option<SourcePosition>>,
     ) -> Result<()> {
-        let Some(position) = highest_position.take() else {
+        let Some(position) = pending.highest_position.take() else {
             return Ok(());
         };
-        let delivered = encoded.len();
+        let delivered = pending.encoded.len();
 
-        if !encoded.is_empty() {
+        if !pending.encoded.is_empty() {
             let batch = DeliveryBatch {
-                events: std::mem::take(encoded),
+                events: std::mem::take(&mut pending.encoded),
                 highest_position: position.clone(),
             };
             if let Err(error) = self.sink.write(&batch).await {
@@ -397,6 +381,9 @@ impl ConnectorRuntime {
         ack_tx
             .send(Some(position.clone()))
             .map_err(|_| Error::Source("source acknowledgement channel closed".into()))?;
+        for acknowledgement in pending.signal_acknowledgements.drain(..) {
+            acknowledgement.acknowledge();
+        }
         self.status.checkpointed(position, delivered).await;
         Ok(())
     }
@@ -425,6 +412,10 @@ mod tests {
 
     struct SignalSource {
         received: Arc<Mutex<Option<crate::SignalRecord>>>,
+    }
+
+    struct CheckpointSignalSource {
+        position: SourcePosition,
     }
 
     #[async_trait]
@@ -464,8 +455,40 @@ mod tests {
 
         async fn run(&mut self, mut context: SourceContext) -> Result<()> {
             let signal = context.signals.recv().await.ok_or(Error::Cancelled)?;
-            *self.received.lock().unwrap() = Some(signal);
+            *self.received.lock().unwrap() = Some(signal.record().clone());
+            signal.acknowledge();
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SourceConnector for CheckpointSignalSource {
+        fn source_type(&self) -> &'static str {
+            "checkpoint-signal-test"
+        }
+
+        async fn validate(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn run(&mut self, mut context: SourceContext) -> Result<()> {
+            let signal = context.signals.recv().await.ok_or(Error::Cancelled)?;
+            context
+                .output
+                .send(Ok(SourceRecord {
+                    event: None,
+                    position: self.position.clone(),
+                    boundary: RecordBoundary::TransactionCommit,
+                    connector_state: None,
+                    signal_acknowledgements: signal.into_acknowledgement().into_iter().collect(),
+                }))
+                .await
+                .map_err(|_| Error::Cancelled)?;
+            context
+                .acknowledged
+                .changed()
+                .await
+                .map_err(|_| Error::Cancelled)
         }
     }
 
@@ -606,6 +629,7 @@ mod tests {
                 position: position.clone(),
                 boundary: RecordBoundary::Heartbeat,
                 connector_state: Some(connector_state.clone()),
+                signal_acknowledgements: Vec::new(),
             },
         };
         let store = Arc::new(MemoryCheckpointStore::default());
@@ -658,6 +682,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acknowledges_a_signal_only_after_its_checkpoint_is_saved() {
+        let position = SourcePosition::MySql(MySqlPosition {
+            binlog_filename: "binlog.000001".into(),
+            binlog_position: 120,
+            gtid_set: None,
+            server_id: 1,
+            event_serial: 0,
+            snapshot: false,
+        });
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let runtime = ConnectorRuntime::new(
+            ConnectorIdentity::new("runtime-durable-signal-test"),
+            Box::new(CheckpointSignalSource {
+                position: position.clone(),
+            }),
+            Arc::new(UnusedEncoder),
+            Box::new(NoopSink),
+            store.clone(),
+            RuntimeConfig::default(),
+            RuntimeStatus::new("runtime-durable-signal-test"),
+        );
+        let sender = runtime.signal_sender();
+        let send = tokio::spawn(async move {
+            sender
+                .send_and_wait(crate::SignalRecord::new(
+                    "snapshot-2",
+                    "execute-snapshot",
+                    serde_json::json!({"type": "incremental"}),
+                ))
+                .await
+        });
+
+        runtime.run(CancellationToken::new()).await.unwrap();
+        send.await.unwrap().unwrap();
+
+        assert_eq!(
+            store
+                .load("runtime-durable-signal-test")
+                .await
+                .unwrap()
+                .unwrap()
+                .source_position,
+            position
+        );
+    }
+
+    #[tokio::test]
     async fn checkpoints_after_all_encoded_records_are_delivered_together() {
         let position = SourcePosition::MySql(MySqlPosition {
             binlog_filename: "mysql-bin.000001".into(),
@@ -698,6 +769,7 @@ mod tests {
                 position: position.clone(),
                 boundary: RecordBoundary::TransactionCommit,
                 connector_state: None,
+                signal_acknowledgements: Vec::new(),
             },
         };
         let store = Arc::new(MemoryCheckpointStore::default());

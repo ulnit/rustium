@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ChangeEvent, ConnectorStateEnvelope, DeliveryBatch, EncodedEvent, Result, SignalRecord,
+    ChangeEvent, ConnectorStateEnvelope, DeliveryBatch, EncodedEvent, Result, SignalDelivery,
     SourcePosition, SourceRecord,
 };
 
@@ -36,7 +36,7 @@ pub struct SourceContext {
     pub output: mpsc::Sender<Result<SourceRecord>>,
     pub acknowledged: watch::Receiver<Option<SourcePosition>>,
     pub initial_checkpoint: Option<Checkpoint>,
-    pub signals: mpsc::Receiver<SignalRecord>,
+    pub signals: mpsc::Receiver<SignalDelivery>,
     pub cancellation: CancellationToken,
 }
 

@@ -56,7 +56,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
     };
     let signal_enabled_channels = requested_signal_channels
         .iter()
-        .filter(|channel| matches!(channel.as_str(), "source" | "file" | "in-process"))
+        .filter(|channel| matches!(channel.as_str(), "source" | "file" | "in-process" | "kafka"))
         .cloned()
         .collect::<Vec<_>>();
     if signal_enabled_channels.is_empty() {
@@ -67,7 +67,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
     let mut warnings = Vec::new();
     for channel in requested_signal_channels
         .iter()
-        .filter(|channel| !matches!(channel.as_str(), "source" | "file" | "in-process"))
+        .filter(|channel| !matches!(channel.as_str(), "source" | "file" | "in-process" | "kafka"))
     {
         warnings.push(format!(
             "signal.enabled.channels={channel} is not implemented and was ignored"
@@ -86,7 +86,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
 
     assemble_config(
         &properties,
-        SourceConfig::Postgresql(PostgresSourceConfig {
+        SourceConfig::Postgresql(Box::new(PostgresSourceConfig {
             hostname: properties
                 .get("database.hostname")
                 .cloned()
@@ -136,6 +136,26 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 "signal.poll.interval.ms",
                 default_signal_poll_interval(),
             )?,
+            signal_kafka_topic: properties.get("signal.kafka.topic").cloned(),
+            signal_kafka_bootstrap_servers: csv_property(
+                properties.get("signal.kafka.bootstrap.servers"),
+            ),
+            signal_kafka_group_id: properties
+                .get("signal.kafka.groupId")
+                .cloned()
+                .unwrap_or_else(default_signal_kafka_group_id),
+            signal_kafka_poll_timeout: duration_ms(
+                &properties,
+                "signal.kafka.poll.timeout.ms",
+                default_signal_kafka_poll_timeout(),
+            )?,
+            signal_kafka_consumer_properties: properties
+                .iter()
+                .filter_map(|(key, value)| {
+                    key.strip_prefix("signal.consumer.")
+                        .map(|key| (key.to_string(), value.clone()))
+                })
+                .collect(),
             incremental_snapshot_chunk_size: usize_value(
                 &properties,
                 "incremental.snapshot.chunk.size",
@@ -150,7 +170,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 .get("hstore.handling.mode")
                 .map(|mode| mode.to_ascii_lowercase())
                 .unwrap_or_else(default_hstore_handling_mode),
-        }),
+        })),
         SnapshotConfig {
             mode: snapshot_mode(
                 properties
@@ -686,6 +706,10 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "signal.enabled.channels",
         "signal.file",
         "signal.poll.interval.ms",
+        "signal.kafka.topic",
+        "signal.kafka.groupId",
+        "signal.kafka.bootstrap.servers",
+        "signal.kafka.poll.timeout.ms",
         "incremental.snapshot.chunk.size",
         "incremental.snapshot.allow.schema.changes",
         "incremental.snapshot.watermarking.strategy",
@@ -710,7 +734,9 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
     properties
         .keys()
         .filter(|key| {
-            !SUPPORTED.contains(&key.as_str()) && !key.starts_with("rustium.kafka.property.")
+            !SUPPORTED.contains(&key.as_str())
+                && !key.starts_with("rustium.kafka.property.")
+                && !key.starts_with("signal.consumer.")
         })
         .map(|key| format!("Debezium property {key} is not implemented and was ignored"))
         .collect()
@@ -743,9 +769,15 @@ heartbeat.action.query=INSERT INTO public.rustium_heartbeat (id) VALUES (1)
 topic.heartbeat.prefix=__pg-heartbeat
 topic.heartbeat.name=shared-pg-heartbeat
 signal.data.collection=public.rustium_signal
-signal.enabled.channels=source,file,in-process
+signal.enabled.channels=source,file,in-process,kafka
 signal.file=/run/rustium/orders-signals.jsonl
 signal.poll.interval.ms=250
+signal.kafka.topic=orders-signals
+signal.kafka.bootstrap.servers=kafka-1:9092,kafka-2:9092
+signal.kafka.groupId=orders-signal-group
+signal.kafka.poll.timeout.ms=75
+signal.consumer.security.protocol=SASL_SSL
+signal.consumer.enable.auto.commit=false
 incremental.snapshot.chunk.size=128
 incremental.snapshot.allow.schema.changes=false
 incremental.snapshot.watermarking.strategy=insert_insert
@@ -777,10 +809,24 @@ max.batch.size=1000
         );
         assert_eq!(
             source.signal_enabled_channels,
-            ["source", "file", "in-process"]
+            ["source", "file", "in-process", "kafka"]
         );
         assert_eq!(source.signal_file, "/run/rustium/orders-signals.jsonl");
         assert_eq!(source.signal_poll_interval, Duration::from_millis(250));
+        assert_eq!(source.signal_kafka_topic.as_deref(), Some("orders-signals"));
+        assert_eq!(
+            source.signal_kafka_bootstrap_servers,
+            ["kafka-1:9092", "kafka-2:9092"]
+        );
+        assert_eq!(source.signal_kafka_group_id, "orders-signal-group");
+        assert_eq!(source.signal_kafka_poll_timeout, Duration::from_millis(75));
+        assert_eq!(
+            source
+                .signal_kafka_consumer_properties
+                .get("security.protocol")
+                .map(String::as_str),
+            Some("SASL_SSL")
+        );
         assert_eq!(source.incremental_snapshot_chunk_size, 128);
         assert_eq!(
             source.incremental_snapshot_watermarking_strategy,
@@ -798,8 +844,8 @@ max.batch.size=1000
     }
 
     #[test]
-    fn rejects_unsupported_postgres_incremental_snapshot_options() {
-        let unsupported_channel = parse(
+    fn rejects_invalid_postgres_incremental_snapshot_options() {
+        let missing_kafka_bootstrap = parse(
             r#"
 name=orders-cdc
 connector.class=io.debezium.connector.postgresql.PostgresConnector
@@ -813,11 +859,7 @@ signal.enabled.channels=kafka
 "#,
         )
         .unwrap_err();
-        assert!(
-            unsupported_channel
-                .to_string()
-                .contains("no implemented channel")
-        );
+        assert!(missing_kafka_bootstrap.to_string().contains("bootstrap"));
 
         let schema_changes = parse(
             r#"

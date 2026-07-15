@@ -13,7 +13,9 @@ pub use event::{
     Row, SourceMetadata, SourcePosition, SourceRecord, SqlServerPosition, TransactionMetadata,
 };
 pub use runtime::{ConnectorRuntime, ConnectorState, RuntimeConfig, RuntimeStatus, StatusSnapshot};
-pub use signal::{SignalRecord, SignalSender, signal_channel};
+pub use signal::{
+    SignalAcknowledgement, SignalDelivery, SignalRecord, SignalSender, signal_channel,
+};
 pub use traits::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, CheckpointStore, Durability, EventEncoder, Sink,
     SourceConnector, SourceContext,

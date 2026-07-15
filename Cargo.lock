@@ -1911,6 +1911,7 @@ dependencies = [
  "rustium-mysql",
  "rustium-postgresql",
  "rustium-server",
+ "rustium-signal-kafka",
  "rustium-sink-kafka",
  "rustium-sink-stdout",
  "rustium-sqlserver",
@@ -2020,6 +2021,19 @@ dependencies = [
  "tokio-util",
  "tower-http",
  "tracing",
+]
+
+[[package]]
+name = "rustium-signal-kafka"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "rdkafka",
+ "rustium-core",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -218,10 +218,16 @@ impl IncrementalSnapshotController {
                 additional_conditions,
                 surrogate_key,
             } => {
+                if self.is_duplicate_execute_signal(&id) {
+                    tracing::info!(%id, "duplicate PostgreSQL execute-snapshot signal ignored");
+                    return Ok(None);
+                }
                 if self.progress.is_some() {
-                    return Err(Error::Source(format!(
-                        "PostgreSQL execute-snapshot signal {id:?} arrived while another incremental snapshot is active"
-                    )));
+                    tracing::warn!(
+                        %id,
+                        "PostgreSQL execute-snapshot signal ignored while another incremental snapshot is active"
+                    );
+                    return Ok(None);
                 }
                 let (expanded, additional_conditions) =
                     expand_data_collections(&data_collections, &additional_conditions, schemas)?;
@@ -291,6 +297,12 @@ impl IncrementalSnapshotController {
             }
             Signal::Unsupported { .. } => Ok(None),
         }
+    }
+
+    fn is_duplicate_execute_signal(&self, id: &str) -> bool {
+        self.progress
+            .as_ref()
+            .is_some_and(|progress| progress.signal_id == id)
     }
 
     pub(crate) fn deduplicate(&mut self, event: &ChangeEvent) {
@@ -1221,6 +1233,23 @@ mod tests {
             Signal::Execute { surrogate_key, .. }
                 if surrogate_key.as_deref() == Some("created_at")
         ));
+    }
+
+    #[test]
+    fn recognizes_replayed_execute_signal_ids() {
+        let controller = IncrementalSnapshotController::new(Some(IncrementalSnapshotProgress {
+            signal_id: "snapshot-1".into(),
+            data_collections: vec!["public.orders".into()],
+            additional_conditions: BTreeMap::new(),
+            surrogate_key: None,
+            current_collection: 0,
+            last_key: None,
+            maximum_key: None,
+            chunk_sequence: 1,
+            paused: false,
+        }));
+        assert!(controller.is_duplicate_execute_signal("snapshot-1"));
+        assert!(!controller.is_duplicate_execute_signal("snapshot-2"));
     }
 
     #[test]

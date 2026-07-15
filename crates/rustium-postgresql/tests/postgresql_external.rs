@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     error::Error as StdError,
     io,
     time::{Duration, SystemTime},
@@ -71,6 +72,11 @@ impl TestSettings {
             signal_enabled_channels: vec!["source".into()],
             signal_file: "file-signals.txt".into(),
             signal_poll_interval: Duration::from_secs(5),
+            signal_kafka_topic: None,
+            signal_kafka_bootstrap_servers: Vec::new(),
+            signal_kafka_group_id: "kafka-signal".into(),
+            signal_kafka_poll_timeout: Duration::from_millis(100),
+            signal_kafka_consumer_properties: BTreeMap::new(),
             incremental_snapshot_chunk_size: 1_024,
             incremental_snapshot_watermarking_strategy: "insert_insert".into(),
             read_only: false,

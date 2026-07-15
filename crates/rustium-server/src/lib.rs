@@ -251,7 +251,7 @@ mod tests {
         let response =
             submit_signal(State(app_state(true, Some(sender))), Json(signal.clone())).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        assert_eq!(receiver.recv().await, Some(signal.clone()));
+        assert_eq!(receiver.recv().await.unwrap().record(), &signal);
 
         let response = submit_signal(State(app_state(false, None)), Json(signal.clone())).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);

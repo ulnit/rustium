@@ -8,6 +8,7 @@ members = [
     "crates/rustium-mysql",
     "crates/rustium-postgresql",
     "crates/rustium-server",
+    "crates/rustium-signal-kafka",
     "crates/rustium-sqlserver",
     "crates/rustium-sink-kafka",
     "crates/rustium-sink-stdout",
