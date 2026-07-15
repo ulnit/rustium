@@ -885,10 +885,10 @@ impl StreamingState {
             let (before_row, after_row) = pair.map_err(mysql_error)?;
             let mut before = before_row
                 .as_ref()
-                .map(|row| convert_binlog_row(row, &schema.event_schema));
+                .map(|row| convert_binlog_row(row, &schema.event_schema, None));
             let mut after = after_row
                 .as_ref()
-                .map(|row| convert_binlog_row(row, &schema.event_schema));
+                .map(|row| convert_binlog_row(row, &schema.event_schema, before.as_ref()));
             if let Some(before) = &mut before {
                 fill_unavailable(before, None, &schema.event_schema);
             }
@@ -1389,7 +1389,7 @@ fn convert_snapshot_row(row: MySqlRow, schema: &EventSchema) -> Result<Row> {
         .collect())
 }
 
-fn convert_binlog_row(row: &BinlogRow, schema: &EventSchema) -> Row {
+fn convert_binlog_row(row: &BinlogRow, schema: &EventSchema, base: Option<&Row>) -> Row {
     row.columns_ref()
         .iter()
         .enumerate()
@@ -1404,18 +1404,195 @@ fn convert_binlog_row(row: &BinlogRow, schema: &EventSchema) -> Row {
             let value = row.as_ref(index)?;
             Some((
                 field.name.clone(),
-                convert_binlog_value(value, &field.type_name),
+                convert_binlog_value(
+                    value,
+                    &field.type_name,
+                    base.and_then(|base| base.get(&field.name)),
+                ),
             ))
         })
         .collect()
 }
 
-fn convert_binlog_value(value: &BinlogValue<'_>, type_name: &str) -> DataValue {
+fn convert_binlog_value(
+    value: &BinlogValue<'_>,
+    type_name: &str,
+    base: Option<&DataValue>,
+) -> DataValue {
     match value {
         BinlogValue::Value(value) => convert_value(value, type_name),
         BinlogValue::Jsonb(value) => serde_json::Value::try_from(value.clone())
             .map_or(DataValue::Unavailable, DataValue::Json),
-        BinlogValue::JsonDiff(_) => DataValue::Unavailable,
+        BinlogValue::JsonDiff(diffs) => apply_json_diffs(base, diffs),
+    }
+}
+
+fn apply_json_diffs(
+    base: Option<&DataValue>,
+    diffs: &[mysql_async::binlog::jsondiff::JsonDiff<'_>],
+) -> DataValue {
+    let Some(DataValue::Json(mut value)) = base.cloned() else {
+        return DataValue::Unavailable;
+    };
+    for diff in diffs {
+        let Some(path) = parse_json_path(diff.path_str().as_ref()) else {
+            return DataValue::Unavailable;
+        };
+        let replacement = diff
+            .value()
+            .and_then(|value| serde_json::Value::try_from(value.clone()).ok());
+        let applied = match diff.operation() {
+            mysql_async::binlog::jsondiff::JsonDiffOperation::REPLACE => replacement
+                .is_some_and(|replacement| set_json_path(&mut value, &path, replacement, false)),
+            mysql_async::binlog::jsondiff::JsonDiffOperation::INSERT => replacement
+                .is_some_and(|replacement| set_json_path(&mut value, &path, replacement, true)),
+            mysql_async::binlog::jsondiff::JsonDiffOperation::REMOVE => {
+                remove_json_path(&mut value, &path)
+            }
+        };
+        if !applied {
+            return DataValue::Unavailable;
+        }
+    }
+    DataValue::Json(value)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JsonPathSegment {
+    Key(String),
+    Index(usize),
+}
+
+fn parse_json_path(path: &str) -> Option<Vec<JsonPathSegment>> {
+    let mut chars = path.chars().peekable();
+    if chars.next()? != '$' {
+        return None;
+    }
+    let mut segments = Vec::new();
+    while let Some(character) = chars.next() {
+        match character {
+            '.' => {
+                let mut key = String::new();
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    while let Some(character) = chars.next() {
+                        match character {
+                            '"' => break,
+                            '\\' => key.push(chars.next()?),
+                            character => key.push(character),
+                        }
+                    }
+                } else {
+                    while let Some(&character) = chars.peek() {
+                        if character == '.' || character == '[' {
+                            break;
+                        }
+                        key.push(character);
+                        chars.next();
+                    }
+                }
+                (!key.is_empty()).then_some(())?;
+                segments.push(JsonPathSegment::Key(key));
+            }
+            '[' => {
+                let mut value = String::new();
+                for character in chars.by_ref() {
+                    if character == ']' {
+                        break;
+                    }
+                    value.push(character);
+                }
+                if value.chars().all(|character| character.is_ascii_digit()) {
+                    segments.push(JsonPathSegment::Index(value.parse().ok()?));
+                } else if value.starts_with('"') && value.ends_with('"') {
+                    segments.push(JsonPathSegment::Key(value[1..value.len() - 1].into()));
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(segments)
+}
+
+fn set_json_path(
+    value: &mut serde_json::Value,
+    path: &[JsonPathSegment],
+    replacement: serde_json::Value,
+    allow_insert: bool,
+) -> bool {
+    let Some((segment, rest)) = path.split_first() else {
+        *value = replacement;
+        return true;
+    };
+    if rest.is_empty() {
+        return match segment {
+            JsonPathSegment::Key(key) => value.as_object_mut().is_some_and(|object| {
+                if !allow_insert && !object.contains_key(key) {
+                    return false;
+                }
+                if allow_insert && object.contains_key(key) {
+                    return false;
+                }
+                object.insert(key.clone(), replacement);
+                true
+            }),
+            JsonPathSegment::Index(index) => value.as_array_mut().is_some_and(|array| {
+                if allow_insert {
+                    if *index > array.len() {
+                        return false;
+                    }
+                    array.insert(*index, replacement);
+                    true
+                } else {
+                    array.get_mut(*index).is_some_and(|value| {
+                        *value = replacement;
+                        true
+                    })
+                }
+            }),
+        };
+    }
+    match segment {
+        JsonPathSegment::Key(key) => value
+            .as_object_mut()
+            .and_then(|object| object.get_mut(key))
+            .is_some_and(|value| set_json_path(value, rest, replacement, allow_insert)),
+        JsonPathSegment::Index(index) => value
+            .as_array_mut()
+            .and_then(|array| array.get_mut(*index))
+            .is_some_and(|value| set_json_path(value, rest, replacement, allow_insert)),
+    }
+}
+
+fn remove_json_path(value: &mut serde_json::Value, path: &[JsonPathSegment]) -> bool {
+    let Some((segment, rest)) = path.split_first() else {
+        return false;
+    };
+    if rest.is_empty() {
+        return match segment {
+            JsonPathSegment::Key(key) => value
+                .as_object_mut()
+                .and_then(|object| object.remove(key))
+                .is_some(),
+            JsonPathSegment::Index(index) => value.as_array_mut().is_some_and(|array| {
+                *index < array.len() && {
+                    array.remove(*index);
+                    true
+                }
+            }),
+        };
+    }
+    match segment {
+        JsonPathSegment::Key(key) => value
+            .as_object_mut()
+            .and_then(|object| object.get_mut(key))
+            .is_some_and(|value| remove_json_path(value, rest)),
+        JsonPathSegment::Index(index) => value
+            .as_array_mut()
+            .and_then(|array| array.get_mut(*index))
+            .is_some_and(|value| remove_json_path(value, rest)),
     }
 }
 
@@ -1748,6 +1925,40 @@ mod tests {
         assert_eq!(
             mysql_timestamp("1784114317.113641"),
             Some("2026-07-15 11:18:37.113641".into())
+        );
+    }
+
+    #[test]
+    fn applies_mysql_json_diff_paths_without_partial_state() {
+        assert_eq!(
+            parse_json_path("$.customer.address[0].city"),
+            Some(vec![
+                JsonPathSegment::Key("customer".into()),
+                JsonPathSegment::Key("address".into()),
+                JsonPathSegment::Index(0),
+                JsonPathSegment::Key("city".into()),
+            ])
+        );
+        let mut value = serde_json::json!({"customer": {"name": "Alice", "tags": ["new"]}});
+        let path = parse_json_path("$.customer.name").unwrap();
+        assert!(set_json_path(
+            &mut value,
+            &path,
+            serde_json::json!("Bob"),
+            false
+        ));
+        let path = parse_json_path("$.customer.tags[1]").unwrap();
+        assert!(set_json_path(
+            &mut value,
+            &path,
+            serde_json::json!("vip"),
+            true
+        ));
+        let path = parse_json_path("$.customer.name").unwrap();
+        assert!(remove_json_path(&mut value, &path));
+        assert_eq!(
+            value,
+            serde_json::json!({"customer": {"tags": ["new", "vip"]}})
         );
     }
 

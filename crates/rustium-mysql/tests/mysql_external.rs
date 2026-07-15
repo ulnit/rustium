@@ -212,6 +212,136 @@ async fn emits_periodic_heartbeat_from_safe_binlog_position() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external MySQL 8.4 server with PARTIAL_JSON support"]
+async fn reconstructs_partial_json_updates_from_before_images() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_partial_json_{}", &suffix[..12]);
+    let connector_name = format!("mysql-partial-json-{}", &suffix[..12]);
+    let qualified_table = format!(
+        "{}.{}",
+        quote_identifier(&settings.database),
+        quote_identifier(&table_name)
+    );
+    let mut admin = connect_admin(&settings).await?;
+    let original_options: String = admin
+        .query_first("SELECT @@GLOBAL.binlog_row_value_options")
+        .await?
+        .ok_or_else(|| test_error("MySQL did not return binlog_row_value_options"))?;
+
+    let outcome: TestResult = async {
+        admin
+            .query_drop(format!(
+                "CREATE TABLE {qualified_table} (id BIGINT PRIMARY KEY, payload JSON NOT NULL)"
+            ))
+            .await?;
+        admin
+            .query_drop(format!(
+                "INSERT INTO {qualified_table} VALUES (1, '{{\"name\":\"Alice\",\"tags\":[\"new\"]}}')"
+            ))
+            .await?;
+        admin
+            .query_drop(format!(
+                "INSERT INTO {qualified_table} VALUES (2, '{{\"name\":\"Carol\",\"tags\":[\"new\"]}}')"
+            ))
+            .await?;
+        admin
+            .query_drop("SET GLOBAL binlog_row_value_options = 'PARTIAL_JSON'")
+            .await?;
+
+        let config = settings.source_config(&table_name);
+        let (snapshot_position, schema_history) =
+            capture_snapshot(&connector_name, config.clone()).await?;
+        let checkpoint = Checkpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            connector_name: connector_name.clone(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: snapshot_position.clone(),
+            snapshot_completed: true,
+            config_fingerprint: "mysql-partial-json-test".into(),
+            updated_at: SystemTime::now(),
+            connector_state: Some(schema_history),
+        };
+
+        admin
+            .query_drop(format!(
+                "UPDATE {qualified_table} SET payload = JSON_SET(payload, '$.name', 'Bob', '$.tags[1]', 'vip') WHERE id = 1"
+            ))
+            .await?;
+
+        let mut source = MySqlSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) =
+            start_source(source, Some(checkpoint), Some(snapshot_position));
+        let capture_result: TestResult = async {
+            loop {
+                let record = receive(&mut output).await?;
+                let Some(event) = record.event else {
+                    continue;
+                };
+                if event.source.table.as_deref() != Some(table_name.as_str()) {
+                    continue;
+                }
+                require(
+                    event.operation == Operation::Update,
+                    "partial JSON row was not emitted as an update",
+                )?;
+                require(
+                    event.after.as_ref().and_then(|row| row.get("payload"))
+                        == Some(&DataValue::Json(serde_json::json!({
+                            "name": "Bob",
+                            "tags": ["new", "vip"]
+                        }))),
+                    "partial JSON after image was not reconstructed",
+                )?;
+                break Ok(());
+            }
+        }
+        .await;
+        finish_source(cancellation, source_task, capture_result).await
+    }
+    .await;
+
+    let restore_result = admin
+        .query_drop(format!(
+            "SET GLOBAL binlog_row_value_options = '{}'",
+            original_options.replace('\'', "''")
+        ))
+        .await
+        .map_err(boxed_error);
+    let cleanup_result = admin
+        .query_drop(format!("DROP TABLE IF EXISTS {qualified_table}"))
+        .await
+        .map_err(boxed_error);
+    let close_result = admin.disconnect().await.map_err(boxed_error);
+    match (outcome, restore_result, cleanup_result, close_result) {
+        (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), restore, cleanup, close) => {
+            if let Err(restore_error) = restore {
+                eprintln!("MySQL partial JSON test restore also failed: {restore_error}");
+            }
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("MySQL partial JSON test cleanup also failed: {cleanup_error}");
+            }
+            if let Err(close_error) = close {
+                eprintln!("MySQL partial JSON test connection close also failed: {close_error}");
+            }
+            Err(error)
+        }
+        (Ok(()), Err(error), _, _)
+        | (Ok(()), Ok(()), Err(error), _)
+        | (Ok(()), Ok(()), Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an external MySQL 8.0+ server with row binlog and GTID enabled"]
 async fn snapshots_and_replays_destructive_ddl_from_checkpoint() -> TestResult {
     let settings = TestSettings::from_env()?;

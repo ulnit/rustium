@@ -405,6 +405,7 @@ Implemented behavior:
 - periodic heartbeat records from the latest safe binlog position, disabled by default
 - optional `heartbeat.action.query` execution on a separate ordinary MySQL connection at the heartbeat cadence
 - FULL, MINIMAL, and NOBLOB row images with explicit unavailable values where MySQL omits data
+- PARTIAL_JSON update diffs reconstructed from a complete before image, with unavailable fallback when safe reconstruction is impossible
 - Docker and external integration coverage against MySQL 8.4, including filtered GTID startup and restart across destructive DDL
 
 Recommended MySQL permissions for the connector user:
@@ -427,7 +428,7 @@ DDL parsing failures stop the connector by default. Debezium-compatible `schema.
 
 Checkpoint v1 JSON remains readable, but a completed MySQL v1 checkpoint has no historical schema baseline and is rejected for resume. Reset that checkpoint and run a new initial snapshot once to establish checkpoint v2 schema history.
 
-Known MySQL gaps include signaling records, custom trust/key stores, incremental snapshots, and wider DDL/type fixtures. Partial JSON updates are marked unavailable when the server enables `binlog_row_value_options=PARTIAL_JSON`.
+Known MySQL gaps include signaling records, custom trust/key stores, incremental snapshots, and wider DDL/type fixtures. When `binlog_row_value_options=PARTIAL_JSON` is enabled, a diff without a complete before image remains explicitly unavailable rather than being guessed.
 
 ### SQL Server
 
@@ -925,6 +926,7 @@ MySQL 连接器通过原生复制协议读取行级二进制日志。
 - 从最新安全 binlog 位点周期发送 heartbeat record，默认关闭
 - 可选地在 heartbeat 周期通过独立普通 MySQL 连接执行 `heartbeat.action.query`
 - 支持 FULL、MINIMAL、NOBLOB row image；MySQL 未提供的值会明确标记为 unavailable
+- 根据完整 before image 重建 PARTIAL_JSON 更新 diff；无法安全重建时保守标记为 unavailable
 - MySQL 8.4 Docker 和外部集成测试，包括过滤后的 GTID 启动和跨破坏性 DDL 重启
 
 建议给 MySQL 连接器用户授予：
@@ -947,7 +949,7 @@ DDL 默认解析失败即停止连接器。可使用 Debezium 兼容参数 `sche
 
 Checkpoint v1 JSON 仍可读取，但已完成的 MySQL v1 checkpoint 不含历史 schema 基线，因此会拒绝恢复。升级后需要重置该 checkpoint 并执行一次新的 initial snapshot，以建立 checkpoint v2 schema history。
 
-MySQL 已知缺口包括信号记录、自定义 trust/key store、增量快照，以及更广的 DDL/类型样例。当服务端启用 `binlog_row_value_options=PARTIAL_JSON` 时，部分 JSON 更新会标记为 unavailable。
+MySQL 已知缺口包括信号记录、自定义 trust/key store、增量快照，以及更广的 DDL/类型样例。启用 `binlog_row_value_options=PARTIAL_JSON` 时，如果 diff 没有完整 before image，仍会明确标记为 unavailable，而不会猜测结果。
 
 ### Debezium 配置兼容
 
