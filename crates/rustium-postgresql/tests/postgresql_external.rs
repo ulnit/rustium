@@ -1091,6 +1091,113 @@ async fn orders_incremental_chunks_by_unique_surrogate_key() -> TestResult {
     outcome
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn rejects_schema_change_inside_incremental_window() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_schema_guard_{}", &suffix[..12]);
+    let signal_table = format!("rustium_pg_schema_signal_{}", &suffix[..12]);
+    let trigger_function = format!("rustium_pg_schema_fn_{}", &suffix[..12]);
+    let publication = format!("rustium_schema_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_schema_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-schema-guard-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome = async {
+        client
+            .batch_execute(&format!(
+                r#"CREATE TABLE public.{table_name} (
+                       id BIGINT PRIMARY KEY, value TEXT NOT NULL
+                   );
+                   INSERT INTO public.{table_name} VALUES (1, 'value-1'), (2, 'value-2');
+                   CREATE TABLE public.{signal_table} (
+                       id VARCHAR(128), type VARCHAR(32), data VARCHAR(4096)
+                   );
+                   CREATE FUNCTION public.{trigger_function}() RETURNS trigger AS $function$
+                   BEGIN
+                       IF NEW.type = 'snapshot-window-open' AND NEW.id LIKE '%-1-open' THEN
+                           EXECUTE 'ALTER TABLE public.{table_name} ADD COLUMN added TEXT NOT NULL DEFAULT ''initial''';
+                           UPDATE public.{table_name} SET value = value || '-changed' WHERE id = 1;
+                       END IF;
+                       RETURN NEW;
+                   END;
+                   $function$ LANGUAGE plpgsql;
+                   CREATE TRIGGER rustium_schema_signal_trigger
+                   AFTER INSERT ON public.{signal_table}
+                   FOR EACH ROW EXECUTE FUNCTION public.{trigger_function}();
+                   CREATE PUBLICATION {publication} FOR TABLE
+                       public.{table_name}, public.{signal_table};"#
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        config.signal_data_collection = Some(format!("public.{signal_table}"));
+        config.incremental_snapshot_chunk_size = 2;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (_output, cancellation, mut source_task) = start_source(source, None);
+
+        wait_for_active_slot(&client, &slot_name).await?;
+        insert_execute_snapshot_signal(&client, &signal_table, &table_name).await?;
+        let result = tokio::time::timeout(Duration::from_secs(10), &mut source_task).await;
+        cancellation.cancel();
+        let source_result = match result {
+            Ok(result) => result?,
+            Err(_) => {
+                source_task.abort();
+                let _ = source_task.await;
+                return Err(test_error(
+                    "PostgreSQL source did not reject an active-window schema change",
+                ));
+            }
+        };
+        let error = source_result.expect_err(
+            "PostgreSQL source unexpectedly accepted an active-window schema change",
+        );
+        require(
+            error.to_string().contains("incremental snapshot window was active"),
+            "PostgreSQL source returned the wrong schema-change failure",
+        )
+    }
+    .await;
+
+    let function_cleanup = client
+        .batch_execute(&format!(
+            "DROP FUNCTION IF EXISTS public.{trigger_function}() CASCADE"
+        ))
+        .await;
+    let cleanup_result = cleanup(
+        &client,
+        &publication,
+        &slot_name,
+        &[&table_name, &signal_table],
+    )
+    .await;
+    connection_task.abort();
+
+    if let Err(cleanup_error) = function_cleanup {
+        if outcome.is_ok() {
+            return Err(cleanup_error.into());
+        }
+        eprintln!("PostgreSQL schema guard function cleanup also failed: {cleanup_error}");
+    }
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL schema guard cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
 async fn insert_execute_snapshot_signal(
     client: &Client,
     signal_table: &str,

@@ -484,6 +484,10 @@ impl SourceConnector for PostgresSource {
                             )
                             .await?;
                         if let Some(version) = state.refresh_schema(refreshed) {
+                            incremental.reject_active_schema_change(
+                                &schema_name,
+                                &table_name,
+                            )?;
                             info!(
                                 schema = %schema_name,
                                 table = %table_name,
@@ -1346,7 +1350,7 @@ fn discover_table_schema(
         .ok_or_else(|| Error::Source(format!("could not discover columns for {schema}.{table}")))
 }
 
-fn query_table_schema(
+pub(crate) fn query_table_schema(
     connection: &mut PgReplicationConnection,
     config: &PostgresSourceConfig,
     schema: &str,

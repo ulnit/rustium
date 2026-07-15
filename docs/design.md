@@ -245,6 +245,8 @@ Connector-state format version 4 stores the signal ID, expanded collections, per
 
 `pause-snapshot` prevents the next chunk from being prepared after the current close boundary. The paused flag is checkpointed, so restart remains paused. `resume-snapshot` schedules the next chunk after its own signal transaction commits. `stop-snapshot` clears all progress when `data-collections` is absent, or removes only collections matched by its fully matched expressions; stopping the current collection resets its key boundaries and advances safely after the control transaction. Unknown and out-of-order watermark IDs are ignored.
 
+With `incremental.snapshot.allow.schema.changes=false`, the chunk connection rediscovers the table immediately after the open watermark and compares fields plus PostgreSQL type identity before building SQL. A changed `Relation` for the active table is also rejected while streaming. Either guard stops the source before the old window can be decoded against a new layout, leaving the last acknowledged checkpoint intact. Supporting `true` requires a bounded reread protocol and remains a separate gate.
+
 #### 9.5 Remaining PostgreSQL gates
 
 - non-source signal input channels;
@@ -687,6 +689,8 @@ PostgreSQL 不会在 `Relation` 中记录原始 DDL、列可空性或 default。
 Connector-state format version 4 保存 signal ID、展开后的集合、每集合 condition、surrogate key、集合索引、last key、maximum key、chunk sequence 和 pause 状态。close commit 将推进后的状态与已投递行原子 checkpoint。若在此之前崩溃，会重新读取同一个有界 chunk，可能重复但不会产生缺口；若在此之后重启，则从下一 key 开始。Version 1 到 3 schema-history payload 会以新字段默认值继续读取。内存窗口有意不持久化。
 
 `pause-snapshot` 在当前 close 边界后阻止准备下一 chunk。pause 标记会被 checkpoint，因此重启后仍保持暂停。`resume-snapshot` 在自身 signal 事务提交后安排下一 chunk。`stop-snapshot` 在没有 `data-collections` 时清除全部进度，否则只移除完整匹配表达式选中的集合；停止当前集合会重置其主键边界，并在控制事务之后安全推进。未知或乱序 watermark ID 会被忽略。
+
+当 `incremental.snapshot.allow.schema.changes=false` 时，chunk 连接会在 open watermark 后立即重新发现表，并在构造 SQL 前比较字段和 PostgreSQL 类型身份。流式阶段若活动表出现变化后的 `Relation` 也会被拒绝。任一保护都会在旧窗口按新布局解码前停止 Source，并保持最后已确认 checkpoint 不变。支持 `true` 需要有界重读协议，仍是独立门槛。
 
 #### 9.5 PostgreSQL 剩余门槛
 

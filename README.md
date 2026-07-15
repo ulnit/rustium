@@ -302,7 +302,7 @@ The signal table must contain exactly `id`, `type`, and `data` in that order and
 
 Set Debezium `read.only=true` or native `source.read_only: true` to replace inserted watermarks with `pg_current_snapshot()` low/high transaction watermarks. Rustium compares WAL transaction IDs against those snapshots, keeps the window open until every transaction visible across the chunk has passed, and applies the same primary-key deduplication. The connector requires only `SELECT` on captured/signal tables plus logical-replication access and writes no watermark records. Rustium currently still needs the source signal table to receive the initial request because Kafka/JMX/file signal input channels are not implemented.
 
-Current PostgreSQL signaling is intentionally limited to the source table channel, one signal table, and incremental snapshots. Writable mode supports `insert_insert`; read-only mode uses transaction snapshots. Online schema changes during an incremental snapshot remain pending. Other PostgreSQL gaps include transient-column optionality/default reconstruction beyond what `Relation` carries, extension types such as PostGIS/hstore/vector, broader failure fixtures, and Kafka end-to-end recovery coverage.
+Current PostgreSQL signaling is intentionally limited to the source table channel, one signal table, and incremental snapshots. Writable mode supports `insert_insert`; read-only mode uses transaction snapshots. With `incremental.snapshot.allow.schema.changes=false`, Rustium compares the catalog after opening every window and also rejects a changed WAL `Relation` for the active table, preserving the previous checkpoint instead of querying or emitting mismatched layouts. Safe chunk rereads for `true` remain pending. Other PostgreSQL gaps include transient-column optionality/default reconstruction beyond what `Relation` carries, extension types such as PostGIS/hstore/vector, broader failure fixtures, and Kafka end-to-end recovery coverage.
 
 ### MySQL
 
@@ -738,7 +738,7 @@ Execute payload 还接受 Debezium `additional-conditions`；每项包含一个 
 
 设置 Debezium `read.only=true` 或原生 `source.read_only: true`，即可用 `pg_current_snapshot()` 低/高事务水位替代插入 watermark。Rustium 将 WAL transaction ID 与这些快照比较，直到跨 chunk 可见的事务全部通过后才关闭窗口，并执行相同的主键去重。连接器只需要捕获表/信号表 `SELECT` 和逻辑复制权限，不写入 watermark 记录。由于 Kafka/JMX/file 信号输入 channel 尚未实现，Rustium 当前仍需要 source 信号表接收初始请求。
 
-当前 PostgreSQL 信号能力有意限定为 source table channel、单一信号表和 incremental snapshot。可写模式支持 `insert_insert`，只读模式使用事务快照。增量快照期间的在线 schema 变更仍待实现。其他 PostgreSQL 缺口包括超出 `Relation` 信息范围的短暂历史列可空性/default 重建、PostGIS/hstore/vector 等扩展类型、更广故障样例，以及 Kafka 端到端恢复覆盖。
+当前 PostgreSQL 信号能力有意限定为 source table channel、单一信号表和 incremental snapshot。可写模式支持 `insert_insert`，只读模式使用事务快照。当 `incremental.snapshot.allow.schema.changes=false` 时，Rustium 会在每次打开窗口后比较 catalog，并拒绝活动表发生变化的 WAL `Relation`；它保留旧 checkpoint，不会查询或发出布局不匹配的数据。`true` 所需的安全 chunk 重读仍待实现。其他 PostgreSQL 缺口包括超出 `Relation` 信息范围的短暂历史列可空性/default 重建、PostGIS/hstore/vector 等扩展类型、更广故障样例，以及 Kafka 端到端恢复覆盖。
 
 ### MySQL
 

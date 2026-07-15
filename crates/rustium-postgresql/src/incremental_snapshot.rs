@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use crate::{
     schema_history::{IncrementalSnapshotProgress, TableSchema},
-    source::convert_text,
+    source::{convert_text, query_table_schema},
 };
 
 const EXECUTE_SNAPSHOT: &str = "execute-snapshot";
@@ -282,6 +282,19 @@ impl IncrementalSnapshotController {
         }
     }
 
+    pub(crate) fn reject_active_schema_change(&self, schema: &str, table: &str) -> Result<()> {
+        if self
+            .current_schema
+            .as_ref()
+            .is_some_and(|current| current.schema == schema && current.table == table)
+        {
+            return Err(Error::Source(format!(
+                "PostgreSQL schema changed for {schema}.{table} while an incremental snapshot window was active; stop the snapshot or restart it after the schema change"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn after_commit(
         &mut self,
         config: &PostgresSourceConfig,
@@ -383,6 +396,7 @@ impl IncrementalSnapshotController {
         let chunk_id = format!("{}-{}", progress.signal_id, progress.chunk_sequence);
         let input = PrepareChunkInput {
             connection_url: config.connection_url(false)?,
+            catalog_config: config.clone(),
             signal_data_collection: config
                 .signal_data_collection
                 .clone()
@@ -564,6 +578,7 @@ struct ControlSnapshotData {
 
 struct PrepareChunkInput {
     connection_url: String,
+    catalog_config: PostgresSourceConfig,
     signal_data_collection: Option<String>,
     schema: TableSchema,
     last_key: Option<Vec<String>>,
@@ -610,6 +625,27 @@ fn prepare_chunk(
         )?;
         (Some(signal_table), None)
     };
+
+    let catalog = query_table_schema(
+        &mut connection,
+        &input.catalog_config,
+        &input.schema.schema,
+        &input.schema.table,
+    )?
+    .ok_or_else(|| {
+        Error::Source(format!(
+            "incremental snapshot table {}.{} disappeared after its window opened",
+            input.schema.schema, input.schema.table
+        ))
+    })?;
+    if catalog.event_schema.fields != input.schema.event_schema.fields
+        || catalog.column_types != input.schema.column_types
+    {
+        return Err(Error::Source(format!(
+            "PostgreSQL schema changed for {}.{} while an incremental snapshot window was active; stop the snapshot or restart it after the schema change",
+            input.schema.schema, input.schema.table
+        )));
+    }
 
     let primary_key_fields = input
         .schema
