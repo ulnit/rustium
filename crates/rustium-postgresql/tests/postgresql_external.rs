@@ -962,6 +962,144 @@ async fn rejects_checkpoint_resume_after_replication_slot_loss() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ superuser with WAL retention controls"]
+async fn rejects_checkpoint_resume_after_wal_retention_invalidation() -> TestResult {
+    if !std::env::var("RUSTIUM_POSTGRES_RUN_WAL_RETENTION_TEST")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        eprintln!(
+            "PostgreSQL WAL retention gate skipped: set RUSTIUM_POSTGRES_RUN_WAL_RETENTION_TEST=true to allow temporary ALTER SYSTEM"
+        );
+        return Ok(());
+    }
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_wal_loss_{}", &suffix[..12]);
+    let publication = format!("rustium_wal_loss_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_wal_loss_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-wal-loss-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+    let original_retention = client
+        .query_one("SHOW max_slot_wal_keep_size", &[])
+        .await?
+        .get::<_, String>(0);
+    let configure_result = set_max_slot_wal_keep_size(&client, "1MB").await;
+    if let Err(error) = configure_result {
+        let _ = set_max_slot_wal_keep_size(&client, &original_retention).await;
+        connection_task.abort();
+        return Err(error);
+    }
+
+    let outcome = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (id BIGINT PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT INTO public.{table_name} VALUES (1, 'checkpointed'); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+        let config = settings.source_config(&publication, &slot_name, &table_name);
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let (position, connector_state) = loop {
+            let record = receive(&mut output).await?;
+            if record.boundary == RecordBoundary::SnapshotComplete {
+                break (
+                    record.position,
+                    record.connector_state.ok_or_else(|| {
+                        test_error("WAL-loss snapshot completion has no connector state")
+                    })?,
+                );
+            }
+        };
+        stop_source(cancellation, source_task).await?;
+        wait_for_inactive_slot(&client, &slot_name).await?;
+
+        let mut wal_status = replication_slot_wal_status(&client, &slot_name).await?;
+        for round in 0_i64..6 {
+            let first_id = 2 + round * 48;
+            let last_id = first_id + 47;
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO public.{table_name} (id, value) \
+                         SELECT id, repeat('wal-retention-', 100000) \
+                         FROM generate_series({first_id}, {last_id}) AS ids(id)"
+                    ),
+                    &[],
+                )
+                .await?;
+            client.query_one("SELECT pg_switch_wal()", &[]).await?;
+            client.execute("CHECKPOINT", &[]).await?;
+            wal_status = replication_slot_wal_status(&client, &slot_name).await?;
+            if wal_status == "lost" {
+                break;
+            }
+        }
+        require(
+            wal_status == "lost",
+            &format!(
+                "PostgreSQL WAL retention fixture did not invalidate the replication slot; final wal_status={wal_status:?}"
+            ),
+        )?;
+
+        let checkpoint = Checkpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            connector_name: connector_name.clone(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: position,
+            snapshot_completed: true,
+            config_fingerprint: "postgresql-wal-loss-test".into(),
+            updated_at: SystemTime::now(),
+            connector_state: Some(connector_state),
+        };
+        let mut resumed_source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+            },
+        );
+        resumed_source.validate().await?;
+        let (_output, _cancellation, source_task) = start_source(resumed_source, Some(checkpoint));
+        let source_result = tokio::time::timeout(Duration::from_secs(10), source_task)
+            .await
+            .map_err(|_| test_error("WAL-loss resume did not fail promptly"))??;
+        let error = match source_result {
+            Err(error) => error,
+            Ok(()) => return Err(test_error("WAL-loss resume unexpectedly continued")),
+        };
+        require(
+            error.to_string().contains("wal_status=\"lost\"")
+                && error.to_string().contains("reset the checkpoint"),
+            "WAL-loss failure did not explain the required recovery action",
+        )
+    }
+    .await;
+
+    let restore_result = set_max_slot_wal_keep_size(&client, &original_retention).await;
+    let cleanup_result = cleanup(&client, &publication, &slot_name, &[&table_name]).await;
+    connection_task.abort();
+    restore_result?;
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL WAL-loss test cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
 async fn runs_incremental_snapshot_from_file_signal() -> TestResult {
     let settings = TestSettings::from_env()?;
@@ -2606,6 +2744,60 @@ async fn wait_for_active_slot(client: &Client, slot_name: &str) -> TestResult {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(test_error("replication slot did not become active"))
+}
+
+async fn wait_for_inactive_slot(client: &Client, slot_name: &str) -> TestResult {
+    for _ in 0..100 {
+        let active = client
+            .query_opt(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot_name],
+            )
+            .await?
+            .is_some_and(|row| row.get(0));
+        if !active {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(test_error("replication slot did not become inactive"))
+}
+
+async fn replication_slot_wal_status(client: &Client, slot_name: &str) -> TestResult<String> {
+    client
+        .query_one(
+            "SELECT wal_status FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot_name],
+        )
+        .await?
+        .get::<_, Option<String>>(0)
+        .ok_or_else(|| test_error("replication slot has no WAL status"))
+}
+
+async fn set_max_slot_wal_keep_size(client: &Client, value: &str) -> TestResult {
+    let sql = format!(
+        "ALTER SYSTEM SET max_slot_wal_keep_size = '{}'",
+        value.replace('\'', "''")
+    );
+    client.execute(&sql, &[]).await?;
+    let reloaded = client
+        .query_one("SELECT pg_reload_conf()", &[])
+        .await?
+        .get::<_, bool>(0);
+    require(reloaded, "PostgreSQL did not reload max_slot_wal_keep_size")?;
+    for _ in 0..100 {
+        let current = client
+            .query_one("SHOW max_slot_wal_keep_size", &[])
+            .await?
+            .get::<_, String>(0);
+        if current == value {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(test_error(&format!(
+        "PostgreSQL max_slot_wal_keep_size did not become {value:?}"
+    )))
 }
 
 async fn wait_for_active_pid(client: &Client, slot_name: &str) -> TestResult<i32> {
