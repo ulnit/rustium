@@ -1,5 +1,6 @@
 //! PostgreSQL logical replication source for Rustium.
 
+mod file_signal;
 mod incremental_snapshot;
 mod schema_history;
 mod source;

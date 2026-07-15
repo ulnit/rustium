@@ -68,6 +68,9 @@ impl TestSettings {
             heartbeat_topics_prefix: "__debezium-heartbeat".into(),
             heartbeat_topic_name: None,
             signal_data_collection: None,
+            signal_enabled_channels: vec!["source".into()],
+            signal_file: "file-signals.txt".into(),
+            signal_poll_interval: Duration::from_secs(5),
             incremental_snapshot_chunk_size: 1_024,
             incremental_snapshot_watermarking_strategy: "insert_insert".into(),
             read_only: false,
@@ -471,6 +474,281 @@ async fn keeps_snapshot_and_streaming_type_conversion_identical() -> TestResult 
             return Err(cleanup_error);
         }
         eprintln!("PostgreSQL type test cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn runs_incremental_snapshot_from_file_signal() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_file_{}", &suffix[..12]);
+    let signal_table = format!("rustium_file_signal_{}", &suffix[..12]);
+    let publication = format!("rustium_file_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_file_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-file-{}", &suffix[..12]);
+    let signal_directory = tempfile::tempdir()?;
+    let signal_path = signal_directory.path().join("signals.jsonl");
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (\
+                    id BIGINT PRIMARY KEY, value TEXT NOT NULL\
+                 ); \
+                 INSERT INTO public.{table_name} VALUES \
+                    (1, 'one'), (2, 'two'), (3, 'three'); \
+                 CREATE TABLE public.{signal_table} (\
+                    id VARCHAR(64), type VARCHAR(32), data VARCHAR(2048)\
+                 ); \
+                 CREATE PUBLICATION {publication} FOR TABLE \
+                    public.{table_name}, public.{signal_table};"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        config.signal_data_collection = Some(format!("public.{signal_table}"));
+        config.signal_enabled_channels = vec!["file".into()];
+        config.signal_file = signal_path.to_string_lossy().into_owned();
+        config.signal_poll_interval = Duration::from_millis(20);
+        config.incremental_snapshot_chunk_size = 2;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+
+        wait_for_active_slot(&client, &slot_name).await?;
+        let signal = serde_json::json!({
+            "id": format!("file-{suffix}"),
+            "type": "execute-snapshot",
+            "data": {
+                "type": "incremental",
+                "data-collections": [format!(r"public\.{table_name}")]
+            }
+        });
+        std::fs::write(&signal_path, format!("{signal}\n"))?;
+
+        let capture_result: TestResult<Vec<i64>> = async {
+            let mut ids = Vec::new();
+            let mut saw_external_checkpoint = false;
+            loop {
+                let record = receive(&mut output).await?;
+                if record.boundary == RecordBoundary::TransactionCommit
+                    && ids.is_empty()
+                    && record
+                        .connector_state
+                        .as_ref()
+                        .and_then(|state| state.payload.get("incremental_snapshot"))
+                        .is_some()
+                {
+                    saw_external_checkpoint = true;
+                }
+                if record.boundary == RecordBoundary::Data {
+                    let event = record.event.ok_or_else(|| {
+                        test_error("file incremental snapshot record has no event")
+                    })?;
+                    require_incremental_event(&event, &table_name)?;
+                    ids.push(row_id(event.after.as_ref())?);
+                }
+                if ids.len() == 3
+                    && record
+                        .connector_state
+                        .as_ref()
+                        .is_some_and(|state| state.payload.get("incremental_snapshot").is_none())
+                {
+                    require(
+                        saw_external_checkpoint,
+                        "file signal progress was not checkpointed at the safe source position",
+                    )?;
+                    break Ok(ids);
+                }
+            }
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        let ids = combine_capture_and_stop(capture_result, stop_result)?;
+        require(
+            ids == [1, 2, 3],
+            "file-signaled snapshot rows are incorrect",
+        )?;
+        require(
+            std::fs::read_to_string(&signal_path)?.is_empty(),
+            "file signal was not cleared after polling",
+        )?;
+        let signal_counts = client
+            .query_one(
+                &format!(
+                    "SELECT \
+                         count(*) FILTER (WHERE type = 'execute-snapshot'), \
+                         count(*) FILTER (WHERE type LIKE 'snapshot-window-%') \
+                     FROM public.{signal_table}"
+                ),
+                &[],
+            )
+            .await?;
+        require(
+            signal_counts.get::<_, i64>(0) == 0,
+            "file signal was unexpectedly written to the source signal table",
+        )?;
+        require(
+            signal_counts.get::<_, i64>(1) == 4,
+            "file-signaled snapshot did not emit two bounded watermark pairs",
+        )
+    }
+    .await;
+
+    let cleanup_result = cleanup(
+        &client,
+        &publication,
+        &slot_name,
+        &[&table_name, &signal_table],
+    )
+    .await;
+    connection_task.abort();
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL file signal cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn runs_read_only_file_snapshot_without_signal_table() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_ro_file_{}", &suffix[..12]);
+    let publication = format!("rustium_ro_file_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_ro_file_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-ro-file-{}", &suffix[..12]);
+    let signal_directory = tempfile::tempdir()?;
+    let signal_path = signal_directory.path().join("signals.jsonl");
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (\
+                    id BIGINT PRIMARY KEY, value TEXT NOT NULL\
+                 ); \
+                 INSERT INTO public.{table_name} VALUES \
+                    (1, 'one'), (2, 'two'), (3, 'three'); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        config.signal_enabled_channels = vec!["file".into()];
+        config.signal_file = signal_path.to_string_lossy().into_owned();
+        config.signal_poll_interval = Duration::from_millis(20);
+        config.incremental_snapshot_chunk_size = 2;
+        config.read_only = true;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+
+        wait_for_active_slot(&client, &slot_name).await?;
+        let signal = serde_json::json!({
+            "id": format!("read-only-file-{suffix}"),
+            "type": "execute-snapshot",
+            "data": {
+                "type": "incremental",
+                "data-collections": [format!(r"public\.{table_name}")]
+            }
+        });
+        std::fs::write(&signal_path, format!("{signal}\n"))?;
+
+        loop {
+            let record = receive(&mut output).await?;
+            if record.boundary == RecordBoundary::TransactionCommit
+                && record
+                    .connector_state
+                    .as_ref()
+                    .and_then(|state| state.payload.get("incremental_snapshot"))
+                    .is_some()
+            {
+                break;
+            }
+        }
+        client
+            .execute(
+                &format!("UPDATE public.{table_name} SET value = 'one-updated' WHERE id = 1"),
+                &[],
+            )
+            .await?;
+
+        let capture_result: TestResult<Vec<i64>> = async {
+            let mut ids = Vec::new();
+            let mut saw_streamed_update = false;
+            loop {
+                let record = receive(&mut output).await?;
+                if let Some(event) = record.event {
+                    if event
+                        .source
+                        .attributes
+                        .get("rustium.snapshot.kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("incremental")
+                    {
+                        ids.push(row_id(event.after.as_ref())?);
+                    } else if event.operation == Operation::Update
+                        && row_id(event.after.as_ref())? == 1
+                    {
+                        saw_streamed_update = true;
+                    }
+                }
+                if ids.len() == 2
+                    && record
+                        .connector_state
+                        .as_ref()
+                        .is_some_and(|state| state.payload.get("incremental_snapshot").is_none())
+                {
+                    require(
+                        saw_streamed_update,
+                        "read-only file snapshot did not stream the concurrent update",
+                    )?;
+                    break Ok(ids);
+                }
+            }
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        let ids = combine_capture_and_stop(capture_result, stop_result)?;
+        require(
+            ids == [2, 3],
+            "read-only file snapshot did not deduplicate the updated key",
+        )?;
+        require(
+            std::fs::read_to_string(&signal_path)?.is_empty(),
+            "read-only file signal was not cleared after polling",
+        )
+    }
+    .await;
+
+    let cleanup_result = cleanup(&client, &publication, &slot_name, &[&table_name]).await;
+    connection_task.abort();
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL read-only file signal cleanup also failed: {cleanup_error}");
     }
     outcome
 }

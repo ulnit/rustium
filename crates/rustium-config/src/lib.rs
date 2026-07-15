@@ -197,6 +197,24 @@ impl SourceConfig {
                             }),
                         );
                 }
+                if config.signal_enabled_channels != default_signal_enabled_channels()
+                    || config
+                        .signal_enabled_channels
+                        .iter()
+                        .any(|channel| channel == "file")
+                {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "signals".into(),
+                            serde_json::json!({
+                                "enabled_channels": config.signal_enabled_channels,
+                                "file": config.signal_file,
+                                "poll_interval_ms": config.signal_poll_interval.as_millis(),
+                            }),
+                        );
+                }
                 semantic
                     .as_object_mut()
                     .expect("source semantic is an object")
@@ -260,6 +278,13 @@ pub struct PostgresSourceConfig {
     pub heartbeat_topic_name: Option<String>,
     #[serde(default)]
     pub signal_data_collection: Option<String>,
+    #[serde(default = "default_signal_enabled_channels")]
+    pub signal_enabled_channels: Vec<String>,
+    #[serde(default = "default_signal_file")]
+    pub signal_file: String,
+    #[serde(default = "default_signal_poll_interval")]
+    #[serde(with = "humantime_serde")]
+    pub signal_poll_interval: Duration,
     #[serde(default = "default_incremental_snapshot_chunk_size")]
     pub incremental_snapshot_chunk_size: usize,
     #[serde(default = "default_incremental_snapshot_watermarking_strategy")]
@@ -310,6 +335,29 @@ impl PostgresSourceConfig {
         if !matches!(self.hstore_handling_mode.as_str(), "json" | "map") {
             return Err(Error::Configuration(
                 "source.hstore_handling_mode must be json or map".into(),
+            ));
+        }
+        if self.signal_poll_interval.is_zero() {
+            return Err(Error::Configuration(
+                "source.signal_poll_interval must be greater than zero".into(),
+            ));
+        }
+        if self.signal_enabled_channels.iter().any(|channel| {
+            channel.trim().is_empty() || !matches!(channel.as_str(), "source" | "file")
+        }) {
+            return Err(Error::Configuration(
+                "source.signal_enabled_channels currently supports source and file".into(),
+            ));
+        }
+        if self
+            .signal_enabled_channels
+            .iter()
+            .any(|channel| channel == "file")
+            && self.signal_file.trim().is_empty()
+        {
+            return Err(Error::Configuration(
+                "source.signal_file must not be empty when the file signal channel is enabled"
+                    .into(),
             ));
         }
         if let Some(collection) = &self.signal_data_collection {
@@ -940,6 +988,15 @@ fn default_incremental_snapshot_watermarking_strategy() -> String {
 }
 fn default_hstore_handling_mode() -> String {
     "json".into()
+}
+fn default_signal_enabled_channels() -> Vec<String> {
+    vec!["source".into()]
+}
+fn default_signal_file() -> String {
+    "file-signals.txt".into()
+}
+const fn default_signal_poll_interval() -> Duration {
+    Duration::from_secs(5)
 }
 fn default_unavailable_value() -> String {
     "__rustium_unavailable_value".into()

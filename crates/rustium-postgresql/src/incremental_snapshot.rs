@@ -112,10 +112,41 @@ impl IncrementalSnapshotController {
     pub(crate) fn parse_signal(row: &RowData) -> Result<Signal> {
         let id = signal_column(row, "id")?;
         let signal_type = signal_column(row, "type")?;
+        let data = signal_column(row, "data")?;
+        Self::parse_signal_fields(id, signal_type, &data)
+    }
+
+    pub(crate) fn parse_external_signal(line: &str) -> Result<Signal> {
+        let envelope: ExternalSignalEnvelope = serde_json::from_str(line).map_err(|error| {
+            Error::Source(format!(
+                "PostgreSQL external signal has invalid JSON: {error}"
+            ))
+        })?;
+        if envelope.id.trim().is_empty() || envelope.signal_type.trim().is_empty() {
+            return Err(Error::Source(
+                "PostgreSQL external signal requires non-empty id and type".into(),
+            ));
+        }
+        let data = envelope
+            .data
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
+            .to_string();
+        let signal = Self::parse_signal_fields(envelope.id, envelope.signal_type, &data)?;
+        if matches!(
+            &signal,
+            Signal::WindowOpen { .. } | Signal::WindowClose { .. }
+        ) {
+            return Err(Error::Source(
+                "PostgreSQL external signal cannot emit internal snapshot watermarks".into(),
+            ));
+        }
+        Ok(signal)
+    }
+
+    fn parse_signal_fields(id: String, signal_type: String, data: &str) -> Result<Signal> {
         match signal_type.as_str() {
             EXECUTE_SNAPSHOT => {
-                let data = signal_column(row, "data")?;
-                let request: ExecuteSnapshotData = serde_json::from_str(&data).map_err(|error| {
+                let request: ExecuteSnapshotData = serde_json::from_str(data).map_err(|error| {
                     Error::Source(format!(
                         "PostgreSQL execute-snapshot signal {id:?} has invalid JSON data: {error}"
                     ))
@@ -152,18 +183,18 @@ impl IncrementalSnapshotController {
                 })
             }
             STOP_SNAPSHOT => {
-                let request = control_snapshot_data(row, &id)?;
+                let request = control_snapshot_data(data, &id)?;
                 Ok(Signal::Stop {
                     id,
                     data_collections: request.data_collections,
                 })
             }
             PAUSE_SNAPSHOT => {
-                control_snapshot_data(row, &id)?;
+                control_snapshot_data(data, &id)?;
                 Ok(Signal::Pause { id })
             }
             RESUME_SNAPSHOT => {
-                control_snapshot_data(row, &id)?;
+                control_snapshot_data(data, &id)?;
                 Ok(Signal::Resume { id })
             }
             WINDOW_OPEN => Ok(Signal::WindowOpen { id }),
@@ -549,6 +580,15 @@ impl IncrementalSnapshotController {
 }
 
 #[derive(Deserialize)]
+struct ExternalSignalEnvelope {
+    id: String,
+    #[serde(rename = "type")]
+    signal_type: String,
+    #[serde(default)]
+    data: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct ExecuteSnapshotData {
     #[serde(default, rename = "type")]
@@ -883,9 +923,8 @@ fn signal_column(row: &RowData, name: &str) -> Result<String> {
         .ok_or_else(|| Error::Source(format!("PostgreSQL signal has no text {name} column")))
 }
 
-fn control_snapshot_data(row: &RowData, id: &str) -> Result<ControlSnapshotData> {
-    let data = signal_column(row, "data")?;
-    let request: ControlSnapshotData = serde_json::from_str(&data).map_err(|error| {
+fn control_snapshot_data(data: &str, id: &str) -> Result<ControlSnapshotData> {
+    let request: ControlSnapshotData = serde_json::from_str(data).map_err(|error| {
         Error::Source(format!(
             "PostgreSQL snapshot control signal {id:?} has invalid JSON data: {error}"
         ))
@@ -1128,6 +1167,34 @@ mod tests {
                     && additional_conditions.len() == 1
                     && additional_conditions[0].filter == "status = 'open'"
         ));
+    }
+
+    #[test]
+    fn parses_external_json_signal_and_rejects_internal_watermarks() {
+        assert!(matches!(
+            IncrementalSnapshotController::parse_external_signal(
+                r#"{"id":"file-1","type":"execute-snapshot","data":{"type":"incremental","data-collections":["public\\.orders"]}}"#,
+            )
+            .unwrap(),
+            Signal::Execute { id, data_collections, .. }
+                if id == "file-1" && data_collections == ["public\\.orders"]
+        ));
+        assert!(
+            IncrementalSnapshotController::parse_external_signal(
+                r#"{"id":"internal","type":"snapshot-window-open","data":{}}"#,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("internal snapshot watermarks")
+        );
+        assert!(
+            IncrementalSnapshotController::parse_external_signal(
+                r#"{"id":"","type":"pause-snapshot","data":{}}"#,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("non-empty id and type")
+        );
     }
 
     #[test]

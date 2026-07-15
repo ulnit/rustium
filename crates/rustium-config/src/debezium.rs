@@ -49,18 +49,25 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
     }
     let signal_data_collection = signal_collections.into_iter().next();
     let signal_channels = csv_property(properties.get("signal.enabled.channels"));
-    if signal_data_collection.is_some()
-        && !signal_channels.is_empty()
-        && !signal_channels.iter().any(|channel| channel == "source")
-    {
+    let requested_signal_channels = if signal_channels.is_empty() {
+        default_signal_enabled_channels()
+    } else {
+        signal_channels
+    };
+    let signal_enabled_channels = requested_signal_channels
+        .iter()
+        .filter(|channel| matches!(channel.as_str(), "source" | "file"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if signal_enabled_channels.is_empty() {
         return Err(Error::Configuration(
-            "PostgreSQL signal.data.collection requires the source signal channel".into(),
+            "PostgreSQL signal.enabled.channels enables no implemented channel".into(),
         ));
     }
     let mut warnings = Vec::new();
-    for channel in signal_channels
+    for channel in requested_signal_channels
         .iter()
-        .filter(|channel| channel.as_str() != "source")
+        .filter(|channel| !matches!(channel.as_str(), "source" | "file"))
     {
         warnings.push(format!(
             "signal.enabled.channels={channel} is not implemented and was ignored"
@@ -119,6 +126,16 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 .unwrap_or_else(default_heartbeat_topics_prefix),
             heartbeat_topic_name: properties.get("topic.heartbeat.name").cloned(),
             signal_data_collection,
+            signal_enabled_channels,
+            signal_file: properties
+                .get("signal.file")
+                .cloned()
+                .unwrap_or_else(default_signal_file),
+            signal_poll_interval: duration_ms(
+                &properties,
+                "signal.poll.interval.ms",
+                default_signal_poll_interval(),
+            )?,
             incremental_snapshot_chunk_size: usize_value(
                 &properties,
                 "incremental.snapshot.chunk.size",
@@ -667,6 +684,8 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "topic.heartbeat.name",
         "signal.data.collection",
         "signal.enabled.channels",
+        "signal.file",
+        "signal.poll.interval.ms",
         "incremental.snapshot.chunk.size",
         "incremental.snapshot.allow.schema.changes",
         "incremental.snapshot.watermarking.strategy",
@@ -724,7 +743,9 @@ heartbeat.action.query=INSERT INTO public.rustium_heartbeat (id) VALUES (1)
 topic.heartbeat.prefix=__pg-heartbeat
 topic.heartbeat.name=shared-pg-heartbeat
 signal.data.collection=public.rustium_signal
-signal.enabled.channels=source
+signal.enabled.channels=source,file
+signal.file=/run/rustium/orders-signals.jsonl
+signal.poll.interval.ms=250
 incremental.snapshot.chunk.size=128
 incremental.snapshot.allow.schema.changes=false
 incremental.snapshot.watermarking.strategy=insert_insert
@@ -754,6 +775,9 @@ max.batch.size=1000
             source.signal_data_collection.as_deref(),
             Some("public.rustium_signal")
         );
+        assert_eq!(source.signal_enabled_channels, ["source", "file"]);
+        assert_eq!(source.signal_file, "/run/rustium/orders-signals.jsonl");
+        assert_eq!(source.signal_poll_interval, Duration::from_millis(250));
         assert_eq!(source.incremental_snapshot_chunk_size, 128);
         assert_eq!(
             source.incremental_snapshot_watermarking_strategy,
@@ -789,7 +813,7 @@ signal.enabled.channels=kafka
         assert!(
             unsupported_channel
                 .to_string()
-                .contains("source signal channel")
+                .contains("no implemented channel")
         );
 
         let schema_changes = parse(
@@ -806,6 +830,30 @@ incremental.snapshot.allow.schema.changes=true
         )
         .unwrap_err();
         assert!(schema_changes.to_string().contains("allow.schema.changes"));
+    }
+
+    #[test]
+    fn accepts_read_only_postgres_file_signaling_without_source_table() {
+        let config = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+signal.enabled.channels=file
+signal.file=/run/rustium/signals.jsonl
+signal.poll.interval.ms=100
+read.only=true
+"#,
+        )
+        .unwrap();
+        let source = config.source.as_postgresql().unwrap();
+        assert_eq!(source.signal_enabled_channels, ["file"]);
+        assert!(source.signal_data_collection.is_none());
+        assert!(source.read_only);
     }
 
     #[test]

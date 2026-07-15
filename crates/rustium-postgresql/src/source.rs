@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::{
+    file_signal,
     incremental_snapshot::{ClosedWindow, IncrementalSnapshotController, Signal},
     schema_history::{
         PostgresColumnType, TableSchema, decode_connector_state, encode_connector_state,
@@ -377,6 +378,9 @@ impl SourceConnector for PostgresSource {
         }
 
         stream.start(start_lsn).await.map_err(pg_error)?;
+        if start_lsn.is_none() {
+            start_lsn = Some(query_slot_safe_lsn(&self.config).await?);
+        }
         let feedback = Arc::clone(&stream.shared_lsn_feedback);
         if let Some(SourcePosition::Postgres(position)) = context.acknowledged.borrow().clone() {
             feedback.update_applied_lsn(position.commit_lsn.unwrap_or(position.lsn));
@@ -397,6 +401,7 @@ impl SourceConnector for PostgresSource {
             !snapshot_needed && checkpoint.is_none(),
         );
         let mut heartbeat = heartbeat_timer(self.config.heartbeat_interval);
+        let mut file_signal_poll = file_signal_timer(&self.config);
         let mut heartbeat_connection = open_heartbeat_connection(&self.config).await?;
         let mut incremental = IncrementalSnapshotController::new(incremental_progress);
         incremental.resume(&self.config, &state.schemas).await?;
@@ -442,6 +447,40 @@ impl SourceConnector for PostgresSource {
                             .await
                             .map_err(|_| Error::Cancelled)?;
                     }
+                }
+                () = next_file_signal_poll(&mut file_signal_poll) => {
+                    if state.transaction.is_some() {
+                        debug!("PostgreSQL file signal polling deferred until the active transaction commits");
+                        continue;
+                    }
+                    for line in file_signal::read_and_clear(&self.config.signal_file).await? {
+                        let signal = match IncrementalSnapshotController::parse_external_signal(&line) {
+                            Ok(signal) => signal,
+                            Err(error) => {
+                                warn!(%error, "invalid PostgreSQL file signal ignored");
+                                continue;
+                            }
+                        };
+                        if let Signal::Unsupported { id, signal_type } = &signal {
+                            warn!(%id, %signal_type, "unsupported PostgreSQL file signal ignored");
+                        }
+                        incremental
+                            .handle_signal(signal, &self.config, &state.schemas)
+                            .await?;
+                        if self.config.read_only {
+                            incremental
+                                .prepare_read_only_continuation(&self.config, &state.schemas)
+                                .await?;
+                        } else {
+                            incremental.after_commit(&self.config, &state.schemas).await?;
+                        }
+                    }
+                    checkpoint_external_signal_state(
+                        &mut state,
+                        &mut incremental,
+                        &context.output,
+                        last_safe_position.as_ref(),
+                    ).await?;
                 }
                 event = stream.next_event_with_retry(&context.cancellation) => {
                     let event = match event {
@@ -559,6 +598,15 @@ impl SourceConnector for PostgresSource {
                         && is_signal_table(&self.config, schema, table)
                     {
                         let signal = IncrementalSnapshotController::parse_signal(data)?;
+                        let enabled = signal_channel_enabled(&self.config, "source")
+                            || matches!(
+                                &signal,
+                                Signal::WindowOpen { .. } | Signal::WindowClose { .. }
+                            );
+                        if !enabled {
+                            debug!("PostgreSQL source-table signal ignored because the source channel is disabled");
+                            continue;
+                        }
                         if let Signal::Unsupported { id, signal_type } = &signal {
                             warn!(%id, %signal_type, "unsupported PostgreSQL signal ignored");
                         }
@@ -625,6 +673,35 @@ async fn send_incremental_window(
     Ok(())
 }
 
+async fn checkpoint_external_signal_state(
+    state: &mut StreamingState,
+    incremental: &mut IncrementalSnapshotController,
+    output: &mpsc::Sender<Result<SourceRecord>>,
+    position: Option<&SourcePosition>,
+) -> Result<()> {
+    let incremental_dirty = incremental.take_state_dirty();
+    if !state.schema_dirty && !incremental_dirty {
+        return Ok(());
+    }
+    let position = position.cloned().ok_or_else(|| {
+        Error::Invariant("PostgreSQL external signal has no safe source position".into())
+    })?;
+    output
+        .send(Ok(SourceRecord {
+            event: None,
+            position,
+            boundary: RecordBoundary::TransactionCommit,
+            connector_state: Some(encode_connector_state(
+                &state.schemas,
+                incremental.progress(),
+            )?),
+        }))
+        .await
+        .map_err(|_| Error::Cancelled)?;
+    state.schema_dirty = false;
+    Ok(())
+}
+
 fn heartbeat_timer(interval: Duration) -> Option<tokio::time::Interval> {
     if interval.is_zero() {
         return None;
@@ -634,6 +711,24 @@ fn heartbeat_timer(interval: Duration) -> Option<tokio::time::Interval> {
     Some(timer)
 }
 
+fn file_signal_timer(config: &PostgresSourceConfig) -> Option<tokio::time::Interval> {
+    signal_channel_enabled(config, "file").then(|| {
+        let mut timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + config.signal_poll_interval,
+            config.signal_poll_interval,
+        );
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        timer
+    })
+}
+
+fn signal_channel_enabled(config: &PostgresSourceConfig, name: &str) -> bool {
+    config
+        .signal_enabled_channels
+        .iter()
+        .any(|channel| channel == name)
+}
+
 async fn next_heartbeat(timer: &mut Option<tokio::time::Interval>) {
     match timer {
         Some(timer) => {
@@ -641,6 +736,10 @@ async fn next_heartbeat(timer: &mut Option<tokio::time::Interval>) {
         }
         None => std::future::pending::<()>().await,
     }
+}
+
+async fn next_file_signal_poll(timer: &mut Option<tokio::time::Interval>) {
+    next_heartbeat(timer).await;
 }
 
 async fn open_heartbeat_connection(
@@ -658,6 +757,25 @@ async fn open_heartbeat_connection(
             ))
         })??;
     Ok(Some(connection))
+}
+
+async fn query_slot_safe_lsn(config: &PostgresSourceConfig) -> Result<u64> {
+    let connection_url = config.connection_url(false)?;
+    let slot_name = config.slot_name.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut connection = connect(&connection_url)?;
+        let slot = quote_literal(&slot_name).map_err(pg_error)?;
+        let lsn = scalar(
+            &mut connection,
+            &format!(
+                "SELECT COALESCE(confirmed_flush_lsn, restart_lsn)::text \
+                 FROM pg_replication_slots WHERE slot_name = {slot}"
+            ),
+        )?;
+        parse_lsn(&lsn).map_err(pg_error)
+    })
+    .await
+    .map_err(|error| Error::Source(format!("slot LSN query task failed: {error}")))?
 }
 
 async fn execute_heartbeat_action(
@@ -2148,6 +2266,9 @@ mod tests {
             heartbeat_topics_prefix: "__debezium-heartbeat".into(),
             heartbeat_topic_name: None,
             signal_data_collection: None,
+            signal_enabled_channels: vec!["source".into()],
+            signal_file: "file-signals.txt".into(),
+            signal_poll_interval: Duration::from_secs(5),
             incremental_snapshot_chunk_size: 1_024,
             incremental_snapshot_watermarking_strategy: "insert_insert".into(),
             read_only: false,

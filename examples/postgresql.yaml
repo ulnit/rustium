@@ -20,6 +20,9 @@ source:
   ssl_mode: prefer
   heartbeat_interval: 0s
   heartbeat_topics_prefix: __debezium-heartbeat
+  signal_enabled_channels: [source]
+  signal_file: file-signals.txt
+  signal_poll_interval: 5s
   read_only: false
 
 snapshot:
