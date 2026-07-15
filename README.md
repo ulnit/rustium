@@ -43,7 +43,7 @@ The repository contains a runnable alpha implementation.
 | Kafka sink with idempotent producer settings | Implemented; end-to-end Kafka test pending |
 | PostgreSQL 14+ snapshot and `pgoutput` streaming | Implemented; external integration test passes with PostgreSQL 17 |
 | MySQL 8+ snapshot and row-binlog streaming | Implemented; Docker integration test passes with MySQL 8.4 |
-| SQL Server CDC | Implemented and linked; real SQL Server integration verification pending |
+| SQL Server CDC | Implemented; external integration test passes with SQL Server 2022 Developer CU25 |
 | CLI, health, status, stop, and Prometheus endpoints | Implemented |
 | Container image, Helm chart, published crates | Not published |
 
@@ -83,7 +83,8 @@ Requirements:
 - Rust `1.88.0` or newer
 - CMake and OpenSSL development packages for the Kafka client build
 - Access to PostgreSQL 14+ with logical replication for the ignored PostgreSQL integration test
-- Docker for the ignored MySQL and SQL Server integration tests
+- Access to SQL Server 2017+ with CDC and SQL Server Agent for the ignored SQL Server external integration test
+- Docker for the ignored MySQL and SQL Server container integration tests
 
 ```bash
 cargo build --workspace
@@ -109,6 +110,19 @@ cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocap
 ```
 
 The test creates uniquely named tables, publications, and managed replication slots. It covers snapshot handoff, transaction ordering and boundaries, checkpoint restart without a repeated snapshot, and resource cleanup.
+
+Run the external SQL Server 2017+ CDC integration test without storing credentials in the repository:
+
+```bash
+export RUSTIUM_SQLSERVER_TEST_HOST=sqlserver.example.com
+export RUSTIUM_SQLSERVER_TEST_PORT=1433
+export RUSTIUM_SQLSERVER_TEST_USER=sa
+export RUSTIUM_SQLSERVER_TEST_PASSWORD='replace-me'
+export RUSTIUM_SQLSERVER_TEST_DATABASE=cdc_demo
+cargo test -p rustium-sqlserver --test sqlserver_external -- --ignored --nocapture
+```
+
+The test creates a uniquely named table and capture instance. It verifies snapshot rows, CDC initialization, ordered transactional create/update/delete events, the commit boundary, checkpoint restart without snapshot replay, and cleanup.
 
 ### CLI
 
@@ -189,9 +203,9 @@ Implemented behavior:
 - explicit failure when CDC cleanup removes the required checkpoint LSN
 - bounded CDC queries controlled by `streaming.fetch.size`
 
-The current implementation requires exactly one entry in `database.names`, one active capture instance per selected table, and `data.query.mode=direct`. It has compiled and passed unit tests, but the SQL Server 2022 image could not be downloaded in the current macOS verification environment, so real-instance behavior is not yet claimed as verified. See [examples/sqlserver.properties](examples/sqlserver.properties).
+The current implementation requires exactly one entry in `database.names`, one active capture instance per selected table, and `data.query.mode=direct`. Snapshot, streaming, transaction ordering, checkpoint restart, and cleanup have been externally integration-tested against SQL Server 2022 Developer RTM-CU25. See [examples/sqlserver.properties](examples/sqlserver.properties).
 
-The database must have CDC enabled, SQL Server Agent must run the capture job, and the connector user needs source-table reads plus direct read access to the `cdc` schema. The pending Docker test can be run with:
+The database must have CDC enabled, SQL Server Agent must run the capture job, and the connector user needs source-table reads plus direct read access to the `cdc` schema. The separate Docker portability test remains runnable with:
 
 ```bash
 cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
@@ -302,7 +316,7 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 | 带幂等 Producer 设置的 Kafka Sink | 已实现；Kafka 端到端测试待补 |
 | PostgreSQL 14+ 快照与 `pgoutput` 流式捕获 | 已实现；PostgreSQL 17 外部集成测试通过 |
 | MySQL 8+ 快照与行级 binlog 流式捕获 | 已实现；MySQL 8.4 Docker 集成测试通过 |
-| SQL Server CDC | 已实现并接入；真实 SQL Server 集成验证待完成 |
+| SQL Server CDC | 已实现；SQL Server 2022 Developer CU25 外部集成测试通过 |
 | CLI、健康、状态、停止和 Prometheus 端点 | 已实现 |
 | 容器镜像、Helm Chart、已发布 crate | 尚未发布 |
 
@@ -342,7 +356,8 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 - Rust `1.88.0` 或更高版本
 - Kafka 客户端构建所需的 CMake 和 OpenSSL 开发包
 - 运行被忽略的 PostgreSQL 集成测试时，需要可访问已启用逻辑复制的 PostgreSQL 14+
-- 运行被忽略的 MySQL 和 SQL Server 集成测试时需要 Docker
+- 运行被忽略的 SQL Server 外部集成测试时，需要可访问已启用 CDC 和 SQL Server Agent 的 SQL Server 2017+
+- 运行被忽略的 MySQL 和 SQL Server 容器集成测试时需要 Docker
 
 ```bash
 cargo build --workspace
@@ -368,6 +383,19 @@ cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocap
 ```
 
 测试会创建唯一命名的表、publication 和托管 replication slot，覆盖快照切换、事务顺序与边界、从 checkpoint 重启且不重复快照，以及资源清理。
+
+运行外部 SQL Server 2017+ CDC 集成测试，凭据无需存入仓库：
+
+```bash
+export RUSTIUM_SQLSERVER_TEST_HOST=sqlserver.example.com
+export RUSTIUM_SQLSERVER_TEST_PORT=1433
+export RUSTIUM_SQLSERVER_TEST_USER=sa
+export RUSTIUM_SQLSERVER_TEST_PASSWORD='replace-me'
+export RUSTIUM_SQLSERVER_TEST_DATABASE=cdc_demo
+cargo test -p rustium-sqlserver --test sqlserver_external -- --ignored --nocapture
+```
+
+测试会创建唯一命名的表和 capture instance，验证快照记录、CDC 初始化、同一事务内有序的 create/update/delete 事件、commit 边界、checkpoint 重启不重复快照，以及资源清理。
 
 ### CLI
 
@@ -483,9 +511,9 @@ SQL Server 连接器基于原生 SQL Server CDC change table 实现。
 - CDC cleanup 删除所需 checkpoint LSN 时明确失败
 - 由 `streaming.fetch.size` 控制的有界 CDC 查询
 
-当前实现要求 `database.names` 只有一个数据库、每张选表只有一个活动 capture instance，并使用 `data.query.mode=direct`。代码已经通过编译和单元测试，但当前 macOS 验证环境未能完成 SQL Server 2022 镜像下载，因此尚不宣称真实实例验证通过。示例见 [examples/sqlserver.properties](examples/sqlserver.properties)。
+当前实现要求 `database.names` 只有一个数据库、每张选表只有一个活动 capture instance，并使用 `data.query.mode=direct`。快照、流式捕获、事务顺序、checkpoint 重启和清理已在 SQL Server 2022 Developer RTM-CU25 上通过外部集成测试。示例见 [examples/sqlserver.properties](examples/sqlserver.properties)。
 
-数据库必须启用 CDC，SQL Server Agent 必须运行 capture job，连接器用户需要读取源表，并能直接读取 `cdc` schema。待验证 Docker 测试可通过以下命令运行：
+数据库必须启用 CDC，SQL Server Agent 必须运行 capture job，连接器用户需要读取源表，并能直接读取 `cdc` schema。独立的 Docker 可移植性测试仍可通过以下命令运行：
 
 ```bash
 cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture

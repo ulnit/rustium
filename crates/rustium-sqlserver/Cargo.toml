@@ -29,3 +29,7 @@ workspace = true
 [[test]]
 name = "sqlserver_docker"
 path = "tests/sqlserver_docker.rs"
+
+[[test]]
+name = "sqlserver_external"
+path = "tests/sqlserver_external.rs"
