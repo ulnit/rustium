@@ -1977,6 +1977,7 @@ dependencies = [
  "futures",
  "indexmap",
  "mysql_async",
+ "regex",
  "rustium-config",
  "rustium-core",
  "serde",

@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use futures::StreamExt;
 use mysql_async::{
-    BinlogStream, BinlogStreamRequest, Conn, Opts, OptsBuilder, Row as MySqlRow, SslOpts, Value,
+    BinlogStream, BinlogStreamRequest, Conn, Opts, OptsBuilder, Row as MySqlRow, Sid, SslOpts,
+    Value,
     binlog::{
         events::{Event as BinlogEvent, EventData, RowsEventData, TableMapEvent},
         row::BinlogRow,
@@ -12,6 +13,7 @@ use mysql_async::{
     },
     prelude::Queryable,
 };
+use regex::RegexBuilder;
 use rustium_config::{MySqlSourceConfig, SnapshotConfig, SnapshotMode};
 use rustium_core::{
     ChangeEvent, DataValue, Error, EventId, EventSchema, FieldSchema, MySqlPosition, Operation,
@@ -29,7 +31,69 @@ struct BinlogCoordinates {
     filename: String,
     position: u64,
     gtid_set: Option<String>,
+    gtid_set_is_complete: bool,
     source_server_id: u32,
+}
+
+#[derive(Debug)]
+struct GtidSourceFilter {
+    patterns: Vec<regex::Regex>,
+    include: bool,
+}
+
+impl GtidSourceFilter {
+    fn from_config(config: &MySqlSourceConfig) -> Result<Option<Self>> {
+        let (patterns, include) = if !config.gtid_source_includes.is_empty() {
+            (&config.gtid_source_includes, true)
+        } else if !config.gtid_source_excludes.is_empty() {
+            (&config.gtid_source_excludes, false)
+        } else {
+            return Ok(None);
+        };
+        let patterns = patterns
+            .iter()
+            .map(|pattern| {
+                RegexBuilder::new(&format!(r"\A(?:{pattern})\z"))
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|error| {
+                        Error::Configuration(format!(
+                            "invalid MySQL GTID source filter {pattern:?}: {error}"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(Self { patterns, include }))
+    }
+
+    fn matches(&self, source_uuid: &str) -> bool {
+        let matched = self
+            .patterns
+            .iter()
+            .any(|pattern| pattern.is_match(source_uuid));
+        if self.include { matched } else { !matched }
+    }
+
+    fn filter_sids(&self, gtid_set: &str) -> Result<Vec<Sid<'static>>> {
+        gtid_set
+            .split(',')
+            .filter(|entry| !entry.trim().is_empty())
+            .map(|entry| {
+                let sid = entry.trim().parse::<Sid<'static>>().map_err(|error| {
+                    Error::Source(format!(
+                        "invalid MySQL gtid_executed entry {entry:?}: {error}"
+                    ))
+                })?;
+                let source_uuid = uuid::Uuid::from_bytes(sid.uuid()).to_string();
+                Ok((self.matches(&source_uuid)).then_some(sid))
+            })
+            .filter_map(|result| match result {
+                Ok(Some(sid)) => Some(Ok(sid)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -44,6 +108,7 @@ struct ActiveTransaction {
     source_time: Option<DateTime<Utc>>,
     total_order: u64,
     collection_order: HashMap<(String, String), u64>,
+    ignore_dml: bool,
 }
 
 pub struct MySqlSource {
@@ -52,6 +117,7 @@ pub struct MySqlSource {
     snapshot: SnapshotConfig,
     schemas: HashMap<(String, String), TableSchema>,
     source_server_id: u32,
+    gtid_source_filter: Option<GtidSourceFilter>,
 }
 
 impl MySqlSource {
@@ -67,10 +133,12 @@ impl MySqlSource {
             snapshot,
             schemas: HashMap::new(),
             source_server_id: 0,
+            gtid_source_filter: None,
         }
     }
 
     async fn validate_source(&mut self) -> Result<()> {
+        self.gtid_source_filter = GtidSourceFilter::from_config(&self.config)?;
         let mut connection = connect(&self.config).await?;
         let version = connection.server_version();
         if version < (8, 0, 0) {
@@ -244,9 +312,30 @@ impl MySqlSource {
             );
         }
         let filename = coordinates.filename.as_bytes().to_vec();
-        let request = BinlogStreamRequest::new(self.config.server_id)
+        let mut request = BinlogStreamRequest::new(self.config.server_id)
             .with_filename(&filename)
             .with_pos(coordinates.position);
+        if let (Some(filter), Some(gtid_set)) = (
+            &self.gtid_source_filter,
+            coordinates
+                .gtid_set_is_complete
+                .then_some(coordinates.gtid_set.as_deref())
+                .flatten(),
+        ) {
+            let filtered_sids = filter.filter_sids(gtid_set)?;
+            if filtered_sids.is_empty() {
+                warn!(
+                    gtid_set,
+                    "configured MySQL GTID source filters matched no executed sources; falling back to binlog file and position"
+                );
+            } else {
+                debug!(
+                    source_count = filtered_sids.len(),
+                    "opening MySQL stream with a filtered GTID set"
+                );
+                request = request.with_gtid().with_gtid_set(filtered_sids);
+            }
+        }
         connection
             .get_binlog_stream(request)
             .await
@@ -278,7 +367,13 @@ impl MySqlSource {
                 Vec::new()
             }
             EventData::GtidEvent(gtid) => {
-                state.begin_gtid(&gtid, source_time);
+                let source_uuid = uuid::Uuid::from_bytes(gtid.sid()).to_string();
+                let ignore_dml = self.config.gtid_source_filter_dml_events
+                    && self
+                        .gtid_source_filter
+                        .as_ref()
+                        .is_some_and(|filter| !filter.matches(&source_uuid));
+                state.begin_gtid(&gtid, source_time, ignore_dml);
                 Vec::new()
             }
             EventData::RowsEvent(rows) => {
@@ -409,6 +504,7 @@ impl SourceConnector for MySqlSource {
     }
 
     async fn run(&mut self, mut context: SourceContext) -> Result<()> {
+        self.gtid_source_filter = GtidSourceFilter::from_config(&self.config)?;
         let checkpoint = context.initial_checkpoint.clone();
         let snapshot_needed = match self.snapshot.mode {
             SnapshotMode::Never => false,
@@ -457,6 +553,7 @@ impl SourceConnector for MySqlSource {
                 filename: position.binlog_filename.clone(),
                 position: position.binlog_position,
                 gtid_set: position.gtid_set.clone(),
+                gtid_set_is_complete: position.snapshot,
                 source_server_id: position.server_id,
             }
         } else {
@@ -706,13 +803,19 @@ impl StreamingState {
         &mut self,
         event: &mysql_async::binlog::events::GtidEvent,
         source_time: Option<DateTime<Utc>>,
+        ignore_dml: bool,
     ) {
         let sid = uuid::Uuid::from_bytes(event.sid());
+        let id = event.tag().map_or_else(
+            || format!("{sid}:{}", event.gno()),
+            |tag| format!("{sid}:{tag}:{}", event.gno()),
+        );
         self.transaction = Some(ActiveTransaction {
-            id: format!("{sid}:{}", event.gno()),
+            id,
             source_time,
             total_order: 0,
             collection_order: HashMap::new(),
+            ignore_dml,
         });
     }
 
@@ -731,6 +834,13 @@ impl StreamingState {
         let table = table_map.table_name().into_owned();
         if !config.tables.includes(&database, &table)
             || (!config.databases.is_empty() && !config.databases.contains(&database))
+        {
+            return Ok(Vec::new());
+        }
+        if self
+            .transaction
+            .as_ref()
+            .is_some_and(|transaction| transaction.ignore_dml)
         {
             return Ok(Vec::new());
         }
@@ -753,6 +863,7 @@ impl StreamingState {
             source_time,
             total_order: 0,
             collection_order: HashMap::new(),
+            ignore_dml: false,
         });
         if transaction.source_time.is_none() {
             transaction.source_time = source_time;
@@ -843,6 +954,7 @@ impl StreamingState {
                 source_time,
                 total_order: 0,
                 collection_order: HashMap::new(),
+                ignore_dml: false,
             });
             if transaction.source_time.is_none() {
                 transaction.source_time = source_time;
@@ -925,6 +1037,7 @@ fn transaction_from_resume(resume_position: &Option<SourcePosition>) -> Option<A
                 source_time: None,
                 total_order: 0,
                 collection_order: HashMap::new(),
+                ignore_dml: false,
             })
         }
         _ => None,
@@ -937,6 +1050,7 @@ fn binlog_coordinates_from_position(position: &SourcePosition) -> Option<BinlogC
             filename: position.binlog_filename.clone(),
             position: position.binlog_position,
             gtid_set: position.gtid_set.clone(),
+            gtid_set_is_complete: position.snapshot,
             source_server_id: position.server_id,
         }),
         SourcePosition::Postgres(_) | SourcePosition::SqlServer(_) => None,
@@ -1065,6 +1179,7 @@ async fn current_binlog_coordinates(
         filename,
         position,
         gtid_set,
+        gtid_set_is_complete: true,
         source_server_id,
     })
 }
@@ -1528,12 +1643,37 @@ fn mysql_error(error: impl std::fmt::Display) -> Error {
 mod tests {
     use std::time::SystemTime;
 
+    use mysql_async::binlog::events::GtidEvent;
     use rustium_config::TableSelection;
     use rustium_core::{Checkpoint, ConnectorIdentity};
     use tokio::sync::{mpsc, watch};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+
+    fn test_mysql_config() -> MySqlSourceConfig {
+        MySqlSourceConfig {
+            hostname: "localhost".into(),
+            port: 3306,
+            username: "rustium".into(),
+            password: "secret".into(),
+            databases: vec!["inventory".into()],
+            server_id: 5_401,
+            tables: TableSelection::default(),
+            ssl_mode: "disabled".into(),
+            connect_timeout: std::time::Duration::from_secs(1),
+            connect_keep_alive: true,
+            connect_keep_alive_interval: std::time::Duration::from_secs(1),
+            reconnect_max_attempts: 1,
+            schema_history_skip_unparseable_ddl: false,
+            gtid_source_includes: Vec::new(),
+            gtid_source_excludes: Vec::new(),
+            gtid_source_filter_dml_events: true,
+            heartbeat_interval: std::time::Duration::ZERO,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
+        }
+    }
 
     #[test]
     fn builds_heartbeat_at_the_safe_mysql_position() {
@@ -1592,6 +1732,68 @@ mod tests {
     }
 
     #[test]
+    fn matches_included_mysql_gtid_sources_by_uuid_and_regex() {
+        let exact_uuid = "8f5f4a9a-6b2d-4dd5-915e-1df9d53d2850";
+        let mut config = test_mysql_config();
+        config.gtid_source_includes = vec![exact_uuid.into()];
+        let filter = GtidSourceFilter::from_config(&config).unwrap().unwrap();
+        assert!(filter.matches(exact_uuid));
+        assert!(filter.matches(&exact_uuid.to_ascii_uppercase()));
+        assert!(!filter.matches("8f5f4a9a-6b2d-4dd5-915e-1df9d53d2851"));
+
+        config.gtid_source_includes = vec![r"8f5f4a9a-[0-9a-f-]+".into()];
+        let filter = GtidSourceFilter::from_config(&config).unwrap().unwrap();
+        assert!(filter.matches(exact_uuid));
+        assert!(!filter.matches(&format!("prefix-{exact_uuid}")));
+    }
+
+    #[test]
+    fn excludes_matching_mysql_gtid_sources_and_filters_the_executed_set() {
+        let excluded_uuid = "8f5f4a9a-6b2d-4dd5-915e-1df9d53d2850";
+        let retained_uuid = "2f6f4a9a-6b2d-4dd5-915e-1df9d53d2850";
+        let mut config = test_mysql_config();
+        config.gtid_source_excludes = vec![excluded_uuid.into()];
+        let filter = GtidSourceFilter::from_config(&config).unwrap().unwrap();
+        assert!(!filter.matches(excluded_uuid));
+        assert!(filter.matches(retained_uuid));
+
+        let sids = filter
+            .filter_sids(&format!("{excluded_uuid}:1-8,\n{retained_uuid}:1-3:7"))
+            .unwrap();
+        assert_eq!(sids.len(), 1);
+        assert_eq!(
+            uuid::Uuid::from_bytes(sids[0].uuid()).to_string(),
+            retained_uuid
+        );
+        assert_eq!(sids[0].to_string(), format!("{retained_uuid}:1-3:7"));
+    }
+
+    #[test]
+    fn filtered_gtid_transactions_preserve_commit_progress() {
+        let source_uuid = uuid::Uuid::parse_str("8f5f4a9a-6b2d-4dd5-915e-1df9d53d2850").unwrap();
+        let event = GtidEvent::new(*source_uuid.as_bytes(), 42);
+        let mut state = StreamingState::new("mysql-bin.000001".into(), HashMap::new(), None);
+
+        state.begin_gtid(&event, None, true);
+        assert!(
+            state
+                .transaction
+                .as_ref()
+                .is_some_and(|transaction| transaction.ignore_dml)
+        );
+
+        let commit = state.commit_record(512, 184, None).unwrap();
+        assert_eq!(commit.boundary, RecordBoundary::TransactionCommit);
+        assert!(matches!(
+            commit.position,
+            SourcePosition::MySql(position)
+                if position.gtid_set.as_deref()
+                    == Some("8f5f4a9a-6b2d-4dd5-915e-1df9d53d2850:42")
+        ));
+        assert!(state.transaction.is_none());
+    }
+
+    #[test]
     fn rewinds_streaming_state_to_a_safe_position() {
         let position = mysql_position(
             "mysql-bin.000002",
@@ -1602,6 +1804,7 @@ mod tests {
             false,
         );
         let coordinates = binlog_coordinates_from_position(&position).unwrap();
+        assert!(!coordinates.gtid_set_is_complete);
         let mut state = StreamingState::new("mysql-bin.000001".into(), HashMap::new(), None);
         state.table_anchors.insert(7, 64);
         state.previous_position = Some(("mysql-bin.000001".into(), 64));
@@ -1625,24 +1828,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_legacy_mysql_checkpoint_without_schema_history() {
-        let config = MySqlSourceConfig {
-            hostname: "localhost".into(),
-            port: 3306,
-            username: "rustium".into(),
-            password: "secret".into(),
-            databases: vec!["inventory".into()],
-            server_id: 5_401,
-            tables: TableSelection::default(),
-            ssl_mode: "disabled".into(),
-            connect_timeout: std::time::Duration::from_secs(1),
-            connect_keep_alive: true,
-            connect_keep_alive_interval: std::time::Duration::from_secs(1),
-            reconnect_max_attempts: 1,
-            schema_history_skip_unparseable_ddl: false,
-            heartbeat_interval: std::time::Duration::ZERO,
-            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
-            heartbeat_topic_name: None,
-        };
+        let config = test_mysql_config();
         let mut source = MySqlSource::new(
             "inventory-mysql",
             config,

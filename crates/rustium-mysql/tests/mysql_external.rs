@@ -66,6 +66,9 @@ impl TestSettings {
             connect_keep_alive_interval: Duration::from_millis(250),
             reconnect_max_attempts: 5,
             schema_history_skip_unparseable_ddl: false,
+            gtid_source_includes: Vec::new(),
+            gtid_source_excludes: Vec::new(),
+            gtid_source_filter_dml_events: true,
             heartbeat_interval: Duration::ZERO,
             heartbeat_topics_prefix: "__debezium-heartbeat".into(),
             heartbeat_topic_name: None,
@@ -193,7 +196,12 @@ async fn snapshots_and_replays_destructive_ddl_from_checkpoint() -> TestResult {
             ))
             .await?;
 
-        let config = settings.source_config(&table_name);
+        let source_uuid = admin
+            .query_first::<String, _>("SELECT @@GLOBAL.server_uuid")
+            .await?
+            .ok_or_else(|| test_error("MySQL did not return server_uuid"))?;
+        let mut config = settings.source_config(&table_name);
+        config.gtid_source_includes = vec![source_uuid];
         let (snapshot_position, schema_history) =
             capture_snapshot(&connector_name, config.clone()).await?;
         let checkpoint = Checkpoint {

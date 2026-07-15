@@ -234,6 +234,9 @@ impl SourceConfig {
                 "server_id": config.server_id,
                 "tables": config.tables,
                 "schema_history_skip_unparseable_ddl": config.schema_history_skip_unparseable_ddl,
+                "gtid_source_includes": config.gtid_source_includes,
+                "gtid_source_excludes": config.gtid_source_excludes,
+                "gtid_source_filter_dml_events": config.gtid_source_filter_dml_events,
             }),
             Self::Sqlserver(config) => serde_json::json!({
                 "type": "sqlserver",
@@ -491,6 +494,12 @@ pub struct MySqlSourceConfig {
     #[serde(default)]
     pub schema_history_skip_unparseable_ddl: bool,
     #[serde(default)]
+    pub gtid_source_includes: Vec<String>,
+    #[serde(default)]
+    pub gtid_source_excludes: Vec<String>,
+    #[serde(default = "default_true")]
+    pub gtid_source_filter_dml_events: bool,
+    #[serde(default)]
     #[serde(with = "humantime_serde")]
     pub heartbeat_interval: Duration,
     #[serde(default = "default_heartbeat_topics_prefix")]
@@ -544,6 +553,23 @@ impl MySqlSourceConfig {
             return Err(Error::Configuration(
                 "source.databases must not contain empty names".into(),
             ));
+        }
+        if !self.gtid_source_includes.is_empty() && !self.gtid_source_excludes.is_empty() {
+            return Err(Error::Configuration(
+                "source.gtid_source_includes and source.gtid_source_excludes cannot both be configured"
+                    .into(),
+            ));
+        }
+        for pattern in self
+            .gtid_source_includes
+            .iter()
+            .chain(self.gtid_source_excludes.iter())
+        {
+            if pattern.trim().is_empty() || Regex::new(pattern).is_err() {
+                return Err(Error::Configuration(format!(
+                    "GTID source filter {pattern:?} is not a valid regular expression"
+                )));
+            }
         }
         validate_table_patterns(&self.tables)
     }

@@ -225,6 +225,13 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
                 .into(),
         );
     }
+    let gtid_source_includes = csv_property(properties.get("gtid.source.includes"));
+    let gtid_source_excludes = csv_property(properties.get("gtid.source.excludes"));
+    if !gtid_source_includes.is_empty() && !gtid_source_excludes.is_empty() {
+        return Err(Error::Configuration(
+            "gtid.source.includes and gtid.source.excludes cannot both be configured".into(),
+        ));
+    }
 
     assemble_config(
         properties,
@@ -266,6 +273,13 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
                 properties,
                 "schema.history.internal.skip.unparseable.ddl",
                 false,
+            )?,
+            gtid_source_includes,
+            gtid_source_excludes,
+            gtid_source_filter_dml_events: bool_value(
+                properties,
+                "gtid.source.filter.dml.events",
+                true,
             )?,
             heartbeat_interval: duration_ms(properties, "heartbeat.interval.ms", Duration::ZERO)?,
             heartbeat_topics_prefix: properties
@@ -683,6 +697,9 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "database.ssl.mode",
         "database.include.list",
         "database.exclude.list",
+        "gtid.source.includes",
+        "gtid.source.excludes",
+        "gtid.source.filter.dml.events",
         "connect.timeout.ms",
         "connect.keep.alive",
         "connect.keep.alive.interval.ms",
@@ -954,6 +971,8 @@ connect.keep.alive=false
 connect.keep.alive.interval.ms=250
 rustium.source.reconnect.max.attempts=3
 schema.history.internal.skip.unparseable.ddl=true
+gtid.source.includes=8f5f4a9a-6b2d-4dd5-915e-1df9d53d2850,2f6f.*
+gtid.source.filter.dml.events=false
 heartbeat.interval.ms=1000
 heartbeat.topics.prefix=__legacy-heartbeat
 topic.heartbeat.prefix=__custom-heartbeat
@@ -971,6 +990,12 @@ topic.heartbeat.name=shared-heartbeat
         );
         assert_eq!(source.reconnect_max_attempts, 3);
         assert!(source.schema_history_skip_unparseable_ddl);
+        assert_eq!(
+            source.gtid_source_includes,
+            ["8f5f4a9a-6b2d-4dd5-915e-1df9d53d2850", "2f6f.*"]
+        );
+        assert!(source.gtid_source_excludes.is_empty());
+        assert!(!source.gtid_source_filter_dml_events);
         assert_eq!(source.heartbeat_interval, Duration::from_secs(1));
         assert_eq!(source.heartbeat_topics_prefix, "__custom-heartbeat");
         assert_eq!(
@@ -979,6 +1004,42 @@ topic.heartbeat.name=shared-heartbeat
         );
         assert!(source.tables.includes("inventory", "orders"));
         assert!(!source.tables.includes("inventory", "products"));
+    }
+
+    #[test]
+    fn rejects_invalid_mysql_gtid_source_filters() {
+        let both = parse(
+            r#"
+name=mysql
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+gtid.source.includes=8f5f.*
+gtid.source.excludes=2f6f.*
+"#,
+        )
+        .unwrap_err();
+        assert!(both.to_string().contains("cannot both be configured"));
+
+        let invalid_regex = parse(
+            r#"
+name=mysql
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+gtid.source.includes=(unterminated
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            invalid_regex
+                .to_string()
+                .contains("valid regular expression")
+        );
     }
 
     #[test]
