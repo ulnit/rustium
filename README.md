@@ -109,7 +109,7 @@ export RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
 ```
 
-The test creates uniquely named tables, publications, and managed replication slots. It covers snapshot handoff, transaction ordering and boundaries, checkpoint restart without a repeated snapshot, and resource cleanup.
+The test creates uniquely named tables, publications, and managed replication slots. It covers snapshot handoff, transaction ordering and boundaries, relation-driven schema refresh after adding a column, checkpoint restart without a repeated snapshot, and resource cleanup.
 
 Run the external SQL Server 2017+ CDC integration test without storing credentials in the repository:
 
@@ -155,10 +155,11 @@ Implemented behavior:
 - restart recovery from SQLite checkpoints
 - replication feedback only after sink acknowledgement and checkpoint persistence
 - schema discovery and table include/exclude regular expressions
+- relation-driven schema refresh with version increments after table DDL
 
 The source requires `wal_level=logical`, an existing publication, and a user with the required replication and table-read permissions. See [examples/postgresql.yaml](examples/postgresql.yaml).
 
-Known PostgreSQL gaps include incremental snapshots/signaling, tombstones, complete DDL-driven schema refresh, broader type and failure fixtures, and Kafka end-to-end recovery coverage.
+Known PostgreSQL gaps include incremental snapshots/signaling, tombstones, durable schema history across restarts, broader type and failure fixtures, and Kafka end-to-end recovery coverage.
 
 ### MySQL
 
@@ -382,7 +383,7 @@ export RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
 ```
 
-测试会创建唯一命名的表、publication 和托管 replication slot，覆盖快照切换、事务顺序与边界、从 checkpoint 重启且不重复快照，以及资源清理。
+测试会创建唯一命名的表、publication 和托管 replication slot，覆盖快照切换、事务顺序与边界、新增列后的 Relation 驱动 schema 刷新、从 checkpoint 重启且不重复快照，以及资源清理。
 
 运行外部 SQL Server 2017+ CDC 集成测试，凭据无需存入仓库：
 
@@ -428,10 +429,11 @@ PostgreSQL 连接器使用逻辑复制和 `pgoutput` 协议版本 2。
 - 从 SQLite checkpoint 重启恢复
 - 仅在 Sink 确认和 checkpoint 持久化后发送复制反馈
 - schema 发现与表 include/exclude 正则过滤
+- 表 DDL 后由 Relation 消息驱动 schema 刷新并递增版本
 
 Source 需要 `wal_level=logical`、已存在的 publication，以及具备复制和表读取权限的用户。配置示例见 [examples/postgresql.yaml](examples/postgresql.yaml)。
 
-PostgreSQL 已知缺口包括增量快照/信号、tombstone、完整的 DDL 驱动 schema 刷新、更广的类型与故障样例，以及 Kafka 端到端恢复覆盖。
+PostgreSQL 已知缺口包括增量快照/信号、tombstone、跨重启持久 schema history、更广的类型与故障样例，以及 Kafka 端到端恢复覆盖。
 
 ### MySQL
 

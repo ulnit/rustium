@@ -219,11 +219,11 @@ The slot retains changes committed during the snapshot, so no handoff gap exists
 
 #### 9.3 Streaming
 
-`pg_walstream` provides replication transport and protocol parsing. Rustium converts begin, insert, update, delete, truncate, commit, and streamed-transaction events. Same-LSN ordinals make positions total and replayable. Missing unchanged TOAST columns become `Unavailable`.
+`pg_walstream` provides replication transport and protocol parsing. Rustium converts begin, insert, update, delete, truncate, commit, and streamed-transaction events. Relation messages trigger catalog rediscovery for selected tables; unchanged schemas retain their version, changed schemas increment it, and newly published tables start at version 1. Same-LSN ordinals make positions total and replayable. Missing unchanged TOAST columns become `Unavailable`.
 
 #### 9.4 Remaining PostgreSQL gates
 
-- durable schema history and complete DDL refresh;
+- durable schema history across connector restarts;
 - incremental snapshots and signaling;
 - tombstone records;
 - broader type and failure fixtures;
@@ -375,7 +375,7 @@ RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo \
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
 ```
 
-This gate creates isolated table/publication/slot names and verifies snapshot rows, snapshot completion, ordered transactional create/update/delete events, the commit boundary, checkpoint restart without snapshot replay, and cleanup. It has passed against PostgreSQL 17 with `wal_level=logical`.
+This gate creates isolated table/publication/slot names and verifies snapshot rows, snapshot completion, ordered transactional create/update/delete events, relation-driven schema refresh and versioning after adding a column, the commit boundary, checkpoint restart without snapshot replay, and cleanup. It has passed against PostgreSQL 17 with `wal_level=logical`.
 
 The ignored external SQL Server test reads connection settings from the environment and does not contain repository credentials:
 
@@ -398,7 +398,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. Roadmap
 
-1. Close PostgreSQL schema, tombstone, incremental-snapshot, type/failure-fixture, and Kafka gates.
+1. Close PostgreSQL durable-schema-history, tombstone, incremental-snapshot, type/failure-fixture, and Kafka gates.
 2. Close MySQL historical-schema, retry, signaling, TLS-store, type, and Kafka gates.
 3. Close SQL Server CDC container-portability, retention-failure, concurrency, wider-type, and Kafka gates.
 4. Only then consider additional databases.
@@ -613,11 +613,11 @@ Slot 会保留快照期间提交的变更，因此切换不存在缺口。
 
 #### 9.3 流式捕获
 
-`pg_walstream` 提供复制传输和协议解析。Rustium 转换 begin、insert、update、delete、truncate、commit 和流式事务事件。同 LSN 序号让位点可全序和重放。缺失的未变化 TOAST 列成为 `Unavailable`。
+`pg_walstream` 提供复制传输和协议解析。Rustium 转换 begin、insert、update、delete、truncate、commit 和流式事务事件。Relation 消息会触发选中表的 catalog 重新发现；未变化 schema 保持版本，发生变化时递增版本，新加入 publication 的表从版本 1 开始。同 LSN 序号让位点可全序和重放。缺失的未变化 TOAST 列成为 `Unavailable`。
 
 #### 9.4 PostgreSQL 剩余门槛
 
-- 持久历史 schema 和完整 DDL 刷新；
+- 跨连接器重启的持久 schema history；
 - 增量快照和信号；
 - tombstone；
 - 更广类型和故障样例；
@@ -769,7 +769,7 @@ RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo \
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
 ```
 
-该门槛使用隔离的表/publication/slot 名称，验证快照记录、快照完成边界、同一事务内有序的 create/update/delete 事件、commit 边界、checkpoint 重启不重复快照，以及资源清理。测试已在启用 `wal_level=logical` 的 PostgreSQL 17 上通过。
+该门槛使用隔离的表/publication/slot 名称，验证快照记录、快照完成边界、同一事务内有序的 create/update/delete 事件、新增列后的 Relation 驱动 schema 刷新与版本递增、commit 边界、checkpoint 重启不重复快照，以及资源清理。测试已在启用 `wal_level=logical` 的 PostgreSQL 17 上通过。
 
 被忽略的 SQL Server 外部测试从环境变量读取连接配置，仓库中不包含测试凭据：
 
@@ -792,7 +792,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. 路线图
 
-1. 补齐 PostgreSQL schema、tombstone、增量快照、类型/故障样例和 Kafka 门槛。
+1. 补齐 PostgreSQL 持久 schema history、tombstone、增量快照、类型/故障样例和 Kafka 门槛。
 2. 补齐 MySQL 历史 schema、重试、信号、TLS store、类型和 Kafka 门槛。
 3. 补齐 SQL Server CDC 容器可移植性、retention 故障、并发、更广类型和 Kafka 门槛。
 4. 只有完成前三项后才考虑其他数据库。

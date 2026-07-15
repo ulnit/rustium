@@ -173,6 +173,17 @@ impl PostgresSource {
         .map_err(|error| Error::Source(format!("slot preparation task failed: {error}")))?
     }
 
+    async fn refresh_table_schema(&self, schema: String, table: String) -> Result<TableSchema> {
+        let connection_url = self.config.connection_url(false)?;
+        let config = self.config.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connect(&connection_url)?;
+            discover_table_schema(&mut connection, &config, &schema, &table)
+        })
+        .await
+        .map_err(|error| Error::Source(format!("schema refresh task failed: {error}")))?
+    }
+
     async fn run_snapshot(
         &self,
         snapshot_name: String,
@@ -357,6 +368,29 @@ impl SourceConnector for PostgresSource {
                         }
                         Err(error) => return Err(pg_error(error)),
                     };
+                    let relation = match &event.event_type {
+                        EventType::Relation {
+                            namespace,
+                            relation_name,
+                            ..
+                        } if self.config.tables.includes(namespace, relation_name) => {
+                            Some((namespace.to_string(), relation_name.to_string()))
+                        }
+                        _ => None,
+                    };
+                    if let Some((schema_name, table_name)) = relation {
+                        let refreshed = self
+                            .refresh_table_schema(schema_name.clone(), table_name.clone())
+                            .await?;
+                        if let Some(version) = state.refresh_schema(refreshed) {
+                            info!(
+                                schema = %schema_name,
+                                table = %table_name,
+                                version,
+                                "PostgreSQL table schema refreshed"
+                            );
+                        }
+                    }
                     if let Some(record) = state.convert(
                         event,
                         &self.connector_name,
@@ -536,6 +570,24 @@ impl StreamingState {
             | EventType::CommitPrepared { .. }
             | EventType::StreamPrepare { .. } => Ok(None),
         }
+    }
+
+    fn refresh_schema(&mut self, mut refreshed: TableSchema) -> Option<u32> {
+        let key = refreshed.key();
+        let changed = match self.schemas.get(&key) {
+            Some(current) if current.event_schema.fields == refreshed.event_schema.fields => {
+                refreshed.event_schema.version = current.event_schema.version;
+                false
+            }
+            Some(current) => {
+                refreshed.event_schema.version = current.event_schema.version.saturating_add(1);
+                true
+            }
+            None => true,
+        };
+        let version = refreshed.event_schema.version;
+        self.schemas.insert(key, refreshed);
+        changed.then_some(version)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1049,5 +1101,41 @@ mod tests {
         let mut after = IndexMap::from([("id".into(), DataValue::Int32(1))]);
         fill_unavailable(&mut after, None, &schema);
         assert_eq!(after["body"], DataValue::Unavailable);
+    }
+
+    #[test]
+    fn versions_relation_driven_schema_changes() {
+        let original = TableSchema {
+            schema: "public".into(),
+            table: "orders".into(),
+            event_schema: EventSchema {
+                name: "test.public.orders.Envelope".into(),
+                version: 1,
+                fields: vec![FieldSchema {
+                    name: "id".into(),
+                    type_name: "bigint".into(),
+                    optional: false,
+                    primary_key: true,
+                }],
+            },
+        };
+        let mut state =
+            StreamingState::new(HashMap::from([(original.key(), original.clone())]), None);
+
+        assert_eq!(state.refresh_schema(original.clone()), None);
+        let mut changed = original;
+        changed.event_schema.fields.push(FieldSchema {
+            name: "status".into(),
+            type_name: "text".into(),
+            optional: false,
+            primary_key: false,
+        });
+        assert_eq!(state.refresh_schema(changed), Some(2));
+        assert_eq!(
+            state.schemas[&("public".into(), "orders".into())]
+                .event_schema
+                .version,
+            2
+        );
     }
 }

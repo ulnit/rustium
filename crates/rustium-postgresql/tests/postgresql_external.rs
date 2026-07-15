@@ -8,8 +8,8 @@ use rustium_config::{
     PostgresSourceConfig, SlotOwnership, SnapshotConfig, SnapshotMode, TableSelection,
 };
 use rustium_core::{
-    Checkpoint, Operation, RecordBoundary, SourceConnector, SourceContext, SourcePosition,
-    SourceRecord,
+    Checkpoint, DataValue, Operation, RecordBoundary, SourceConnector, SourceContext,
+    SourcePosition, SourceRecord,
 };
 use rustium_postgresql::PostgresSource;
 use tokio::{
@@ -200,10 +200,10 @@ async fn run_initial_capture(
 
         let mut operations = Vec::new();
         let mut transaction_orders = Vec::new();
-        let commit_position = loop {
+        loop {
             let record = receive(&mut output).await?;
             if record.boundary == RecordBoundary::TransactionCommit {
-                break record.position;
+                break;
             }
             require(
                 record.boundary == RecordBoundary::Data,
@@ -220,7 +220,7 @@ async fn run_initial_capture(
                     .total_order
                     .ok_or_else(|| test_error("streaming event has no transaction order"))?,
             );
-        };
+        }
         require(
             operations == [Operation::Create, Operation::Update, Operation::Delete],
             "transaction operations are incomplete or out of order",
@@ -228,6 +228,63 @@ async fn run_initial_capture(
         require(
             transaction_orders == [1, 2, 3],
             "transaction total_order values are incorrect",
+        )?;
+
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE public.{table_name} \
+                 ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
+            ))
+            .await?;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO public.{table_name} (id, customer, amount, status) \
+                     VALUES (4, 'Dora', 67.80, 'ready')"
+                ),
+                &[],
+            )
+            .await?;
+
+        let mut refreshed_event = None;
+        let commit_position = loop {
+            let record = receive(&mut output).await?;
+            if record.boundary == RecordBoundary::TransactionCommit {
+                break record.position;
+            }
+            require(
+                record.boundary == RecordBoundary::Data,
+                "unexpected DDL boundary",
+            )?;
+            let event = record
+                .event
+                .ok_or_else(|| test_error("DDL data record has no event"))?;
+            require(
+                event.operation == Operation::Create,
+                "DDL follow-up event is not a create",
+            )?;
+            refreshed_event = Some(event);
+        };
+        let event = refreshed_event
+            .ok_or_else(|| test_error("DDL follow-up transaction emitted no data event"))?;
+        require(
+            event.schema.version == 2,
+            "relation-driven schema version did not advance",
+        )?;
+        let status_field = event
+            .schema
+            .fields
+            .iter()
+            .find(|field| field.name == "status")
+            .ok_or_else(|| test_error("refreshed schema does not contain status"))?;
+        require(
+            status_field.type_name == "text" && !status_field.optional,
+            "refreshed status field metadata is incorrect",
+        )?;
+        require(
+            event.after.as_ref().and_then(|row| row.get("status"))
+                == Some(&DataValue::String("ready".into())),
+            "DDL follow-up event does not contain the new status value",
         )?;
         Ok(commit_position)
     }
@@ -261,7 +318,8 @@ async fn run_resumed_capture(
         client
             .execute(
                 &format!(
-                    "INSERT INTO public.{table_name} (id, customer, amount) VALUES (4, 'Dora', 67.80)"
+                    "INSERT INTO public.{table_name} (id, customer, amount, status) \
+                     VALUES (5, 'Erin', 89.10, 'resumed')"
                 ),
                 &[],
             )
@@ -278,7 +336,10 @@ async fn run_resumed_capture(
             if record.boundary == RecordBoundary::TransactionCommit {
                 break;
             }
-            require(record.boundary == RecordBoundary::Data, "unexpected resumed boundary")?;
+            require(
+                record.boundary == RecordBoundary::Data,
+                "unexpected resumed boundary",
+            )?;
             let event = record
                 .event
                 .ok_or_else(|| test_error("resumed data record has no event"))?;
