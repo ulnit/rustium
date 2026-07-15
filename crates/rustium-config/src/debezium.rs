@@ -1,0 +1,666 @@
+use super::*;
+
+pub(super) fn parse(raw: &str) -> Result<Config> {
+    let interpolated = interpolate_environment(raw)?;
+    let properties = parse_properties(&interpolated)?;
+    let connector_class = required(&properties, "connector.class")?;
+    if connector_class.contains("MySqlConnector") {
+        return parse_mysql(&properties);
+    }
+    if connector_class.contains("SqlServerConnector") {
+        return parse_sqlserver(&properties);
+    }
+    if !connector_class.contains("PostgresConnector") {
+        return Err(Error::Configuration(format!(
+            "unsupported Debezium connector.class {connector_class:?}; PostgreSQL, MySQL, and SQL Server are prioritized"
+        )));
+    }
+    if let Some(plugin) = properties.get("plugin.name")
+        && plugin != "pgoutput"
+    {
+        return Err(Error::Configuration(format!(
+            "plugin.name={plugin:?} is not supported; Rustium uses pgoutput"
+        )));
+    }
+
+    let table_include = csv_property(properties.get("table.include.list"));
+    let table_exclude = csv_property(properties.get("table.exclude.list"));
+    let schema_include = csv_property(properties.get("schema.include.list"));
+    let schema_exclude = csv_property(properties.get("schema.exclude.list"));
+    let include = if table_include.is_empty() {
+        schema_include
+            .into_iter()
+            .map(|schema| format!("(?:{schema})\\..+"))
+            .collect()
+    } else {
+        table_include
+    };
+    let mut exclude = table_exclude;
+    exclude.extend(
+        schema_exclude
+            .into_iter()
+            .map(|schema| format!("(?:{schema})\\..+")),
+    );
+
+    assemble_config(
+        &properties,
+        SourceConfig::Postgresql(PostgresSourceConfig {
+            hostname: properties
+                .get("database.hostname")
+                .cloned()
+                .unwrap_or_else(default_hostname),
+            port: u16_value(&properties, "database.port", default_postgres_port())?,
+            database: required(&properties, "database.dbname")?.to_string(),
+            username: required(&properties, "database.user")?.to_string(),
+            password: required(&properties, "database.password")?.to_string(),
+            publication: properties
+                .get("publication.name")
+                .cloned()
+                .unwrap_or_else(|| "dbz_publication".into()),
+            slot_name: properties
+                .get("slot.name")
+                .cloned()
+                .unwrap_or_else(|| "debezium".into()),
+            slot_ownership: SlotOwnership::Managed,
+            tables: TableSelection { include, exclude },
+            ssl_mode: properties
+                .get("database.sslmode")
+                .cloned()
+                .unwrap_or_else(default_ssl_mode),
+            connect_timeout: duration_ms(
+                &properties,
+                "connection.validation.timeout.ms",
+                default_connect_timeout(),
+            )?,
+        }),
+        SnapshotConfig {
+            mode: snapshot_mode(
+                properties
+                    .get("snapshot.mode")
+                    .map_or("initial", String::as_str),
+            )?,
+            fetch_size: usize_value(
+                &properties,
+                "snapshot.fetch.size",
+                default_snapshot_fetch_size(),
+            )?,
+        },
+        Vec::new(),
+    )
+}
+
+fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
+    let database_include = csv_property(properties.get("database.include.list"));
+    let database_exclude = csv_property(properties.get("database.exclude.list"));
+    let mut table_exclude = csv_property(properties.get("table.exclude.list"));
+    table_exclude.extend(
+        database_exclude
+            .into_iter()
+            .map(|database| format!("(?:{database})\\..+")),
+    );
+
+    let mut warnings = Vec::new();
+    if properties.contains_key("database.server.id.offset") {
+        warnings.push(
+            "database.server.id.offset is accepted but ignored because Rustium runs one source task per connector"
+                .into(),
+        );
+    }
+
+    assemble_config(
+        properties,
+        SourceConfig::Mysql(MySqlSourceConfig {
+            hostname: properties
+                .get("database.hostname")
+                .cloned()
+                .unwrap_or_else(default_hostname),
+            port: u16_value(properties, "database.port", default_mysql_port())?,
+            username: required(properties, "database.user")?.to_string(),
+            password: required(properties, "database.password")?.to_string(),
+            databases: database_include,
+            server_id: u32_value(properties, "database.server.id", default_mysql_server_id())?,
+            tables: TableSelection {
+                include: csv_property(properties.get("table.include.list")),
+                exclude: table_exclude,
+            },
+            ssl_mode: properties
+                .get("database.ssl.mode")
+                .cloned()
+                .unwrap_or_else(default_mysql_ssl_mode),
+            connect_timeout: duration_ms(
+                properties,
+                "connect.timeout.ms",
+                default_connect_timeout(),
+            )?,
+        }),
+        SnapshotConfig {
+            mode: snapshot_mode(
+                properties
+                    .get("snapshot.mode")
+                    .map_or("initial", String::as_str),
+            )?,
+            fetch_size: usize_value(
+                properties,
+                "snapshot.fetch.size",
+                default_snapshot_fetch_size(),
+            )?,
+        },
+        warnings,
+    )
+}
+
+fn parse_sqlserver(properties: &BTreeMap<String, String>) -> Result<Config> {
+    let databases = csv_property(properties.get("database.names"));
+    if databases.len() != 1 {
+        return Err(Error::Configuration(
+            "Rustium currently requires exactly one SQL Server database in database.names".into(),
+        ));
+    }
+    if properties
+        .get("data.query.mode")
+        .is_some_and(|mode| mode != "direct")
+    {
+        return Err(Error::Configuration(
+            "Rustium currently requires data.query.mode=direct for SQL Server CDC".into(),
+        ));
+    }
+    let poll_interval = duration_ms(properties, "poll.interval.ms", default_poll_interval())?;
+    assemble_config(
+        properties,
+        SourceConfig::Sqlserver(SqlServerSourceConfig {
+            hostname: properties
+                .get("database.hostname")
+                .cloned()
+                .unwrap_or_else(default_hostname),
+            port: u16_value(properties, "database.port", default_sqlserver_port())?,
+            username: required(properties, "database.user")?.to_string(),
+            password: required(properties, "database.password")?.to_string(),
+            databases,
+            tables: TableSelection {
+                include: csv_property(properties.get("table.include.list")),
+                exclude: csv_property(properties.get("table.exclude.list")),
+            },
+            connect_timeout: duration_ms(
+                properties,
+                "database.connection.timeout.ms",
+                default_connect_timeout(),
+            )?,
+            encrypt: bool_value(properties, "database.encrypt", true)?,
+            trust_server_certificate: bool_value(
+                properties,
+                "database.trustServerCertificate",
+                false,
+            )?,
+            poll_interval,
+            streaming_fetch_size: usize_value(
+                properties,
+                "streaming.fetch.size",
+                default_streaming_fetch_size(),
+            )?,
+            snapshot_isolation_mode: properties
+                .get("snapshot.isolation.mode")
+                .cloned()
+                .unwrap_or_else(default_sqlserver_snapshot_isolation),
+        }),
+        SnapshotConfig {
+            mode: snapshot_mode(
+                properties
+                    .get("snapshot.mode")
+                    .map_or("initial", String::as_str),
+            )?,
+            fetch_size: usize_value(
+                properties,
+                "snapshot.fetch.size",
+                default_snapshot_fetch_size(),
+            )?,
+        },
+        Vec::new(),
+    )
+}
+
+fn assemble_config(
+    properties: &BTreeMap<String, String>,
+    source: SourceConfig,
+    snapshot: SnapshotConfig,
+    mut warnings: Vec<String>,
+) -> Result<Config> {
+    let topic_prefix = required(properties, "topic.prefix")?.to_string();
+    let sink = sink_config(properties, &topic_prefix)?;
+    warnings.extend(unsupported_warnings(properties));
+    if properties
+        .get("tombstones.on.delete")
+        .is_some_and(|value| value != "false")
+    {
+        warnings.push(
+            "tombstones.on.delete is accepted but tombstone emission is not implemented yet".into(),
+        );
+    }
+
+    let config = Config {
+        api_version: API_VERSION.into(),
+        kind: "Connector".into(),
+        metadata: Metadata {
+            name: required(properties, "name")?.to_string(),
+            labels: BTreeMap::new(),
+        },
+        source,
+        snapshot,
+        format: FormatConfig {
+            kind: FormatType::DebeziumJson,
+            unavailable_value: properties
+                .get("unavailable.value.placeholder")
+                .cloned()
+                .unwrap_or_else(default_unavailable_value),
+        },
+        sink,
+        state: StateConfig {
+            kind: StateType::Sqlite,
+            path: properties
+                .get("rustium.state.path")
+                .or_else(|| properties.get("offset.storage.file.filename"))
+                .cloned()
+                .unwrap_or_else(default_state_path),
+        },
+        runtime: RuntimeSettings {
+            channel_capacity: usize_value(
+                properties,
+                "max.queue.size",
+                default_channel_capacity(),
+            )?,
+            max_batch_size: usize_value(properties, "max.batch.size", default_batch_size())?,
+            flush_interval: duration_ms(properties, "poll.interval.ms", default_flush_interval())?,
+            shutdown_timeout: default_shutdown_timeout(),
+        },
+        server: ServerConfig {
+            bind: properties
+                .get("rustium.server.bind")
+                .cloned()
+                .unwrap_or_else(default_bind),
+            enable_mutations: properties
+                .get("rustium.server.enable.mutations")
+                .is_some_and(|value| value == "true"),
+        },
+        observability: ObservabilityConfig {
+            log_format: properties
+                .get("rustium.log.format")
+                .map_or(LogFormat::Json, |value| {
+                    if value == "pretty" {
+                        LogFormat::Pretty
+                    } else {
+                        LogFormat::Json
+                    }
+                }),
+            log_level: properties
+                .get("rustium.log.level")
+                .cloned()
+                .unwrap_or_else(default_log_level),
+            metrics: properties
+                .get("rustium.metrics.enabled")
+                .is_none_or(|value| value == "true"),
+        },
+        compatibility_warnings: warnings,
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+fn sink_config(properties: &BTreeMap<String, String>, topic_prefix: &str) -> Result<SinkConfig> {
+    match properties
+        .get("rustium.sink.type")
+        .map_or("stdout", String::as_str)
+    {
+        "stdout" => Ok(SinkConfig::Stdout {
+            topic_prefix: topic_prefix.into(),
+        }),
+        "kafka" => {
+            let bootstrap_servers = properties
+                .get("rustium.kafka.bootstrap.servers")
+                .or_else(|| properties.get("bootstrap.servers"))
+                .ok_or_else(|| {
+                    Error::Configuration(
+                        "rustium.sink.type=kafka requires rustium.kafka.bootstrap.servers or bootstrap.servers"
+                            .into(),
+                    )
+                })?;
+            Ok(SinkConfig::Kafka {
+                bootstrap_servers: split_csv(bootstrap_servers),
+                topic_prefix: topic_prefix.into(),
+                acks: properties
+                    .get("rustium.kafka.acks")
+                    .cloned()
+                    .unwrap_or_else(default_kafka_acks),
+                compression: properties
+                    .get("rustium.kafka.compression.type")
+                    .cloned()
+                    .unwrap_or_else(default_kafka_compression),
+                delivery_timeout: duration_ms(
+                    properties,
+                    "rustium.kafka.delivery.timeout.ms",
+                    default_delivery_timeout(),
+                )?,
+                properties: properties
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        key.strip_prefix("rustium.kafka.property.")
+                            .map(|key| (key.to_string(), value.clone()))
+                    })
+                    .collect(),
+            })
+        }
+        other => Err(Error::Configuration(format!(
+            "unsupported rustium.sink.type {other:?}"
+        ))),
+    }
+}
+
+fn parse_properties(input: &str) -> Result<BTreeMap<String, String>> {
+    let mut logical_lines = Vec::new();
+    let mut current = String::new();
+    for raw_line in input.lines() {
+        let trimmed = raw_line.trim_end();
+        let slash_count = trimmed
+            .chars()
+            .rev()
+            .take_while(|character| *character == '\\')
+            .count();
+        if slash_count % 2 == 1 {
+            current.push_str(trimmed.strip_suffix('\\').unwrap_or(trimmed));
+        } else {
+            current.push_str(trimmed);
+            logical_lines.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        logical_lines.push(current);
+    }
+
+    let mut properties = BTreeMap::new();
+    for line in logical_lines {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+            continue;
+        }
+        let separator = line
+            .char_indices()
+            .find(|(_, character)| matches!(character, '=' | ':') || character.is_whitespace())
+            .map(|(index, _)| index)
+            .ok_or_else(|| Error::Configuration(format!("invalid property line {line:?}")))?;
+        let key = unescape(&line[..separator])?;
+        let value = line[separator..].trim_start_matches(|character: char| {
+            matches!(character, '=' | ':') || character.is_whitespace()
+        });
+        properties.insert(key, unescape(value)?);
+    }
+    Ok(properties)
+}
+
+fn unescape(value: &str) -> Result<String> {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            output.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => output.push('\n'),
+            Some('r') => output.push('\r'),
+            Some('t') => output.push('\t'),
+            Some('f') => output.push('\u{000c}'),
+            Some('u') => {
+                let code = chars.by_ref().take(4).collect::<String>();
+                let number = u32::from_str_radix(&code, 16).map_err(|error| {
+                    Error::Configuration(format!("invalid Unicode property escape: {error}"))
+                })?;
+                output.push(char::from_u32(number).ok_or_else(|| {
+                    Error::Configuration("invalid Unicode property code point".into())
+                })?);
+            }
+            Some(other) => output.push(other),
+            None => output.push('\\'),
+        }
+    }
+    Ok(output)
+}
+
+fn required<'a>(properties: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str> {
+    properties
+        .get(name)
+        .filter(|value| !value.trim().is_empty())
+        .map(String::as_str)
+        .ok_or_else(|| Error::Configuration(format!("missing required property {name}")))
+}
+
+fn usize_value(properties: &BTreeMap<String, String>, name: &str, default: usize) -> Result<usize> {
+    properties.get(name).map_or(Ok(default), |value| {
+        value.parse().map_err(|error| {
+            Error::Configuration(format!("property {name} must be an integer: {error}"))
+        })
+    })
+}
+
+fn u16_value(properties: &BTreeMap<String, String>, name: &str, default: u16) -> Result<u16> {
+    properties.get(name).map_or(Ok(default), |value| {
+        value.parse().map_err(|error| {
+            Error::Configuration(format!("property {name} must be a port number: {error}"))
+        })
+    })
+}
+
+fn u32_value(properties: &BTreeMap<String, String>, name: &str, default: u32) -> Result<u32> {
+    properties.get(name).map_or(Ok(default), |value| {
+        value.parse().map_err(|error| {
+            Error::Configuration(format!("property {name} must be an integer: {error}"))
+        })
+    })
+}
+
+fn bool_value(properties: &BTreeMap<String, String>, name: &str, default: bool) -> Result<bool> {
+    properties.get(name).map_or(Ok(default), |value| {
+        value.parse().map_err(|error| {
+            Error::Configuration(format!("property {name} must be true or false: {error}"))
+        })
+    })
+}
+
+fn duration_ms(
+    properties: &BTreeMap<String, String>,
+    name: &str,
+    default: Duration,
+) -> Result<Duration> {
+    properties.get(name).map_or(Ok(default), |value| {
+        value
+            .parse::<u64>()
+            .map(Duration::from_millis)
+            .map_err(|error| {
+                Error::Configuration(format!("property {name} must be milliseconds: {error}"))
+            })
+    })
+}
+
+fn snapshot_mode(mode: &str) -> Result<SnapshotMode> {
+    match mode {
+        "initial" | "always" | "initial_only" => Ok(SnapshotMode::Initial),
+        "when_needed" => Ok(SnapshotMode::WhenNeeded),
+        "never" | "no_data" | "schema_only" => Ok(SnapshotMode::Never),
+        other => Err(Error::Configuration(format!(
+            "snapshot.mode={other:?} is recognized but not supported by the current connector"
+        ))),
+    }
+}
+
+fn csv_property(value: Option<&String>) -> Vec<String> {
+    value.map_or_else(Vec::new, |value| split_csv(value))
+}
+
+fn split_csv(value: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            current.push('\\');
+            current.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == ',' {
+            if !current.trim().is_empty() {
+                values.push(current.trim().to_string());
+            }
+            current.clear();
+        } else {
+            current.push(character);
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if !current.trim().is_empty() {
+        values.push(current.trim().to_string());
+    }
+    values
+}
+
+fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
+    const SUPPORTED: &[&str] = &[
+        "name",
+        "connector.class",
+        "tasks.max",
+        "database.hostname",
+        "database.port",
+        "database.user",
+        "database.password",
+        "database.dbname",
+        "database.sslmode",
+        "database.server.id",
+        "database.server.id.offset",
+        "database.ssl.mode",
+        "database.include.list",
+        "database.exclude.list",
+        "connect.timeout.ms",
+        "database.names",
+        "database.encrypt",
+        "database.trustServerCertificate",
+        "database.connection.timeout.ms",
+        "snapshot.isolation.mode",
+        "data.query.mode",
+        "streaming.fetch.size",
+        "topic.prefix",
+        "plugin.name",
+        "slot.name",
+        "publication.name",
+        "snapshot.mode",
+        "snapshot.fetch.size",
+        "table.include.list",
+        "table.exclude.list",
+        "schema.include.list",
+        "schema.exclude.list",
+        "max.queue.size",
+        "max.batch.size",
+        "poll.interval.ms",
+        "connection.validation.timeout.ms",
+        "unavailable.value.placeholder",
+        "tombstones.on.delete",
+        "offset.storage.file.filename",
+        "bootstrap.servers",
+        "rustium.sink.type",
+        "rustium.kafka.bootstrap.servers",
+        "rustium.kafka.acks",
+        "rustium.kafka.compression.type",
+        "rustium.kafka.delivery.timeout.ms",
+        "rustium.state.path",
+        "rustium.server.bind",
+        "rustium.server.enable.mutations",
+        "rustium.log.format",
+        "rustium.log.level",
+        "rustium.metrics.enabled",
+    ];
+    properties
+        .keys()
+        .filter(|key| {
+            !SUPPORTED.contains(&key.as_str()) && !key.starts_with("rustium.kafka.property.")
+        })
+        .map(|key| format!("Debezium property {key} is not implemented and was ignored"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_postgres_properties_and_regex_filters() {
+        let config = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.port=5432
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+plugin.name=pgoutput
+slot.name=orders_slot
+publication.name=orders_pub
+table.include.list=public\\.(orders|customers)
+snapshot.mode=initial
+max.queue.size=4096
+max.batch.size=1000
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.metadata.name, "orders-cdc");
+        assert_eq!(config.runtime.channel_capacity, 4096);
+        let source = config.source.as_postgresql().unwrap();
+        assert!(source.tables.includes("public", "orders"));
+        assert!(!source.tables.includes("public", "products"));
+    }
+
+    #[test]
+    fn recognizes_prioritized_connectors() {
+        let config = parse(
+            r#"
+name=mysql
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+database.server.id=7001
+database.include.list=inventory
+table.include.list=inventory\.(orders|customers)
+topic.prefix=inventory
+"#,
+        )
+        .unwrap();
+        let source = config.source.as_mysql().unwrap();
+        assert_eq!(source.server_id, 7001);
+        assert_eq!(source.databases, ["inventory"]);
+        assert!(source.tables.includes("inventory", "orders"));
+        assert!(!source.tables.includes("inventory", "products"));
+    }
+
+    #[test]
+    fn parses_sqlserver_properties() {
+        let config = parse(
+            r#"
+name=inventory-sqlserver
+connector.class=io.debezium.connector.sqlserver.SqlServerConnector
+database.hostname=sqlserver
+database.user=rustium
+database.password=secret
+database.names=inventory
+table.include.list=dbo\.orders
+topic.prefix=inventory
+snapshot.isolation.mode=snapshot
+streaming.fetch.size=2048
+"#,
+        )
+        .unwrap();
+        let source = config.source.as_sqlserver().unwrap();
+        assert_eq!(source.databases, ["inventory"]);
+        assert_eq!(source.streaming_fetch_size, 2048);
+        assert_eq!(source.snapshot_isolation_mode, "snapshot");
+    }
+}

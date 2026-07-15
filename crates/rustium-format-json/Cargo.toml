@@ -1,0 +1,21 @@
+[package]
+name = "rustium-format-json"
+description = "Rustium native and Debezium-compatible JSON encoders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+bytes.workspace = true
+chrono.workspace = true
+rustium-core = { path = "../rustium-core" }
+serde_json.workspace = true
+
+[dev-dependencies]
+indexmap.workspace = true
+
+[lints]
+workspace = true

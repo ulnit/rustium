@@ -1,0 +1,28 @@
+[package]
+name = "rustium-postgresql"
+description = "PostgreSQL source connector for Rustium"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+indexmap.workspace = true
+pg_walstream.workspace = true
+rustium-config = { path = "../rustium-config" }
+rustium-core = { path = "../rustium-core" }
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

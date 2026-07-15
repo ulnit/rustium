@@ -1,0 +1,31 @@
+[package]
+name = "rustium-sqlserver"
+description = "SQL Server CDC source connector for Rustium"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+hex.workspace = true
+indexmap.workspace = true
+rustium-config = { path = "../rustium-config" }
+rustium-core = { path = "../rustium-core" }
+serde_json.workspace = true
+tiberius.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "sqlserver_docker"
+path = "tests/sqlserver_docker.rs"

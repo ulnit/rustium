@@ -1,0 +1,30 @@
+[package]
+name = "rustium-mysql"
+description = "MySQL source connector for Rustium"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+indexmap.workspace = true
+mysql_async.workspace = true
+rustium-config = { path = "../rustium-config" }
+rustium-core = { path = "../rustium-core" }
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "mysql_docker"
+path = "tests/mysql_docker.rs"

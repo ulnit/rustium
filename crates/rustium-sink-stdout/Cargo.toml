@@ -1,0 +1,17 @@
+[package]
+name = "rustium-sink-stdout"
+description = "Development stdout sink for Rustium"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+rustium-core = { path = "../rustium-core" }
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,1057 +1,749 @@
 # Rustium Architecture and Design
 
-> Status: Pre-alpha design baseline<br>
-> Document version: 0.1<br>
+> Status: Implemented alpha baseline
+> Document version: 0.2
 > Last updated: 2026-07-15
 
 ## Language Policy
 
-Rustium is a global open-source project. Project documentation MUST be published in both English and Simplified Chinese, with English first. The English text is the normative version when the two versions differ. Code, configuration keys, API fields, logs, commit messages, and issue titles SHOULD use English.
+Rustium documentation is published in complete English first and complete Simplified Chinese second. English is normative when translations differ. Code, configuration keys, APIs, logs, issues, and commit messages use English.
 
-This document first presents the complete English design, followed by its Chinese translation.
+Rustium 文档先提供完整英文，再提供完整简体中文。两种文本不一致时以英文为准。代码、配置键、API、日志、Issue 和提交信息使用英文。
 
 ---
 
 ## English
 
-### 1. Project Definition
+### 1. Product Definition
 
-Rustium is an independently implemented, open-source, log-based Change Data Capture (CDC) platform written in Rust. It reads committed changes from a database replication log, converts them into a stable internal event model, and delivers them to downstream systems.
+Rustium is an independently implemented, open-source, log-based Change Data Capture platform written in Rust. It reads committed database changes, converts them into a database-neutral typed event, and delivers ordered records to downstream sinks.
 
-The first product form is a standalone service distributed as a single binary. Rustium is designed to work without Kafka Connect or a JVM. Kafka is an optional sink, not a runtime dependency.
+Rustium is a standalone service. It does not require Kafka Connect or a JVM. Kafka is a sink, not a runtime dependency.
 
-**Tagline:** Change Data Capture, reimagined in Rust.
+Rustium uses the latest Debezium architecture, event behavior, and configuration names as compatibility references. Rustium is not a Debezium fork and does not copy Debezium Java source code.
 
-#### 1.1 Goals
+#### 1.1 Connector priority
 
-- Preserve source ordering and database positions correctly.
-- Prefer correctness, recoverability, and bounded resource usage over benchmark-only throughput.
-- Provide a small standalone deployment with clear operational behavior.
-- Support source connectors, event encoders, state stores, and sinks through stable Rust interfaces.
-- Offer a tested Debezium-compatible JSON envelope for easier ecosystem adoption.
-- Make health, lag, failures, and retained-log risk observable.
+Connector work follows this strict order:
 
-#### 1.2 MVP non-goals
+1. PostgreSQL
+2. MySQL
+3. SQL Server
 
-- A Kafka Connect plugin or full Kafka Connect worker compatibility.
-- End-to-end exactly-once delivery.
-- Compatibility with every Debezium connector, option, data type, or Single Message Transform.
-- High-availability coordination between multiple Rustium instances.
-- User-provided native or WebAssembly transformations.
-- Capturing changes by polling application tables.
+Other databases remain out of scope until these three connectors pass their correctness, recovery, type-coverage, and operational release gates.
 
-### 2. Current Status and MVP Scope
+#### 1.2 Goals
 
-The repository currently contains design material and the Apache-2.0 license. It does not yet contain a runnable Rustium implementation, published crate, container image, Helm chart, benchmark, or production release. Every capability in this document is a target until code and tests are merged.
+- Preserve source ordering and replayable source positions.
+- Never checkpoint data that the sink has not acknowledged.
+- Bound memory and propagate backpressure to the source.
+- Provide deterministic event identifiers for at-least-once deduplication.
+- Keep source protocols, internal events, formats, sinks, and state ownership separate.
+- Prefer Debezium property names and event fields where compatibility is practical.
+- Expose lifecycle, position, queue, delivery, and failure state operationally.
 
-The first usable release is scoped to:
+#### 1.3 Non-goals before 1.0
 
-| Capability | MVP target |
+- End-to-end exactly-once delivery across arbitrary sinks.
+- Kafka Connect worker or SMT compatibility.
+- Dynamic native plugin ABI.
+- Multi-instance high-availability coordination.
+- Polling application tables instead of using database CDC facilities.
+- Adding lower-priority database connectors before the first three are complete.
+
+### 2. Current Implementation
+
+The workspace contains a runnable alpha service.
+
+| Component | State |
 |---|---|
-| Source | PostgreSQL 14+ logical replication using `pgoutput` |
-| Capture modes | Consistent initial snapshot, then continuous streaming |
-| Sinks | stdout for development; Kafka for durable production delivery |
-| Event format | Versioned JSON and a tested Debezium-compatible JSON encoder |
-| State | Local SQLite checkpoint store |
-| Runtime | Tokio, one connector per process |
-| Management | CLI, health/status HTTP endpoints, Prometheus metrics |
-| Delivery | At-least-once with deterministic event identifiers |
-| Deployment | Standalone binary and container image |
+| Core event/position/runtime traits | Implemented |
+| Bounded Tokio runtime | Implemented |
+| SQLite state | Implemented |
+| Native and Debezium JSON | Implemented |
+| stdout and Kafka sinks | Implemented |
+| PostgreSQL source | Implemented and manually integration-tested |
+| MySQL source | Implemented and Docker integration-tested |
+| SQL Server source | Implemented and linked; real-instance verification pending |
+| CLI and HTTP management | Implemented |
+| Published image/package/Helm chart | Not available |
 
-MySQL, Schema Registry formats, incremental snapshots, a multi-connector daemon, Kubernetes Operator, embedded mode, and additional sinks are later milestones.
+Alpha means the source and delivery contracts are functional, but configuration and persisted state are not stable yet.
 
-### 3. Design Principles and Invariants
+### 3. Architectural Invariants
 
-The following rules are architectural invariants:
+1. **No acknowledged data loss.** A source position is persisted only after all covered events receive the configured sink acknowledgement.
+2. **At-least-once delivery.** A crash after sink acknowledgement but before checkpoint persistence can replay events.
+3. **Source order is authoritative.** Records from one connector remain ordered by their typed source position.
+4. **Bounded memory.** Every source-to-runtime queue has a configured capacity.
+5. **Explicit unavailable values.** Missing TOAST or minimal-row-image values are not converted to null.
+6. **Versioned state.** Checkpoints and configuration have explicit schema versions and fingerprints.
+7. **Visible failures.** Protocol, conversion, state, and sink errors stop the connector by default.
+8. **Secret redaction.** Credentials and row payloads do not appear in status or metrics.
+9. **No silent compatibility claims.** Unsupported Debezium properties generate warnings or validation errors.
 
-1. **No acknowledged data loss.** A source position MUST NOT be checkpointed until the configured sink has durably acknowledged every event covered by that position.
-2. **At-least-once by default.** A crash between sink acknowledgement and checkpoint recovery can produce duplicates. Rustium MUST document this and provide stable event identifiers for deduplication.
-3. **Source order is authoritative.** Events from one source partition MUST remain ordered by source position. Parallel work may not reorder them.
-4. **Memory is bounded.** Every inter-stage queue MUST have a configured bound. Backpressure propagates to the source instead of allowing unbounded buffering.
-5. **Capabilities are explicit.** A connector or sink MUST advertise optional capabilities. The runtime must reject unsupported configurations during validation.
-6. **State is versioned.** Checkpoints, event schemas, configuration schemas, and persisted metadata MUST carry versions and support explicit migrations.
-7. **Failure is visible.** Rustium MUST stop by default on an event it cannot decode or deliver. Skipping data requires an explicit policy and an observable record.
-8. **Secrets stay secret.** Credentials and row payloads MUST NOT appear in logs, metrics, status APIs, or panic output by default.
-
-### 4. System Architecture
-
-Rustium separates the data plane from the control plane.
+### 4. Workspace Boundaries
 
 ```text
-                         Control plane
-  Config validation | lifecycle | status API | health | metrics
-                                |
-                                v
-+-------------------------------------------------------------------+
-|                           Data plane                              |
-|                                                                   |
-|  Source -> Decode -> Normalize -> Filter -> Transform -> Route    |
-|     |                                                   |         |
-|     |                                                   v         |
-|     +-> snapshot / replication position       Encode -> Batch     |
-|                                                         |         |
-|                                                         v         |
-|                                                       Sink        |
-|                                                         | ack     |
-|                                                         v         |
-|                                              Checkpoint store      |
-+-------------------------------------------------------------------+
-              | schema cache | retry policy | telemetry |
+crates/
+|-- rustium-core/          typed events, positions, traits, runtime
+|-- rustium-config/        YAML, properties parsing, validation, fingerprints
+|-- rustium-state/         versioned SQLite checkpoints
+|-- rustium-postgresql/    pgoutput source
+|-- rustium-mysql/         row-binlog source
+|-- rustium-sqlserver/     SQL Server CDC source
+|-- rustium-format-json/   native and Debezium JSON
+|-- rustium-sink-stdout/   development sink
+|-- rustium-sink-kafka/    durable Kafka producer sink
+|-- rustium-server/        health, status, lifecycle, metrics
+`-- rustium-cli/           rustium binary
 ```
 
-#### 4.1 Data plane
+Connectors and sinks are statically linked behind Rust traits. A stable dynamic plugin ABI is deferred.
 
-- **Source connector:** discovers source schemas, performs snapshots, reads the replication stream, and emits source records with positions.
-- **Decoder:** turns protocol messages such as PostgreSQL `pgoutput` messages into typed values.
-- **Normalizer:** creates the database-neutral internal `ChangeEvent`.
-- **Filter:** applies configured database, schema, and table inclusion/exclusion rules.
-- **Transform:** applies built-in, deterministic transformations. The MVP may initially expose only field masking and topic routing.
-- **Router:** selects a destination topic or stream from event metadata.
-- **Encoder:** serializes the internal event to native versioned JSON or a Debezium-compatible JSON envelope.
-- **Batcher and sink:** groups events within ordering constraints and waits for durable delivery acknowledgement.
-- **Checkpoint store:** atomically persists the last fully acknowledged source position and snapshot state.
-
-#### 4.2 Control plane
-
-The MVP runs one connector per process. Its control plane loads and validates configuration, manages the connector lifecycle, exposes status and health endpoints, and coordinates graceful shutdown. A future multi-connector daemon must reuse the same connector runtime instead of changing connector semantics.
-
-### 5. Proposed Workspace Boundaries
+### 5. Data Plane
 
 ```text
-rustium/
-|-- crates/
-|   |-- rustium-core/              # Event model, traits, runtime, errors
-|   |-- rustium-config/            # Versioned config and validation
-|   |-- rustium-state/             # Checkpoint API and SQLite store
-|   |-- rustium-postgresql/        # pgoutput source connector
-|   |-- rustium-format-json/       # Native and Debezium JSON encoders
-|   |-- rustium-sink-stdout/       # Development sink
-|   |-- rustium-sink-kafka/        # Kafka producer sink
-|   |-- rustium-server/            # HTTP health, status, and metrics
-|   `-- rustium-cli/               # rustium executable
-|-- docs/
-|-- examples/
-|-- tests/
-|-- deploy/
-`-- Cargo.toml
+Source protocol
+    |
+    v
+Decode and normalize
+    |
+    v
+bounded SourceRecord channel
+    |
+    v
+encode ordered ChangeEvent records
+    |
+    v
+write ordered DeliveryBatch to sink
+    |
+    v
+persist highest acknowledged SourcePosition
+    |
+    v
+acknowledge source protocol where supported
 ```
 
-Connectors and sinks are statically linked in the MVP. A dynamic plugin ABI is deferred because Rust does not provide a stable native ABI and an early plugin boundary would constrain core types prematurely.
+The current runtime uses one source task and one ordered delivery coordinator. This intentionally limits parallelism until ordering barriers and partition contracts are explicit.
+
+#### 5.1 Commit sequence
+
+For every non-empty or position-only batch:
+
+1. Encode all data records.
+2. Call `Sink::write` and wait for its acknowledgement.
+3. Save a versioned SQLite checkpoint atomically.
+4. Publish the saved position on the source acknowledgement channel.
+5. Update status counters.
+
+Snapshot-complete and transaction-commit boundaries force a flush. Size and time thresholds can also flush inside a transaction; connector positions must therefore support exact mid-transaction replay.
+
+#### 5.2 Shutdown
+
+Cancellation stops source reads, flushes pending events, persists only acknowledged positions, flushes and closes the sink, then closes protocol resources. A timeout fails shutdown without checkpointing unacknowledged records.
 
 ### 6. Internal Event Model
 
-The internal model is database-neutral and must not depend on a sink serialization format.
+`ChangeEvent` contains:
 
-```rust
-pub struct ChangeEvent {
-    pub id: EventId,
-    pub source: SourceMetadata,
-    pub position: SourcePosition,
-    pub transaction: Option<TransactionMetadata>,
-    pub operation: Operation,
-    pub before: Option<Row>,
-    pub after: Option<Row>,
-    pub schema: EventSchema,
-    pub source_time: Option<SystemTime>,
-    pub observed_time: SystemTime,
-}
+- deterministic `EventId`;
+- typed `SourcePosition`;
+- connector/database/schema/table metadata;
+- optional transaction ID and ordering;
+- operation: read, create, update, delete, truncate, or message;
+- optional before and after rows;
+- versioned field schema;
+- source and observed timestamps.
 
-pub enum Operation {
-    Read,
-    Create,
-    Update,
-    Delete,
-    Truncate,
-    Message,
-}
-```
+`DataValue` distinguishes null, boolean, signed/unsigned integers, decimal text, float, string, bytes, date, time, timestamp, UUID, JSON, array, and unavailable.
 
-`SourcePosition` is a typed, connector-owned value with a stable serialized representation and total ordering within a source partition. PostgreSQL positions contain at least the WAL LSN and an event ordinal when multiple events share one LSN. MySQL positions will later contain binlog file/position and optional GTID state.
+Event IDs hash connector name, source partition, typed position, collection, and ordinal. Replaying the same source row produces the same ID.
 
-`EventId` is deterministic. It is derived from connector identity, source partition, source position, collection identity, and event ordinal. Replaying the same source record therefore produces the same identifier.
+### 7. Source Positions and Checkpoints
 
-Rows use a typed value model rather than raw JSON so that decimals, timestamps, binary values, arrays, and null remain distinguishable before encoding. An explicit `Unavailable` value represents source values that cannot be reconstructed, such as unchanged PostgreSQL TOAST columns.
+#### 7.1 PostgreSQL
 
-### 7. Runtime and Lifecycle
+The position contains WAL LSN, optional commit LSN, transaction ID, same-LSN event serial, and snapshot state. Replication feedback advances only after the matching checkpoint is saved.
 
-#### 7.1 Connector states
+#### 7.2 MySQL
 
-```text
-CREATED -> STARTING -> SNAPSHOTTING -> STREAMING
-               |             |             |
-               +-------------+-------------+-> FAILED
+The position contains binlog filename, a replayable event anchor, GTID, source server ID, row/event serial, and snapshot state.
 
-SNAPSHOTTING <-> PAUSED <-> STREAMING
-STARTING/SNAPSHOTTING/STREAMING/PAUSED -> STOPPING -> STOPPED
-```
+For row events, the checkpoint anchor is the preceding `TABLE_MAP_EVENT` start position. This is deliberate. Starting at only the row-event end can lose remaining rows; starting at the row-event body can omit metadata required to decode it. Replaying from the table-map anchor plus a deterministic row ordinal allows Rustium to skip already acknowledged rows and continue inside a multi-row event.
 
-A state transition records a timestamp and a machine-readable reason. `FAILED` is terminal until an operator restart or a configured restart policy creates a new run generation.
+#### 7.3 State compatibility
 
-#### 7.2 Task model
+The configuration fingerprint covers semantic source identity, selected tables, snapshot behavior, format, and routing. Passwords and operational tuning do not affect the fingerprint. An incompatible checkpoint is rejected until reset or migrated.
 
-The runtime uses Tokio tasks connected by bounded channels. A connector task owns the database protocol connection. Processor tasks may parallelize CPU work only where an ordering barrier restores source order. A sink worker owns batching and delivery. A checkpoint coordinator serializes acknowledgement and state updates.
+### 8. Configuration
 
-#### 7.3 Graceful shutdown
+Rustium supports:
 
-On shutdown, Rustium stops accepting new source records, drains in-flight events up to a configured timeout, flushes the sink, persists the last acknowledged checkpoint, sends final source feedback where applicable, and closes resources. If the timeout expires, the process exits without checkpointing unacknowledged events; those events are replayed on restart.
+- strict, versioned YAML with unknown-field rejection;
+- `${NAME}` and `${NAME:-default}` environment interpolation;
+- Debezium-style Java `.properties` parsing;
+- full-match regular expressions for database/schema/table filters;
+- compatibility warnings for recognized but unsupported properties.
 
-### 8. Delivery and Checkpoint Semantics
+The native root schema is `api_version: rustium.io/v1alpha1`, `kind: Connector`.
 
-#### 8.1 Default guarantee
+Debezium names are preferred for migration. Common mappings include `name`, `connector.class`, `topic.prefix`, `database.*`, `table.include.list`, `table.exclude.list`, `snapshot.mode`, `snapshot.fetch.size`, `max.queue.size`, `max.batch.size`, and `poll.interval.ms`.
 
-Rustium provides **at-least-once delivery** when the source can replay from a stored position and the sink returns a durable acknowledgement. It does not claim end-to-end exactly-once behavior.
-
-The commit sequence is:
-
-1. Read and decode source records.
-2. Deliver an ordered batch to the sink.
-3. Wait for the sink's durable acknowledgement.
-4. Atomically persist the batch's highest contiguous source position.
-5. Notify the source that the position may be released, when the protocol supports feedback.
-
-If Rustium crashes after step 3 but before step 4, the acknowledged batch is replayed. If it crashes before step 3, the sink must not report success and the position is not advanced.
-
-#### 8.2 Checkpoint record
-
-A checkpoint contains at least:
-
-- connector identity and run generation;
-- source type and versioned source position;
-- snapshot phase, snapshot anchor, and completed collections;
-- last fully acknowledged transaction or batch boundary;
-- compatibility-relevant configuration fingerprint;
-- checkpoint schema version and update timestamp.
-
-SQLite is the MVP state store and runs in WAL mode with transactional updates. The state directory must be placed on durable storage. A file being writable does not by itself make it durable in container deployments.
-
-#### 8.3 Sink acknowledgement
-
-`Sink::write(batch)` succeeds only after the sink's configured durability condition is met. For Kafka, the production default is `acks=all` with idempotent producer settings when supported. Kafka producer idempotence reduces producer retries but does not turn source-to-Kafka delivery into an exactly-once transaction.
-
-The stdout sink acknowledges an operating-system write and is intended for development. It cannot provide a durable delivery guarantee.
+Rustium-only state, sink, server, logging, and producer extensions use `rustium.*` in properties files.
 
 ### 9. PostgreSQL Connector
 
 #### 9.1 Prerequisites
 
-- PostgreSQL 14 or newer for the supported MVP matrix.
-- `wal_level=logical` and sufficient replication slots and WAL senders.
-- A login with replication permission and `SELECT` access to captured tables.
-- A `pgoutput` publication containing the selected tables.
-- An appropriate `REPLICA IDENTITY` when old row values are required for updates or deletes.
+- PostgreSQL 14 or newer.
+- `wal_level=logical`.
+- Existing `pgoutput` publication.
+- Replication and table-read permissions.
+- A unique replication slot.
 
-Rustium validates publication membership, replica identity limitations, slot state, server version, and required privileges before capture begins.
+#### 9.2 Snapshot handoff
 
-#### 9.2 Consistent initial snapshot
+For a managed initial snapshot:
 
-For a Rustium-managed new replication slot, the initial snapshot algorithm is:
+1. Prepare or recreate an inactive managed slot.
+2. create the logical slot with an exported snapshot;
+3. open a repeatable-read, read-only SQL transaction;
+4. import the exported snapshot;
+5. discover selected publication tables and schemas;
+6. scan each table in bounded pages;
+7. emit snapshot-complete at the slot anchor LSN;
+8. start `pgoutput` from that LSN.
 
-1. Create the logical replication slot and export a database snapshot, obtaining a consistent WAL position.
-2. Start a `REPEATABLE READ` transaction and import the exported snapshot.
-3. Discover table schemas and freeze the selected collection set for this run.
-4. Scan tables in deterministic primary-key order where possible and emit `Read` events.
-5. Mark the final snapshot record and atomically record snapshot completion.
-6. End the snapshot transaction and start logical replication from the consistent WAL position.
-7. Process changes retained by the slot while the snapshot was running.
+The slot retains changes committed during the snapshot, so no handoff gap exists.
 
-This produces a snapshot followed by all changes after its anchor without an intentional gap. Long snapshots retain WAL, so Rustium must expose retained-WAL size and fail or warn at configured thresholds.
+#### 9.3 Streaming
 
-If the process crashes before the exported snapshot completes, PostgreSQL cannot resume that transaction. The MVP restarts the initial snapshot. With an engine-owned slot, Rustium may recreate the slot only under an explicit ownership policy; it never drops a user-managed slot automatically. Re-emitted snapshot rows are duplicates under the at-least-once contract.
+`pg_walstream` provides replication transport and protocol parsing. Rustium converts begin, insert, update, delete, truncate, commit, and streamed-transaction events. Same-LSN ordinals make positions total and replayable. Missing unchanged TOAST columns become `Unavailable`.
 
-Tables without a primary key may be scanned, but deterministic chunking and future incremental snapshots are limited. The runtime reports this limitation.
+#### 9.4 Remaining PostgreSQL gates
 
-#### 9.3 Streaming and feedback
+- automated PostgreSQL Docker integration test;
+- durable schema history and complete DDL refresh;
+- incremental snapshots and signaling;
+- tombstone records;
+- broader type and failure fixtures;
+- Kafka end-to-end recovery tests.
 
-The connector decodes `Begin`, `Relation`, `Insert`, `Update`, `Delete`, `Truncate`, `Commit`, and keepalive messages from `pgoutput`. Transactions are emitted in commit order. Relation messages update a versioned schema cache.
+### 10. MySQL Connector
 
-PostgreSQL standby status feedback advances only after the corresponding sink acknowledgement has been checkpointed. This ordering favors replay over data loss. Metrics and alerts must make replication-slot WAL retention visible when the sink is unavailable.
+#### 10.1 Prerequisites
 
-The values available in `before` depend on `REPLICA IDENTITY`. Unchanged TOAST values are represented internally as unavailable, never silently converted to `null`.
+- MySQL 8.0 or newer.
+- `log_bin=ON` and `binlog_format=ROW`.
+- a connector `database.server.id` distinct from the source server ID;
+- `SELECT`, `RELOAD`, `FLUSH_TABLES`, `REPLICATION SLAVE`, and `REPLICATION CLIENT` privileges.
 
-### 10. Filtering, Transforming, and Routing
+#### 10.2 Snapshot handoff
 
-Inclusion is evaluated before exclusion. Identifiers use explicit `database.schema.table` semantics and do not depend on locale. Invalid patterns fail configuration validation.
+1. Acquire `FLUSH TABLES WITH READ LOCK` on a lock connection.
+2. Start a repeatable-read consistent transaction on a snapshot connection.
+3. capture current binlog filename, position, GTID state, and source server ID;
+4. release the global read lock;
+5. discover selected base tables and columns inside the snapshot;
+6. scan tables in bounded pages, ordered by primary key when present;
+7. commit the snapshot and emit snapshot-complete;
+8. start binlog streaming from the captured position.
 
-The MVP should keep transformations intentionally small:
+The read lock is held only for transaction establishment and coordinate capture, not for the table scan.
 
-- include/exclude collections;
-- rename a routed topic;
-- remove or mask configured fields;
-- add static headers that do not contain secrets.
+#### 10.3 Streaming
 
-Transforms are deterministic and side-effect free. They cannot change the source position. A transform failure stops the connector by default.
+`mysql_async` provides replication transport and binlog parsing. Rustium handles rotate, table-map, GTID, query, write-rows, update-rows, delete-rows, and XID events.
 
-The default Kafka topic is:
+Row events produce typed before/after images. FULL, MINIMAL, and NOBLOB images are accepted; omitted values are explicit `Unavailable` values. GTID transactions carry total order and collection order. DDL query events refresh current table schemas before later row events are decoded.
 
-```text
-{topic_prefix}.{database}.{schema}.{table}
-```
+#### 10.4 TLS modes
 
-Topic normalization and collision detection happen during validation. Two source collections may not silently resolve to the same topic.
+- `disabled`: plaintext only.
+- `preferred`: try encrypted transport, then fall back to plaintext.
+- `required`: encrypted transport without CA or hostname verification.
+- `verify_ca`: encrypted transport with CA verification, without hostname verification.
+- `verify_identity`: encrypted transport with CA and hostname verification.
 
-### 11. Event Formats and Debezium Compatibility
+Custom Debezium truststore/keystore mapping is not implemented yet.
 
-The canonical contract is Rustium's versioned internal event model. Encoders provide external representations.
+#### 10.5 Verified recovery
 
-The MVP includes:
+The MySQL 8.4 test gates cover:
 
-1. **Rustium JSON:** a versioned format that can evolve under Rustium's compatibility rules.
-2. **Debezium-compatible JSON:** an encoder tested against a documented compatibility matrix.
+- two-row snapshot and snapshot completion;
+- one transaction with multi-row insert, update, and delete;
+- transaction order 1 through 5;
+- restart without snapshot repetition;
+- restart from row 1 of a two-row event, correctly resuming at row 2;
+- GTID preservation;
+- decimal, JSON, boolean, and timestamp conversion;
+- DDL schema refresh and capture of a newly added column.
 
-Example target envelope:
+#### 10.6 Remaining MySQL gates
 
-```json
-{
-  "before": null,
-  "after": {
-    "id": 1,
-    "name": "Alice"
-  },
-  "source": {
-    "version": "0.1.0",
-    "connector": "postgresql",
-    "name": "orders-cdc",
-    "ts_ms": 1784102400000,
-    "snapshot": "false",
-    "db": "app",
-    "sequence": "[\"24023119\",\"24023128\"]",
-    "schema": "public",
-    "table": "customers",
-    "txId": 555,
-    "lsn": 24023128
-  },
-  "op": "c",
-  "ts_ms": 1784102400142,
-  "transaction": null
-}
-```
+- persisted historical schemas for destructive DDL replay;
+- GTID source include/exclude filters;
+- heartbeat and signaling records;
+- incremental snapshots;
+- automatic reconnect and finite retry budgets;
+- tombstone records;
+- custom trust/key stores and wider type fixtures;
+- exact reconstruction of server-side partial JSON diffs.
 
-Operation codes are `r` for snapshot read, `c` for create, `u` for update, `d` for delete, and `t` for truncate when supported.
+### 11. SQL Server Connector
 
-Compatibility is a testable boundary, not a blanket claim. The compatibility matrix must specify envelope fields, snapshot markers, decimal and temporal encodings, unavailable values, tombstones, transaction metadata, schema names, and topic names. Rustium does not claim compatibility for an item until golden tests exist for it.
+The SQL Server connector is implemented with SQL Server CDC, not application-table polling. It currently accepts one database per connector, one active capture instance per selected table, and `data.query.mode=direct`.
 
-Schema Registry integration, Avro, and Protobuf are post-MVP. Their eventual schema naming convention should follow the selected compatibility mode and be treated as a public API.
+Mapped Debezium-compatible inputs include `database.hostname`, `database.port`, `database.user`, `database.password`, `database.names`, `database.encrypt`, `database.trustServerCertificate`, `table.include.list`, `table.exclude.list`, `snapshot.mode`, `snapshot.isolation.mode`, `data.query.mode`, `streaming.fetch.size`, `max.queue.size`, `max.batch.size`, and `poll.interval.ms`.
 
-### 12. Configuration Contract
+The implemented flow is:
 
-Configuration is YAML with a versioned top-level schema. Unknown fields are errors by default. Environment interpolation uses `${NAME}` and `${NAME:-default}`; resolved secrets are redacted from diagnostics and APIs.
+1. validate SQL Server version, Agent state, database CDC state, and capture instances;
+2. capture `sys.fn_cdc_get_max_lsn()` as the snapshot handoff point;
+3. read selected source tables in a consistent snapshot transaction;
+4. poll each `cdc.fn_cdc_get_all_changes_<capture_instance>` range;
+5. pair operation 3 and 4 rows into update before/after images;
+6. merge tables by commit LSN and sequence value;
+7. checkpoint only after sink acknowledgement;
+8. detect CDC cleanup that has removed the required restart LSN and fail visibly.
 
-Proposed MVP configuration:
+Update operation 3 and 4 rows are paired into one logical update event. Queries are globally ordered and bounded by `streaming.fetch.size`; transaction boundaries use commit LSN. Mid-transaction recovery replays from the commit LSN, counts skipped records, and preserves transaction ordering.
 
-```yaml
-api_version: rustium.io/v1alpha1
-kind: Connector
+Multiple database names require explicit partition-aware ordering and checkpoint ownership. Rustium rejects them until that contract is tested. Real SQL Server integration verification is still pending because the SQL Server 2022 container image did not finish downloading in the current macOS environment; only compilation and unit tests are claimed.
 
-metadata:
-  name: orders-cdc
+### 12. Formats and Sinks
 
-source:
-  type: postgresql
-  hostname: localhost
-  port: 5432
-  database: app
-  username: rustium
-  password: ${PG_PASSWORD}
-  publication: rustium_pub
-  slot_name: rustium_orders
-  slot_ownership: managed
-  tables:
-    include:
-      - public.customers
-      - public.orders
+The native JSON encoder exposes the full typed source position and event schema. The Debezium JSON encoder emits `before`, `after`, `source`, `op`, `ts_ms`, and transaction metadata, plus connector-specific position fields.
 
-snapshot:
-  mode: initial
+stdout is best-effort and intended for development. Kafka uses `librdkafka`, configurable producer properties, durable acknowledgements, and idempotence when acknowledgement settings allow it. Producer idempotence does not make source-to-Kafka delivery exactly-once.
 
-format:
-  type: debezium_json
+### 13. Control Plane and Observability
 
-sink:
-  type: kafka
-  bootstrap_servers:
-    - localhost:9092
-  topic_prefix: app
-  acks: all
-
-state:
-  type: sqlite
-  path: /var/lib/rustium/state.db
-
-runtime:
-  channel_capacity: 2048
-  shutdown_timeout: 30s
-
-server:
-  bind: 127.0.0.1:8080
-
-observability:
-  log_format: json
-  log_level: info
-  metrics: true
-```
-
-Startup validation checks syntax, cross-field constraints, connector and sink capabilities, topic collisions, state ownership, and source prerequisites before emitting data.
-
-Changes that alter source identity, slot, selected tables, event format, or topic routing may be checkpoint-incompatible. The CLI must show the incompatibility and require an explicit reset or migration; it must not silently reuse unsafe state.
-
-### 13. Error Handling and Backpressure
-
-Errors are classified as:
-
-- **Configuration:** invalid or unsupported; fail before startup.
-- **Authentication/authorization:** fail with a redacted diagnostic; retry only when configured.
-- **Transient source/sink:** retry with capped exponential backoff and jitter.
-- **Protocol or invariant violation:** stop and mark the connector failed.
-- **Data conversion:** stop by default; explicit dead-letter or skip policies are later capabilities.
-- **State corruption/incompatibility:** refuse to continue until repaired, migrated, or explicitly reset.
-
-Retry budgets are finite or operator-configured. Status exposes the attempt count, next retry time, and last redacted error.
-
-Bounded channels implement backpressure. For PostgreSQL, stalled delivery eventually stops consuming replication messages while keepalives and safe status feedback continue. Rustium never advances a confirmed position merely to reduce retained WAL. Operators receive lag and disk-risk alerts instead.
-
-### 14. Management API and Observability
-
-The initial HTTP surface is small and versioned:
+Lifecycle states are created, starting, snapshotting, streaming, paused, failed, stopping, and stopped. The currently implemented API is:
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /health/live` | Process liveness |
-| `GET /health/ready` | Source, state, and sink readiness |
-| `GET /v1/connector/status` | Lifecycle, positions, lag, and last error |
-| `POST /v1/connector/pause` | Gracefully pause capture, when enabled |
-| `POST /v1/connector/resume` | Resume a paused connector, when enabled |
-| `GET /metrics` | Prometheus exposition |
+| `GET /health/live` | process liveness |
+| `GET /health/ready` | connector readiness |
+| `GET /v1/connector/status` | lifecycle, position, checkpoint, queue, counters |
+| `POST /v1/connector/stop` | graceful stop when enabled |
+| `GET /metrics` | Prometheus metrics |
 
-The server binds to loopback by default. Mutating endpoints are disabled unless explicitly enabled and protected. Configuration values returned by an API are always redacted.
+Metrics currently expose connector state, delivered events, failed events, and pipeline queue depth. Database lag and retained-log metrics remain release work.
 
-Core metric families include:
+### 14. Error, Security, and Resource Policy
 
-- `rustium_events_total{operation,table}`;
-- `rustium_event_errors_total{stage}`;
-- `rustium_source_lag_bytes` and `rustium_source_lag_seconds` where measurable;
-- `rustium_checkpoint_lag_seconds`;
-- `rustium_pipeline_queue_depth{stage}`;
-- `rustium_sink_batch_seconds` and `rustium_sink_errors_total`;
-- `rustium_snapshot_rows_total{table}`;
-- `rustium_postgresql_retained_wal_bytes`.
+- Configuration and capability errors fail before capture.
+- Unknown protocol/data errors stop the connector.
+- General source/sink retry orchestration is not implemented yet; retries must be finite and observable when added.
+- Queues are bounded and backpressure blocks source output.
+- Database and Kafka TLS are configuration-controlled.
+- The management server binds to loopback by default.
+- Mutating HTTP endpoints are disabled by default.
+- Secrets are interpolated at load time and excluded from status and semantic fingerprints.
 
-Metric labels must be bounded. Row values, SQL text, credentials, and arbitrary error strings are not metric labels. Structured logs include connector name, run generation, stage, source position, and transaction identifier where safe. Row payload logging is off by default.
+### 15. Testing and Release Gates
 
-### 15. Security
+A connector is not complete because it compiles. Required gates include:
 
-- Use TLS for database, Kafka, and HTTP connections when configured.
-- Support Kafka SASL mechanisms required by the selected client library.
-- Read secrets from environment variables or mounted files; external secret-provider integration is future work.
-- Redact credentials in config dumps, URLs, errors, and tracing fields.
-- Bind management endpoints locally by default and require explicit remote exposure.
-- Run containers as a non-root user with a read-only filesystem except for the state directory.
-- Audit dependency licenses and vulnerabilities in CI.
-- Publish a `SECURITY.md` before the first public binary release.
+- unit tests for positions, conversions, filters, configuration, and event envelopes;
+- real database snapshot/stream tests;
+- concurrent-write snapshot handoff tests;
+- crash/restart tests inside transactions and multi-row events;
+- sink acknowledgement/checkpoint ordering tests;
+- cleanup/retention failure tests;
+- DDL and historical schema tests;
+- golden Debezium compatibility fixtures;
+- long-running backpressure and reconnect tests;
+- Kafka end-to-end durability tests.
 
-### 16. Testing and Release Gates
+The ignored MySQL Docker test is runnable with:
 
-No feature is “ready” based only on implementation. Release gates include:
+```bash
+cargo test -p rustium-mysql --test mysql_docker -- --ignored --nocapture
+```
 
-- unit tests for event models, configuration, offsets, and type conversion;
-- protocol fixture tests for `pgoutput` messages;
-- integration tests against supported PostgreSQL and Kafka versions;
-- snapshot/stream handoff tests with concurrent writes;
-- crash tests before and after sink acknowledgement and checkpoint persistence;
-- golden event tests for every claimed Debezium-compatible behavior;
-- fuzz tests for protocol decoders and configuration parsers;
-- long-running backpressure, reconnect, and WAL-retention tests;
-- reproducible benchmarks with workload, hardware, versions, and raw results published.
+The pending SQL Server Docker gate is runnable where the Microsoft image is available:
 
-Performance numbers must not appear in project documentation until the benchmark code and results are public and repeatable. Correctness tests block release; performance regressions use documented budgets after a baseline exists.
+```bash
+cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
+```
 
-### 17. Roadmap
+### 16. Roadmap
 
-#### Phase 0: Foundation
-
-- Approve architecture and compatibility boundaries.
-- Create the Cargo workspace, CI, contribution guide, security policy, and code of conduct.
-- Define the event model, connector/sink traits, configuration schema, and SQLite migrations.
-
-#### Phase 1: PostgreSQL vertical slice (`0.1.0` target)
-
-- PostgreSQL `pgoutput` streaming.
-- Consistent initial snapshot.
-- Native JSON and Debezium-compatible JSON.
-- stdout and Kafka sinks.
-- SQLite checkpoints, graceful shutdown, retries, health, status, and metrics.
-- Container image, examples, integration tests, and compatibility matrix.
-
-#### Phase 2: Reliability and schema (`0.2.x` target)
-
-- Incremental snapshots and signaling.
-- Schema change propagation and Schema Registry integration.
-- Dead-letter policies, heartbeats, transaction metadata, and broader PostgreSQL type coverage.
-- Operational runbooks and published benchmarks.
-
-#### Phase 3: Ecosystem (`0.3+` target)
-
-- MySQL row-based binlog connector.
-- Avro and Protobuf encoders.
-- Additional durable sinks.
-- Embedded runtime evaluation and multi-connector daemon evaluation.
-
-#### Phase 4: Production scale (`1.0` criteria)
-
-- Stable public configuration and event compatibility policies.
-- Upgrade and state migration guarantees.
-- Security audit, disaster recovery guidance, and production case studies.
-- High-availability and Kubernetes operation based on demonstrated user needs.
-
-Version numbers are targets, not promises. A milestone is complete only when its release gates pass.
-
-### 18. Key Decisions
-
-| Area | Decision | Reason |
-|---|---|---|
-| Runtime | Tokio | Mature async I/O ecosystem and cancellation primitives |
-| Deployment | One connector per process for MVP | Fault isolation and simpler state ownership |
-| Connector model | Statically linked Rust traits | Type safety without an unstable plugin ABI |
-| Source | PostgreSQL `pgoutput` first | Native protocol and a focused correctness surface |
-| Delivery | At-least-once | Honest guarantee across heterogeneous sources and sinks |
-| State | SQLite by default | Transactional, inspectable, and dependency-light local state |
-| Format | Typed internal model; JSON first | Prevent sink formats from defining core semantics |
-| Compatibility | Tested encoder and matrix | Compatibility is specific and verifiable |
-| Configuration | Strict, versioned YAML | Human-readable with controlled evolution |
-| Errors | Stop on unknown data errors | Silent loss is worse than visible interruption |
-| Telemetry | `tracing` and Prometheus | Structured diagnostics and standard metrics |
-
-Architecture decisions that change these contracts should be recorded as ADRs under `docs/adr/`.
-
-### 19. Open Design Questions
-
-- Exact boundaries of transaction metadata in per-table Kafka topics.
-- Slot ownership and recovery UX for externally managed PostgreSQL slots.
-- Native JSON compatibility policy before `1.0`.
-- Schema Registry subject naming across native and Debezium modes.
-- Snapshot restart behavior for very large tables without primary keys.
-- Criteria for adding a distributed state store or multi-instance coordination.
-
-These questions do not block workspace scaffolding, but must be resolved before the affected feature is declared stable.
+1. Close PostgreSQL automated integration, schema, tombstone, incremental-snapshot, and Kafka gates.
+2. Close MySQL historical-schema, retry, signaling, TLS-store, type, and Kafka gates.
+3. Complete real-instance verification and failure fixtures for SQL Server CDC snapshot, streaming, recovery, and cleanup handling.
+4. Only then consider additional databases.
+5. Add Schema Registry formats, packaging, security policy, operational runbooks, and stable upgrade migrations before `1.0`.
 
 ---
 
-## 中文
+## 简体中文
 
-### 1. 项目定义
+### 1. 产品定义
 
-Rustium 是一个使用 Rust 独立实现的开源、基于数据库日志的变更数据捕获（CDC）平台。它从数据库复制日志中读取已提交的变更，将其转换为稳定的内部事件模型，并投递到下游系统。
+Rustium 是一个使用 Rust 独立实现的开源、基于日志的变更数据捕获平台。它读取数据库已提交变更，转换为与数据库无关的强类型事件，并将有序记录投递到下游 Sink。
 
-Rustium 的首个产品形态是以单一二进制发布的独立服务，无需 Kafka Connect 或 JVM。Kafka 是可选的 Sink，而不是运行时依赖。
+Rustium 是独立服务，不依赖 Kafka Connect 或 JVM。Kafka 是 Sink，而不是运行时依赖。
 
-**标语：** Change Data Capture, reimagined in Rust.（用 Rust 重新构想变更数据捕获。）
+Rustium 以最新版 Debezium 的架构、事件行为和配置名称作为兼容性参考。Rustium 不是 Debezium fork，也不复制 Debezium Java 源码。
 
-#### 1.1 目标
+#### 1.1 连接器优先级
 
-- 正确保留源端顺序和数据库位点。
-- 优先保证正确性、可恢复性和资源有界，而不是只追求基准测试吞吐量。
-- 提供体积小、行为明确的独立部署方式。
-- 通过稳定的 Rust 接口支持 Source Connector、事件编码器、状态存储和 Sink。
-- 提供经过测试的 Debezium 兼容 JSON Envelope，降低生态接入成本。
-- 让健康状态、延迟、故障和日志保留风险可观测。
+连接器严格按以下顺序推进：
 
-#### 1.2 MVP 非目标
+1. PostgreSQL
+2. MySQL
+3. SQL Server
 
-- Kafka Connect 插件或完整的 Kafka Connect Worker 兼容性。
-- 端到端 exactly-once 投递。
-- 兼容 Debezium 的所有连接器、选项、数据类型或单消息转换（SMT）。
-- 多个 Rustium 实例之间的高可用协调。
-- 用户提供的原生或 WebAssembly 转换逻辑。
-- 通过轮询业务表捕获变更。
+在这三个连接器通过正确性、恢复、类型覆盖和运维发布门槛之前，其他数据库不进入范围。
 
-### 2. 当前状态与 MVP 范围
+#### 1.2 目标
 
-仓库目前只包含设计材料和 Apache-2.0 许可证，尚无可运行的 Rustium 实现、已发布 crate、容器镜像、Helm Chart、基准测试或生产版本。在代码和测试合并之前，本文中的所有能力都只是设计目标。
+- 正确保留源端顺序和可重放位点。
+- 绝不 checkpoint 尚未获得 Sink 确认的数据。
+- 限制内存并将背压传回 Source。
+- 为 at-least-once 去重提供确定性事件 ID。
+- 分离源协议、内部事件、格式、Sink 和状态所有权。
+- 在实际可兼容时优先采用 Debezium 参数名和事件字段。
+- 暴露生命周期、位点、队列、投递和故障状态。
 
-第一个可用版本的范围如下：
+#### 1.3 `1.0` 前的非目标
 
-| 能力 | MVP 目标 |
+- 跨任意 Sink 的端到端 exactly-once。
+- Kafka Connect Worker 或 SMT 兼容。
+- 动态原生插件 ABI。
+- 多实例高可用协调。
+- 通过轮询业务表替代数据库 CDC 能力。
+- 在前三个连接器完成前添加低优先级数据库。
+
+### 2. 当前实现
+
+Workspace 已包含可运行的 alpha 服务。
+
+| 组件 | 状态 |
 |---|---|
-| Source | PostgreSQL 14+，使用 `pgoutput` 逻辑复制 |
-| 捕获模式 | 一致性初始快照，然后持续流式捕获 |
-| Sink | 用于开发的 stdout；用于持久投递的 Kafka |
-| 事件格式 | 带版本的 JSON，以及经过测试的 Debezium 兼容 JSON 编码器 |
-| 状态 | 本地 SQLite checkpoint 存储 |
-| 运行时 | Tokio，每个进程运行一个连接器 |
-| 管理 | CLI、健康/状态 HTTP 端点、Prometheus 指标 |
-| 投递语义 | at-least-once，并提供确定性事件 ID |
-| 部署 | 独立二进制和容器镜像 |
+| 核心事件/位点/运行时 trait | 已实现 |
+| 有界 Tokio 运行时 | 已实现 |
+| SQLite 状态 | 已实现 |
+| 原生和 Debezium JSON | 已实现 |
+| stdout 和 Kafka Sink | 已实现 |
+| PostgreSQL Source | 已实现并完成手工集成验证 |
+| MySQL Source | 已实现并通过 Docker 集成测试 |
+| SQL Server Source | 已实现并接入；真实实例验证待完成 |
+| CLI 和 HTTP 管理 | 已实现 |
+| 已发布镜像/包/Helm Chart | 尚不可用 |
 
-MySQL、Schema Registry 格式、增量快照、多连接器守护进程、Kubernetes Operator、嵌入式模式和更多 Sink 属于后续里程碑。
+Alpha 表示源端和投递契约可以运行，但配置和持久化状态尚未稳定。
 
-### 3. 设计原则与不变量
+### 3. 架构不变量
 
-以下规则属于架构不变量：
+1. **不丢失已确认数据。** 只有相关事件全部获得 Sink 确认后才持久化源位点。
+2. **At-least-once 投递。** Sink 确认后、checkpoint 持久化前崩溃可能导致重放。
+3. **源顺序权威。** 一个连接器的记录按强类型源位点保持顺序。
+4. **内存有界。** Source 到运行时的每个队列都有配置容量。
+5. **显式 unavailable。** 缺失的 TOAST 或 minimal row image 值不会被错误转换为 null。
+6. **状态版本化。** Checkpoint 和配置具有明确 schema 版本与指纹。
+7. **故障可见。** 协议、转换、状态和 Sink 错误默认停止连接器。
+8. **敏感信息保护。** 凭据和行数据不进入状态或指标。
+9. **不静默宣称兼容。** 未支持的 Debezium 参数产生警告或校验错误。
 
-1. **不丢失已确认数据。** 在配置的 Sink 持久确认某个位点覆盖的所有事件之前，不得持久化该源位点。
-2. **默认 at-least-once。** Sink 确认后、checkpoint 持久化前发生崩溃可能产生重复。Rustium 必须明确说明这一点，并提供稳定事件 ID 用于去重。
-3. **源端顺序权威。** 同一个源分区的事件必须按源位点排序，任何并行处理都不得改变顺序。
-4. **内存有界。** 阶段之间的每个队列都必须有配置上限。队列满时向 Source 传播背压，禁止无限缓冲。
-5. **能力显式声明。** Connector 或 Sink 必须声明可选能力，运行时在校验阶段拒绝不支持的配置。
-6. **状态版本化。** checkpoint、事件 schema、配置 schema 和持久化元数据都必须带版本，并支持显式迁移。
-7. **故障可见。** 对无法解码或投递的事件，Rustium 默认必须停止。跳过数据需要显式策略和可观测记录。
-8. **保护敏感信息。** 默认情况下，凭据和行数据不得出现在日志、指标、状态 API 或 panic 输出中。
-
-### 4. 系统架构
-
-Rustium 将数据平面和控制平面分离。
+### 4. Workspace 边界
 
 ```text
-                         控制平面
-       配置校验 | 生命周期 | 状态 API | 健康检查 | 指标
-                                |
-                                v
-+-------------------------------------------------------------------+
-|                           数据平面                                |
-|                                                                   |
-|  Source -> 解码 -> 规范化 -> 过滤 -> 转换 -> 路由                 |
-|     |                                             |               |
-|     |                                             v               |
-|     +-> 快照 / 复制位点                         编码 -> 批处理     |
-|                                                   |               |
-|                                                   v               |
-|                                                  Sink             |
-|                                                   | 确认          |
-|                                                   v               |
-|                                             Checkpoint 存储        |
-+-------------------------------------------------------------------+
-                | Schema 缓存 | 重试策略 | 遥测 |
+crates/
+|-- rustium-core/          强类型事件、位点、trait、运行时
+|-- rustium-config/        YAML、properties、校验、指纹
+|-- rustium-state/         版本化 SQLite checkpoint
+|-- rustium-postgresql/    pgoutput Source
+|-- rustium-mysql/         行级 binlog Source
+|-- rustium-sqlserver/     SQL Server CDC Source
+|-- rustium-format-json/   原生和 Debezium JSON
+|-- rustium-sink-stdout/   开发用 Sink
+|-- rustium-sink-kafka/    持久 Kafka Producer Sink
+|-- rustium-server/        健康、状态、生命周期、指标
+`-- rustium-cli/           rustium 二进制
 ```
 
-#### 4.1 数据平面
+Connector 和 Sink 通过 Rust trait 静态链接。稳定动态插件 ABI 延后设计。
 
-- **Source Connector：** 发现源端 schema、执行快照、读取复制流，并输出带源位点的记录。
-- **Decoder：** 将 PostgreSQL `pgoutput` 等协议消息转换为强类型值。
-- **Normalizer：** 生成与具体数据库无关的内部 `ChangeEvent`。
-- **Filter：** 应用数据库、schema、表的包含和排除规则。
-- **Transform：** 应用内置且确定性的转换。MVP 初期可以只提供字段脱敏和 Topic 路由。
-- **Router：** 根据事件元数据选择目标 Topic 或 Stream。
-- **Encoder：** 将内部事件序列化为 Rustium 原生版本化 JSON 或 Debezium 兼容 JSON Envelope。
-- **Batcher 与 Sink：** 在不破坏顺序的前提下批量投递，并等待持久确认。
-- **Checkpoint Store：** 原子持久化最后一个完全确认的源位点和快照状态。
-
-#### 4.2 控制平面
-
-MVP 中每个进程只运行一个连接器。控制平面负责加载和校验配置、管理连接器生命周期、暴露状态和健康端点，并协调优雅关闭。未来的多连接器守护进程必须复用同一个连接器运行时，不能改变连接器语义。
-
-### 5. 建议的 Workspace 边界
+### 5. 数据平面
 
 ```text
-rustium/
-|-- crates/
-|   |-- rustium-core/              # 事件模型、trait、运行时、错误
-|   |-- rustium-config/            # 版本化配置与校验
-|   |-- rustium-state/             # Checkpoint API 与 SQLite 存储
-|   |-- rustium-postgresql/        # pgoutput Source Connector
-|   |-- rustium-format-json/       # 原生和 Debezium JSON 编码器
-|   |-- rustium-sink-stdout/       # 开发用 Sink
-|   |-- rustium-sink-kafka/        # Kafka Producer Sink
-|   |-- rustium-server/            # HTTP 健康、状态和指标
-|   `-- rustium-cli/               # rustium 可执行文件
-|-- docs/
-|-- examples/
-|-- tests/
-|-- deploy/
-`-- Cargo.toml
+源协议
+  |
+  v
+解码和规范化
+  |
+  v
+有界 SourceRecord channel
+  |
+  v
+编码有序 ChangeEvent
+  |
+  v
+写入有序 DeliveryBatch
+  |
+  v
+持久化最高已确认 SourcePosition
+  |
+  v
+在协议支持时确认 Source
 ```
 
-MVP 中 Connector 和 Sink 采用静态链接。由于 Rust 没有稳定的原生 ABI，过早设计动态插件边界还会限制核心类型，因此动态插件 ABI 延后考虑。
+当前运行时使用一个 Source task 和一个有序投递协调器。在明确排序屏障和分区契约之前，项目有意限制并行度。
+
+#### 5.1 提交顺序
+
+每个非空批次或仅位点批次执行：
+
+1. 编码全部数据记录。
+2. 调用 `Sink::write` 并等待确认。
+3. 原子保存版本化 SQLite checkpoint。
+4. 通过 Source 确认 channel 发布已保存位点。
+5. 更新状态计数器。
+
+快照完成和事务提交边界会强制刷新。大小和时间阈值也可能在事务中间刷新，因此连接器位点必须支持事务内部精确重放。
+
+#### 5.2 关闭
+
+取消操作会停止 Source 读取、刷新待处理事件、只持久化已确认位点、刷新并关闭 Sink，最后关闭协议资源。超时退出时不会 checkpoint 未确认记录。
 
 ### 6. 内部事件模型
 
-内部模型与具体数据库无关，也不能依赖任何 Sink 的序列化格式。
+`ChangeEvent` 包含：
 
-```rust
-pub struct ChangeEvent {
-    pub id: EventId,
-    pub source: SourceMetadata,
-    pub position: SourcePosition,
-    pub transaction: Option<TransactionMetadata>,
-    pub operation: Operation,
-    pub before: Option<Row>,
-    pub after: Option<Row>,
-    pub schema: EventSchema,
-    pub source_time: Option<SystemTime>,
-    pub observed_time: SystemTime,
-}
+- 确定性 `EventId`；
+- 强类型 `SourcePosition`；
+- Connector/数据库/schema/表元数据；
+- 可选事务 ID 和顺序；
+- read、create、update、delete、truncate 或 message 操作；
+- 可选 before/after 行；
+- 版本化字段 schema；
+- 源时间和观测时间。
 
-pub enum Operation {
-    Read,
-    Create,
-    Update,
-    Delete,
-    Truncate,
-    Message,
-}
-```
+`DataValue` 区分 null、boolean、有符号/无符号整数、decimal 文本、float、string、bytes、date、time、timestamp、UUID、JSON、array 和 unavailable。
 
-`SourcePosition` 是由 Connector 管理的强类型值，拥有稳定的序列化表示，并且在单个源分区中可全序比较。PostgreSQL 位点至少包含 WAL LSN；同一 LSN 存在多个事件时还需包含事件序号。未来的 MySQL 位点包含 binlog 文件/位置和可选的 GTID 状态。
+事件 ID 对连接器名称、源分区、强类型位点、集合和序号进行哈希。同一源记录重放会得到相同 ID。
 
-`EventId` 是确定性的，由连接器身份、源分区、源位点、集合身份和事件序号生成。因此重放同一条源记录会得到相同 ID。
+### 7. 源位点与 Checkpoint
 
-行数据使用强类型值模型而不是原始 JSON，使 decimal、timestamp、binary、array 和 null 在编码前保持可区分。对于无法从源端重建的值，例如 PostgreSQL 未变化的 TOAST 列，使用显式的 `Unavailable` 值表示。
+#### 7.1 PostgreSQL
 
-### 7. 运行时与生命周期
+位点包含 WAL LSN、可选 commit LSN、事务 ID、同 LSN 事件序号和快照状态。只有对应 checkpoint 保存后才推进复制反馈。
 
-#### 7.1 连接器状态
+#### 7.2 MySQL
 
-```text
-CREATED -> STARTING -> SNAPSHOTTING -> STREAMING
-               |             |             |
-               +-------------+-------------+-> FAILED
+位点包含 binlog 文件名、可重放事件锚点、GTID、源 server ID、行/事件序号和快照状态。
 
-SNAPSHOTTING <-> PAUSED <-> STREAMING
-STARTING/SNAPSHOTTING/STREAMING/PAUSED -> STOPPING -> STOPPED
-```
+对于行事件，checkpoint 锚点是前置 `TABLE_MAP_EVENT` 的起始位置。这是有意设计：只记录行事件结束位置可能丢失剩余行；直接从行事件体启动又可能缺少解码元数据。从 table-map 锚点重放并使用确定性行序号，可跳过已经确认的行，并从多行事件内部继续。
 
-每次状态转换都记录时间戳和机器可读原因。`FAILED` 是终止状态，直到操作员重启，或配置的重启策略创建新的运行代次。
+#### 7.3 状态兼容
 
-#### 7.2 任务模型
+配置指纹覆盖源身份、选表、快照行为、格式和路由。密码与运维调优不影响指纹。不兼容 checkpoint 会被拒绝，直到显式重置或迁移。
 
-运行时使用由有界 channel 连接的 Tokio task。Connector task 独占数据库协议连接。Processor task 只能在最终通过排序屏障恢复源端顺序的情况下并行执行 CPU 工作。Sink worker 负责批处理和投递，checkpoint coordinator 串行处理确认和状态更新。
+### 8. 配置
 
-#### 7.3 优雅关闭
+Rustium 支持：
 
-关闭时，Rustium 停止接收新的源记录，在配置的超时时间内排空在途事件，刷新 Sink，持久化最后一个已确认 checkpoint，在适用时发送最终源端反馈，然后关闭资源。若超时，进程退出且不 checkpoint 未确认事件；这些事件会在重启后重放。
+- 严格、版本化 YAML，拒绝未知字段；
+- `${NAME}` 和 `${NAME:-default}` 环境变量插值；
+- Debezium 风格 Java `.properties`；
+- 数据库/schema/表完整匹配正则；
+- 对已识别但未支持参数输出兼容性警告。
 
-### 8. 投递与 Checkpoint 语义
+原生根 schema 为 `api_version: rustium.io/v1alpha1`、`kind: Connector`。
 
-#### 8.1 默认保证
+项目优先使用 Debezium 名称，包括 `name`、`connector.class`、`topic.prefix`、`database.*`、`table.include.list`、`table.exclude.list`、`snapshot.mode`、`snapshot.fetch.size`、`max.queue.size`、`max.batch.size` 和 `poll.interval.ms`。
 
-当 Source 能从已存位点重放、Sink 能返回持久确认时，Rustium 提供 **at-least-once 投递**。Rustium 不宣称端到端 exactly-once。
+Properties 中 Rustium 自身的状态、Sink、Server、日志和 Producer 扩展使用 `rustium.*`。
 
-提交顺序如下：
-
-1. 读取并解码源记录。
-2. 向 Sink 投递有序批次。
-3. 等待 Sink 持久确认。
-4. 原子持久化该批次最高的连续源位点。
-5. 当源协议支持反馈时，通知源端该位点可以释放。
-
-如果 Rustium 在第 3 步之后、第 4 步之前崩溃，已确认批次会被重放。如果在第 3 步之前崩溃，Sink 不得报告成功，位点也不会推进。
-
-#### 8.2 Checkpoint 记录
-
-Checkpoint 至少包含：
-
-- 连接器身份和运行代次；
-- Source 类型和版本化源位点；
-- 快照阶段、快照锚点和已完成集合；
-- 最后一个完全确认的事务或批次边界；
-- 与兼容性有关的配置指纹；
-- checkpoint schema 版本和更新时间。
-
-SQLite 是 MVP 状态存储，使用 WAL 模式和事务更新。状态目录必须位于持久存储上。在容器部署中，文件可写并不等于数据持久。
-
-#### 8.3 Sink 确认
-
-只有达到 Sink 配置的持久性条件后，`Sink::write(batch)` 才能成功。对于 Kafka，生产默认值是 `acks=all`，并在客户端支持时启用幂等 Producer。Kafka Producer 幂等性可以减少 Producer 重试产生的重复，但不会把 Source 到 Kafka 的投递变成 exactly-once 事务。
-
-stdout Sink 的确认只表示操作系统写入完成，仅适用于开发，不能提供持久投递保证。
-
-### 9. PostgreSQL Connector
+### 9. PostgreSQL 连接器
 
 #### 9.1 前置条件
 
-- MVP 支持矩阵为 PostgreSQL 14 或更高版本。
-- `wal_level=logical`，并配置足够的复制槽和 WAL Sender。
-- 登录用户具备复制权限和目标表的 `SELECT` 权限。
-- 存在包含目标表的 `pgoutput` Publication。
-- 当 update 或 delete 需要旧值时，配置合适的 `REPLICA IDENTITY`。
+- PostgreSQL 14 或更高版本。
+- `wal_level=logical`。
+- 已存在的 `pgoutput` publication。
+- 复制和表读取权限。
+- 唯一复制 slot。
 
-开始捕获前，Rustium 校验 Publication 成员、Replica Identity 限制、复制槽状态、服务器版本和所需权限。
+#### 9.2 快照切换
 
-#### 9.2 一致性初始快照
+托管初始快照流程：
 
-对于由 Rustium 管理的新复制槽，初始快照算法如下：
+1. 准备或重建非活动托管 slot；
+2. 创建逻辑 slot 并导出 snapshot；
+3. 打开 repeatable-read、read-only SQL 事务；
+4. 导入导出的 snapshot；
+5. 发现选中的 publication 表和 schema；
+6. 以有界分页扫描每张表；
+7. 在 slot 锚点 LSN 发出 snapshot-complete；
+8. 从该 LSN 启动 `pgoutput`。
 
-1. 创建逻辑复制槽并导出数据库快照，获得一致的 WAL 位点。
-2. 启动 `REPEATABLE READ` 事务并导入该快照。
-3. 发现表结构，并固定本次运行选择的集合。
-4. 在可能的情况下按主键确定性排序扫描表，并输出 `Read` 事件。
-5. 标记最后一条快照记录，并原子记录快照完成。
-6. 结束快照事务，从一致 WAL 位点开始逻辑复制。
-7. 处理快照期间由复制槽保留的变更。
+Slot 会保留快照期间提交的变更，因此切换不存在缺口。
 
-这样可以先输出快照，再输出锚点之后的所有变更，并且不主动留下缺口。长时间快照会保留 WAL，因此 Rustium 必须暴露 WAL 保留量，并在达到配置阈值时告警或失败。
+#### 9.3 流式捕获
 
-如果进程在导出快照完成前崩溃，PostgreSQL 无法恢复该事务。MVP 会重新执行完整初始快照。对于引擎拥有的复制槽，Rustium 只能在显式所有权策略允许时重建；绝不自动删除用户管理的复制槽。重新输出的快照行属于 at-least-once 契约下的重复数据。
+`pg_walstream` 提供复制传输和协议解析。Rustium 转换 begin、insert、update、delete、truncate、commit 和流式事务事件。同 LSN 序号让位点可全序和重放。缺失的未变化 TOAST 列成为 `Unavailable`。
 
-没有主键的表可以扫描，但确定性分块和未来增量快照能力受限，运行时必须报告这一限制。
+#### 9.4 PostgreSQL 剩余门槛
 
-#### 9.3 流式捕获与反馈
+- 自动化 PostgreSQL Docker 集成测试；
+- 持久历史 schema 和完整 DDL 刷新；
+- 增量快照和信号；
+- tombstone；
+- 更广类型和故障样例；
+- Kafka 端到端恢复测试。
 
-Connector 解码 `pgoutput` 的 `Begin`、`Relation`、`Insert`、`Update`、`Delete`、`Truncate`、`Commit` 和 keepalive 消息。事务按提交顺序输出，Relation 消息用于更新版本化 schema 缓存。
+### 10. MySQL 连接器
 
-只有相应 Sink 确认已写入 checkpoint 后，PostgreSQL standby status feedback 才推进位点。这一顺序优先选择重放而不是数据丢失。当 Sink 不可用时，指标和告警必须展示复制槽保留 WAL 的风险。
+#### 10.1 前置条件
 
-`before` 中可用的值取决于 `REPLICA IDENTITY`。未变化的 TOAST 值在内部表示为 unavailable，绝不能静默转换为 `null`。
+- MySQL 8.0 或更高版本。
+- `log_bin=ON` 和 `binlog_format=ROW`。
+- 与源 server ID 不同的 `database.server.id`。
+- `SELECT`、`RELOAD`、`FLUSH_TABLES`、`REPLICATION SLAVE` 和 `REPLICATION CLIENT` 权限。
 
-### 10. 过滤、转换与路由
+#### 10.2 快照切换
 
-先计算包含规则，再计算排除规则。标识符采用明确的 `database.schema.table` 语义，且不依赖 locale。无效模式会导致配置校验失败。
+1. 在锁连接执行 `FLUSH TABLES WITH READ LOCK`。
+2. 在快照连接启动 repeatable-read 一致性事务。
+3. 捕获当前 binlog 文件名、位置、GTID 状态和源 server ID。
+4. 释放全局读锁。
+5. 在快照内发现选中的基础表和列。
+6. 以有界分页扫描表，有主键时按主键排序。
+7. 提交快照并发出 snapshot-complete。
+8. 从捕获位置开始 binlog 流式读取。
 
-MVP 应刻意限制转换范围：
+全局读锁只在建立事务和捕获位点期间持有，不覆盖完整表扫描。
 
-- 包含或排除集合；
-- 重命名路由 Topic；
-- 删除或脱敏配置的字段；
-- 添加不包含秘密的静态 header。
+#### 10.3 流式捕获
 
-转换必须是确定性且无副作用的，不能修改源位点。转换失败时默认停止连接器。
+`mysql_async` 提供复制传输和 binlog 解析。Rustium 处理 rotate、table-map、GTID、query、write-rows、update-rows、delete-rows 和 XID 事件。
 
-默认 Kafka Topic 为：
+行事件生成强类型 before/after。FULL、MINIMAL 和 NOBLOB image 均可接受；省略值使用显式 `Unavailable`。GTID 事务包含全局顺序和集合内顺序。DDL query 事件会在后续行事件解码前刷新当前表 schema。
 
-```text
-{topic_prefix}.{database}.{schema}.{table}
-```
+#### 10.4 TLS 模式
 
-Topic 规范化和冲突检测在配置校验时完成。两个源集合不得静默映射到同一个 Topic。
+- `disabled`：仅明文。
+- `preferred`：先尝试加密，失败后回退明文。
+- `required`：加密，但不校验 CA 或主机名。
+- `verify_ca`：加密并校验 CA，不校验主机名。
+- `verify_identity`：加密并同时校验 CA 和主机名。
 
-### 11. 事件格式与 Debezium 兼容性
+自定义 Debezium truststore/keystore 映射尚未实现。
 
-Rustium 的规范契约是版本化内部事件模型，Encoder 提供外部表示。
+#### 10.5 已验证恢复
 
-MVP 包含：
+MySQL 8.4 测试门槛覆盖：
 
-1. **Rustium JSON：** 在 Rustium 兼容性规则下演进的版本化格式。
-2. **Debezium 兼容 JSON：** 通过明确兼容性矩阵测试的编码器。
+- 两行快照和快照完成；
+- 一个包含多行 insert、update、delete 的事务；
+- 事务顺序 1 到 5；
+- 重启不重复快照；
+- 从两行事件的第 1 行重启，正确从第 2 行继续；
+- GTID 保留；
+- decimal、JSON、boolean、timestamp 转换；
+- DDL schema 刷新和新增列捕获。
 
-目标 Envelope 示例：
+#### 10.6 MySQL 剩余门槛
 
-```json
-{
-  "before": null,
-  "after": {
-    "id": 1,
-    "name": "Alice"
-  },
-  "source": {
-    "version": "0.1.0",
-    "connector": "postgresql",
-    "name": "orders-cdc",
-    "ts_ms": 1784102400000,
-    "snapshot": "false",
-    "db": "app",
-    "sequence": "[\"24023119\",\"24023128\"]",
-    "schema": "public",
-    "table": "customers",
-    "txId": 555,
-    "lsn": 24023128
-  },
-  "op": "c",
-  "ts_ms": 1784102400142,
-  "transaction": null
-}
-```
+- 用于破坏性 DDL 回放的持久历史 schema；
+- GTID source include/exclude 过滤；
+- heartbeat 和信号记录；
+- 增量快照；
+- 自动重连和有限重试预算；
+- tombstone；
+- 自定义 trust/key store 和更广类型样例；
+- 服务端 partial JSON diff 的精确重建。
 
-操作码包括：快照读取 `r`、创建 `c`、更新 `u`、删除 `d`，以及在支持时用于 truncate 的 `t`。
+### 11. SQL Server 连接器
 
-兼容性是可测试的边界，而不是笼统声明。兼容性矩阵必须明确 Envelope 字段、快照标记、decimal 和时间编码、不可用值、tombstone、事务元数据、schema 名称和 Topic 名称。只有存在 golden test 的行为才能宣称兼容。
+SQL Server 连接器使用 SQL Server CDC 实现，不轮询业务表。当前每个连接器只接受一个数据库、每张选表只接受一个活动 capture instance，并要求 `data.query.mode=direct`。
 
-Schema Registry、Avro 和 Protobuf 属于 MVP 之后的能力。未来的 schema 命名约定应遵循所选兼容模式，并被视为公共 API。
+已映射的 Debezium 兼容输入包括 `database.hostname`、`database.port`、`database.user`、`database.password`、`database.names`、`database.encrypt`、`database.trustServerCertificate`、`table.include.list`、`table.exclude.list`、`snapshot.mode`、`snapshot.isolation.mode`、`data.query.mode`、`streaming.fetch.size`、`max.queue.size`、`max.batch.size` 和 `poll.interval.ms`。
 
-### 12. 配置契约
+已实现流程：
 
-配置采用带顶层版本的 YAML schema。默认情况下，未知字段属于错误。环境变量插值支持 `${NAME}` 和 `${NAME:-default}`；解析后的秘密会从诊断和 API 中脱敏。
+1. 校验 SQL Server 版本、Agent 状态、数据库 CDC 状态和 capture instance；
+2. 捕获 `sys.fn_cdc_get_max_lsn()` 作为快照切换点；
+3. 在一致性快照事务中读取选中的源表；
+4. 轮询每个 `cdc.fn_cdc_get_all_changes_<capture_instance>` 范围；
+5. 将 operation 3 和 4 配对为 update before/after；
+6. 按 commit LSN 和 sequence value 合并各表；
+7. 仅在 Sink 确认后 checkpoint；
+8. 检测 CDC cleanup 已删除所需重启 LSN，并明确失败。
 
-建议的 MVP 配置：
+Update operation 3 和 4 会配对为一个逻辑 update 事件。查询按全局顺序排列，并由 `streaming.fetch.size` 限制；事务边界使用 commit LSN。事务中间恢复会从 commit LSN 重放、统计已跳过记录，并保留事务顺序。
 
-```yaml
-api_version: rustium.io/v1alpha1
-kind: Connector
+多个数据库名称需要显式的分区感知排序和 checkpoint 所有权。在该契约经过测试前，Rustium 会直接拒绝。由于当前 macOS 环境未能完成 SQL Server 2022 容器镜像下载，真实 SQL Server 集成验证仍待完成；目前只宣称编译和单元测试通过。
 
-metadata:
-  name: orders-cdc
+### 12. 格式与 Sink
 
-source:
-  type: postgresql
-  hostname: localhost
-  port: 5432
-  database: app
-  username: rustium
-  password: ${PG_PASSWORD}
-  publication: rustium_pub
-  slot_name: rustium_orders
-  slot_ownership: managed
-  tables:
-    include:
-      - public.customers
-      - public.orders
+原生 JSON Encoder 暴露完整强类型源位点和事件 schema。Debezium JSON Encoder 输出 `before`、`after`、`source`、`op`、`ts_ms`、事务元数据和连接器特定位点字段。
 
-snapshot:
-  mode: initial
+stdout 是 best-effort，仅用于开发。Kafka 使用 `librdkafka`，支持可配置 Producer 属性、持久确认，并在确认设置允许时启用幂等。Producer 幂等并不会把 Source 到 Kafka 变为 exactly-once。
 
-format:
-  type: debezium_json
+### 13. 控制平面与可观测性
 
-sink:
-  type: kafka
-  bootstrap_servers:
-    - localhost:9092
-  topic_prefix: app
-  acks: all
-
-state:
-  type: sqlite
-  path: /var/lib/rustium/state.db
-
-runtime:
-  channel_capacity: 2048
-  shutdown_timeout: 30s
-
-server:
-  bind: 127.0.0.1:8080
-
-observability:
-  log_format: json
-  log_level: info
-  metrics: true
-```
-
-在输出任何数据前，启动校验会检查语法、字段间约束、Connector 和 Sink 能力、Topic 冲突、状态所有权以及源端前置条件。
-
-修改 Source 身份、复制槽、所选表、事件格式或 Topic 路由可能与 checkpoint 不兼容。CLI 必须显示不兼容原因，并要求显式 reset 或 migration；不得静默复用不安全状态。
-
-### 13. 错误处理与背压
-
-错误分类如下：
-
-- **配置错误：** 无效或不支持，启动前失败。
-- **认证/授权错误：** 使用脱敏诊断失败；只有显式配置后才重试。
-- **Source/Sink 瞬时错误：** 使用有上限的指数退避和抖动重试。
-- **协议或不变量错误：** 停止并将连接器标记为失败。
-- **数据转换错误：** 默认停止；死信或跳过策略属于后续能力。
-- **状态损坏/不兼容：** 在修复、迁移或显式 reset 之前拒绝继续运行。
-
-重试预算必须有限或由操作员配置。状态接口暴露尝试次数、下次重试时间和最后一个已脱敏错误。
-
-有界 channel 用于实现背压。对 PostgreSQL 而言，投递阻塞最终会暂停消费复制消息，同时继续处理 keepalive 和安全的状态反馈。Rustium 绝不为了减少 WAL 保留量而推进已确认位点，而是通过延迟和磁盘风险告警通知操作员。
-
-### 14. 管理 API 与可观测性
-
-初始 HTTP 接口保持小而且版本化：
+生命周期状态包括 created、starting、snapshotting、streaming、paused、failed、stopping 和 stopped。当前 API：
 
 | 端点 | 用途 |
 |---|---|
-| `GET /health/live` | 进程存活状态 |
-| `GET /health/ready` | Source、状态存储和 Sink 就绪状态 |
-| `GET /v1/connector/status` | 生命周期、位点、延迟和最后错误 |
-| `POST /v1/connector/pause` | 启用时优雅暂停捕获 |
-| `POST /v1/connector/resume` | 启用时恢复已暂停连接器 |
-| `GET /metrics` | Prometheus 指标输出 |
+| `GET /health/live` | 进程存活 |
+| `GET /health/ready` | 连接器就绪 |
+| `GET /v1/connector/status` | 生命周期、位点、checkpoint、队列、计数 |
+| `POST /v1/connector/stop` | 启用后优雅停止 |
+| `GET /metrics` | Prometheus 指标 |
 
-服务器默认绑定 loopback。修改状态的端点只有在显式启用并受到保护时才可用。API 返回的配置值始终经过脱敏。
+当前指标包括连接器状态、已投递事件、失败事件和流水线队列深度。数据库 lag 和日志保留指标仍属于发布工作。
 
-核心指标包括：
+### 14. 错误、安全与资源策略
 
-- `rustium_events_total{operation,table}`；
-- `rustium_event_errors_total{stage}`；
-- 可测量时的 `rustium_source_lag_bytes` 和 `rustium_source_lag_seconds`；
-- `rustium_checkpoint_lag_seconds`；
-- `rustium_pipeline_queue_depth{stage}`；
-- `rustium_sink_batch_seconds` 和 `rustium_sink_errors_total`；
-- `rustium_snapshot_rows_total{table}`；
-- `rustium_postgresql_retained_wal_bytes`。
+- 配置和能力错误在捕获前失败。
+- 未知协议/数据错误停止连接器。
+- 通用 Source/Sink 重试协调尚未实现；未来重试必须有限且可观测。
+- 队列有界，背压会阻塞 Source 输出。
+- 数据库和 Kafka TLS 由配置控制。
+- 管理 Server 默认绑定 loopback。
+- 变更型 HTTP 端点默认禁用。
+- Secret 在加载时插值，不进入状态和语义指纹。
 
-指标 label 必须有界。行值、SQL 文本、凭据和任意错误字符串不能作为指标 label。结构化日志在安全时包含连接器名称、运行代次、阶段、源位点和事务 ID。默认关闭行数据日志。
+### 15. 测试与发布门槛
 
-### 15. 安全
+连接器能编译不代表完成。必要门槛包括：
 
-- 配置后为数据库、Kafka 和 HTTP 连接启用 TLS。
-- 支持所选 Kafka 客户端库提供的必要 SASL 机制。
-- 从环境变量或挂载文件读取秘密；外部 Secret Provider 集成属于未来工作。
-- 在配置输出、URL、错误和 tracing 字段中脱敏凭据。
-- 管理端点默认只绑定本机，远程暴露必须显式开启。
-- 容器以非 root 用户运行，除状态目录外使用只读文件系统。
-- 在 CI 中审计依赖许可证和漏洞。
-- 在首次公开二进制发布前提供 `SECURITY.md`。
+- 位点、转换、过滤、配置和事件 Envelope 单元测试；
+- 真实数据库快照/流式测试；
+- 快照切换期间并发写入测试；
+- 事务和多行事件内部崩溃/重启测试；
+- Sink 确认/checkpoint 顺序测试；
+- cleanup/retention 故障测试；
+- DDL 和历史 schema 测试；
+- Debezium 兼容 golden fixture；
+- 长时间背压和重连测试；
+- Kafka 端到端持久性测试。
 
-### 16. 测试与发布门槛
+可运行被忽略的 MySQL Docker 测试：
 
-功能不能仅因代码完成就标记为“可用”。发布门槛包括：
+```bash
+cargo test -p rustium-mysql --test mysql_docker -- --ignored --nocapture
+```
 
-- 事件模型、配置、位点和类型转换的单元测试；
-- `pgoutput` 消息的协议 fixture 测试；
-- 针对支持的 PostgreSQL 和 Kafka 版本的集成测试；
-- 存在并发写入时的快照/流式切换测试；
-- Sink 确认和 checkpoint 持久化前后的崩溃测试；
-- 每项 Debezium 兼容声明对应的 golden event 测试；
-- 协议解码器和配置解析器的 fuzz 测试；
-- 长时间背压、重连和 WAL 保留测试；
-- 发布工作负载、硬件、版本和原始结果的可复现基准测试。
+在可以访问 Microsoft 镜像的环境中，可运行待验证 SQL Server Docker 门槛：
 
-在基准代码和结果公开且可复现之前，项目文档不得出现性能数字。正确性测试阻塞发布；建立基线后，性能回归使用公开的预算判断。
+```bash
+cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
+```
 
-### 17. 路线图
+### 16. 路线图
 
-#### Phase 0：基础
-
-- 审批架构和兼容性边界。
-- 创建 Cargo workspace、CI、贡献指南、安全策略和行为准则。
-- 定义事件模型、Connector/Sink trait、配置 schema 和 SQLite migration。
-
-#### Phase 1：PostgreSQL 垂直切片（目标 `0.1.0`）
-
-- PostgreSQL `pgoutput` 流式捕获。
-- 一致性初始快照。
-- 原生 JSON 和 Debezium 兼容 JSON。
-- stdout 和 Kafka Sink。
-- SQLite checkpoint、优雅关闭、重试、健康检查、状态和指标。
-- 容器镜像、示例、集成测试和兼容性矩阵。
-
-#### Phase 2：可靠性与 Schema（目标 `0.2.x`）
-
-- 增量快照和信号机制。
-- Schema 变更传播和 Schema Registry 集成。
-- 死信策略、心跳、事务元数据和更完整的 PostgreSQL 类型覆盖。
-- 运维手册和公开基准测试。
-
-#### Phase 3：生态（目标 `0.3+`）
-
-- MySQL row-based binlog Connector。
-- Avro 和 Protobuf Encoder。
-- 更多持久化 Sink。
-- 评估嵌入式运行时和多连接器守护进程。
-
-#### Phase 4：生产规模（`1.0` 标准）
-
-- 稳定的公开配置和事件兼容性策略。
-- 升级和状态迁移保证。
-- 安全审计、灾难恢复指南和生产案例。
-- 根据真实用户需求实现高可用和 Kubernetes 运维能力。
-
-版本号是目标，不是承诺。只有通过发布门槛后，里程碑才算完成。
-
-### 18. 关键决策
-
-| 领域 | 决策 | 原因 |
-|---|---|---|
-| 运行时 | Tokio | 成熟的异步 I/O 生态和取消机制 |
-| 部署 | MVP 每进程一个连接器 | 故障隔离和更简单的状态所有权 |
-| Connector 模型 | 静态链接的 Rust trait | 在不依赖不稳定插件 ABI 的情况下提供类型安全 |
-| Source | 优先 PostgreSQL `pgoutput` | 原生协议和聚焦的正确性范围 |
-| 投递 | at-least-once | 面对异构 Source 和 Sink 时诚实可实现的保证 |
-| 状态 | 默认 SQLite | 支持事务、可检查且本地依赖少 |
-| 格式 | 强类型内部模型，JSON 优先 | 避免由 Sink 格式定义核心语义 |
-| 兼容性 | 测试过的 Encoder 和矩阵 | 兼容范围具体且可验证 |
-| 配置 | 严格、版本化 YAML | 便于阅读且可以受控演进 |
-| 错误 | 未知数据错误默认停止 | 静默丢失比可见中断更危险 |
-| 遥测 | `tracing` 和 Prometheus | 结构化诊断和标准指标 |
-
-改变这些契约的架构决策应以 ADR 形式记录在 `docs/adr/`。
-
-### 19. 待决设计问题
-
-- 在按表分 Topic 时，事务元数据的准确边界。
-- 外部管理 PostgreSQL 复制槽时的所有权和恢复体验。
-- `1.0` 之前原生 JSON 的兼容策略。
-- 原生模式和 Debezium 模式下的 Schema Registry subject 命名。
-- 无主键超大表的快照重启行为。
-- 引入分布式状态存储或多实例协调的判断标准。
-
-这些问题不阻塞 workspace 初始化，但必须在受影响功能被标记为稳定前解决。
+1. 补齐 PostgreSQL 自动集成、schema、tombstone、增量快照和 Kafka 门槛。
+2. 补齐 MySQL 历史 schema、重试、信号、TLS store、类型和 Kafka 门槛。
+3. 完成 SQL Server CDC 快照、流式捕获、恢复和 cleanup 的真实实例验证与故障样例。
+4. 只有完成前三项后才考虑其他数据库。
+5. 在 `1.0` 前补 Schema Registry 格式、打包、安全策略、运维手册和稳定升级迁移。

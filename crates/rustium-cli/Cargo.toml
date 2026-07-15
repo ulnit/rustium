@@ -1,0 +1,33 @@
+[package]
+name = "rustium"
+description = "Standalone Rustium CDC service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rustium"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+rustium-config = { path = "../rustium-config" }
+rustium-core = { path = "../rustium-core" }
+rustium-format-json = { path = "../rustium-format-json" }
+rustium-mysql = { path = "../rustium-mysql" }
+rustium-postgresql = { path = "../rustium-postgresql" }
+rustium-server = { path = "../rustium-server" }
+rustium-sink-kafka = { path = "../rustium-sink-kafka" }
+rustium-sink-stdout = { path = "../rustium-sink-stdout" }
+rustium-sqlserver = { path = "../rustium-sqlserver" }
+rustium-state = { path = "../rustium-state" }
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
