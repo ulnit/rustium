@@ -11,9 +11,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::{
-    Checkpoint, CheckpointStore, ConnectorIdentity, DeliveryBatch, EncodedEvent, Error,
-    EventEncoder, RecordBoundary, Result, Sink, SourceConnector, SourceContext, SourcePosition,
-    SourceRecord,
+    CHECKPOINT_SCHEMA_VERSION, Checkpoint, CheckpointStore, ConnectorIdentity,
+    ConnectorStateEnvelope, DeliveryBatch, EncodedEvent, Error, EventEncoder, RecordBoundary,
+    Result, Sink, SourceConnector, SourceContext, SourcePosition, SourceRecord,
 };
 
 #[derive(Debug, Clone)]
@@ -165,6 +165,9 @@ impl ConnectorRuntime {
         let snapshot_completed = initial_checkpoint
             .as_ref()
             .is_some_and(|checkpoint| checkpoint.snapshot_completed);
+        let mut connector_state = initial_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.connector_state.clone());
         let source_cancel = cancellation.child_token();
         let source_handle: JoinHandle<Result<()>> = tokio::spawn(async move {
             source
@@ -197,7 +200,13 @@ impl ConnectorRuntime {
                     break;
                 }
                 _ = interval.tick() => {
-                    self.flush_batch(&mut encoded, &mut highest_position, snapshot_completed, &ack_tx).await?;
+                    self.flush_batch(
+                        &mut encoded,
+                        &mut highest_position,
+                        snapshot_completed,
+                        &connector_state,
+                        &ack_tx,
+                    ).await?;
                 }
                 record = source_rx.recv() => {
                     let Some(record) = record else { break };
@@ -208,6 +217,7 @@ impl ConnectorRuntime {
                         &mut encoded,
                         &mut highest_position,
                         &mut snapshot_completed,
+                        &mut connector_state,
                         &ack_tx,
                     ).await?;
                 }
@@ -218,6 +228,7 @@ impl ConnectorRuntime {
             &mut encoded,
             &mut highest_position,
             snapshot_completed,
+            &connector_state,
             &ack_tx,
         )
         .await?;
@@ -244,6 +255,7 @@ impl ConnectorRuntime {
         encoded: &mut Vec<EncodedEvent>,
         highest_position: &mut Option<SourcePosition>,
         snapshot_completed: &mut bool,
+        connector_state: &mut Option<ConnectorStateEnvelope>,
         ack_tx: &watch::Sender<Option<SourcePosition>>,
     ) -> Result<()> {
         if let Some(previous) = highest_position.as_ref()
@@ -267,6 +279,9 @@ impl ConnectorRuntime {
             encoded.push(self.encoder.encode(event)?);
         }
         *highest_position = Some(record.position);
+        if let Some(state) = record.connector_state {
+            *connector_state = Some(state);
+        }
 
         match record.boundary {
             RecordBoundary::SnapshotComplete => {
@@ -274,20 +289,44 @@ impl ConnectorRuntime {
                 self.status
                     .transition(ConnectorState::Streaming, None)
                     .await;
-                self.flush_batch(encoded, highest_position, *snapshot_completed, ack_tx)
-                    .await?;
+                self.flush_batch(
+                    encoded,
+                    highest_position,
+                    *snapshot_completed,
+                    connector_state,
+                    ack_tx,
+                )
+                .await?;
             }
             RecordBoundary::TransactionCommit => {
-                self.flush_batch(encoded, highest_position, *snapshot_completed, ack_tx)
-                    .await?;
+                self.flush_batch(
+                    encoded,
+                    highest_position,
+                    *snapshot_completed,
+                    connector_state,
+                    ack_tx,
+                )
+                .await?;
             }
             RecordBoundary::Data if encoded.len() >= self.config.max_batch_size => {
-                self.flush_batch(encoded, highest_position, *snapshot_completed, ack_tx)
-                    .await?;
+                self.flush_batch(
+                    encoded,
+                    highest_position,
+                    *snapshot_completed,
+                    connector_state,
+                    ack_tx,
+                )
+                .await?;
             }
             RecordBoundary::Heartbeat if encoded.is_empty() => {
-                self.flush_batch(encoded, highest_position, *snapshot_completed, ack_tx)
-                    .await?;
+                self.flush_batch(
+                    encoded,
+                    highest_position,
+                    *snapshot_completed,
+                    connector_state,
+                    ack_tx,
+                )
+                .await?;
             }
             _ => {}
         }
@@ -299,6 +338,7 @@ impl ConnectorRuntime {
         encoded: &mut Vec<EncodedEvent>,
         highest_position: &mut Option<SourcePosition>,
         snapshot_completed: bool,
+        connector_state: &Option<ConnectorStateEnvelope>,
         ack_tx: &watch::Sender<Option<SourcePosition>>,
     ) -> Result<()> {
         let Some(position) = highest_position.take() else {
@@ -321,13 +361,14 @@ impl ConnectorRuntime {
         }
 
         let checkpoint = Checkpoint {
-            schema_version: 1,
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
             connector_name: self.identity.name.clone(),
             generation: self.identity.generation,
             source_position: position.clone(),
             snapshot_completed,
             config_fingerprint: self.config.config_fingerprint.clone(),
             updated_at: std::time::SystemTime::now(),
+            connector_state: connector_state.clone(),
         };
         self.checkpoint_store.save(&checkpoint).await?;
         ack_tx
@@ -335,5 +376,147 @@ impl ConnectorRuntime {
             .map_err(|_| Error::Source("source acknowledgement channel closed".into()))?;
         self.status.checkpointed(position, delivered).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::{ChangeEvent, ConnectorStateEnvelope, Durability, MySqlPosition, RecordBoundary};
+
+    struct StateSource {
+        record: SourceRecord,
+    }
+
+    #[async_trait]
+    impl SourceConnector for StateSource {
+        fn source_type(&self) -> &'static str {
+            "test"
+        }
+
+        async fn validate(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn run(&mut self, mut context: SourceContext) -> Result<()> {
+            context
+                .output
+                .send(Ok(self.record.clone()))
+                .await
+                .map_err(|_| Error::Cancelled)?;
+            context
+                .acknowledged
+                .changed()
+                .await
+                .map_err(|_| Error::Cancelled)?;
+            Ok(())
+        }
+    }
+
+    struct UnusedEncoder;
+
+    impl EventEncoder for UnusedEncoder {
+        fn content_type(&self) -> &'static str {
+            "application/test"
+        }
+
+        fn encode(&self, _event: &ChangeEvent) -> Result<EncodedEvent> {
+            Err(Error::Invariant(
+                "position-only runtime test unexpectedly encoded an event".into(),
+            ))
+        }
+    }
+
+    struct NoopSink;
+
+    #[async_trait]
+    impl Sink for NoopSink {
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+
+        fn durability(&self) -> Durability {
+            Durability::Durable
+        }
+
+        async fn validate(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn write(&mut self, _batch: &DeliveryBatch) -> Result<()> {
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MemoryCheckpointStore {
+        checkpoint: Mutex<Option<Checkpoint>>,
+    }
+
+    #[async_trait]
+    impl CheckpointStore for MemoryCheckpointStore {
+        async fn load(&self, _connector_name: &str) -> Result<Option<Checkpoint>> {
+            Ok(self.checkpoint.lock().unwrap().clone())
+        }
+
+        async fn save(&self, checkpoint: &Checkpoint) -> Result<()> {
+            *self.checkpoint.lock().unwrap() = Some(checkpoint.clone());
+            Ok(())
+        }
+
+        async fn delete(&self, _connector_name: &str) -> Result<()> {
+            *self.checkpoint.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoints_connector_state_with_its_source_position() {
+        let position = SourcePosition::MySql(MySqlPosition {
+            binlog_filename: "mysql-bin.000001".into(),
+            binlog_position: 128,
+            gtid_set: None,
+            server_id: 1,
+            event_serial: 0,
+            snapshot: false,
+        });
+        let connector_state =
+            ConnectorStateEnvelope::new("rustium.test", 1, serde_json::json!({"table": "orders"}));
+        let source = StateSource {
+            record: SourceRecord {
+                event: None,
+                position: position.clone(),
+                boundary: RecordBoundary::Heartbeat,
+                connector_state: Some(connector_state.clone()),
+            },
+        };
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let runtime = ConnectorRuntime::new(
+            ConnectorIdentity::new("runtime-state-test"),
+            Box::new(source),
+            Arc::new(UnusedEncoder),
+            Box::new(NoopSink),
+            store.clone(),
+            RuntimeConfig {
+                flush_interval: Duration::from_secs(60),
+                ..RuntimeConfig::default()
+            },
+            RuntimeStatus::new("runtime-state-test"),
+        );
+
+        runtime.run(CancellationToken::new()).await.unwrap();
+
+        let checkpoint = store.checkpoint.lock().unwrap().clone().unwrap();
+        assert_eq!(checkpoint.schema_version, CHECKPOINT_SCHEMA_VERSION);
+        assert_eq!(checkpoint.source_position, position);
+        assert_eq!(checkpoint.connector_state, Some(connector_state));
     }
 }

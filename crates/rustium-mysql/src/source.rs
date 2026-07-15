@@ -20,20 +20,9 @@ use rustium_core::{
 };
 use tracing::{debug, info, warn};
 
+use crate::schema_history::{TableSchema, apply_ddl, decode_schema_history, encode_schema_history};
+
 const CONNECTOR_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Debug, Clone)]
-struct TableSchema {
-    database: String,
-    table: String,
-    event_schema: EventSchema,
-}
-
-impl TableSchema {
-    fn key(&self) -> (String, String) {
-        (self.database.clone(), self.table.clone())
-    }
-}
 
 #[derive(Debug, Clone)]
 struct BinlogCoordinates {
@@ -127,7 +116,10 @@ impl MySqlSource {
 
         current_binlog_coordinates(&mut connection, source_server_id).await?;
         let schemas = discover_tables(&mut connection, &self.config, &self.connector_name).await?;
-        if schemas.is_empty() {
+        if !schemas
+            .values()
+            .any(|schema| self.config.tables.includes(&schema.database, &schema.table))
+        {
             return Err(Error::Configuration(
                 "the database and table filters select no MySQL tables".into(),
             ));
@@ -172,7 +164,11 @@ impl MySqlSource {
             let schemas =
                 discover_tables(&mut snapshot_connection, &self.config, &self.connector_name)
                     .await?;
-            let mut ordered = schemas.values().cloned().collect::<Vec<_>>();
+            let mut ordered = schemas
+                .values()
+                .filter(|schema| self.config.tables.includes(&schema.database, &schema.table))
+                .cloned()
+                .collect::<Vec<_>>();
             ordered.sort_by_key(TableSchema::key);
             let mut ordinal = 0_u64;
             for schema in &ordered {
@@ -205,6 +201,7 @@ impl MySqlSource {
                         true,
                     ),
                     boundary: RecordBoundary::SnapshotComplete,
+                    connector_state: Some(encode_schema_history(&schemas)?),
                 }))
                 .await
                 .map_err(|_| Error::Cancelled)?;
@@ -230,13 +227,6 @@ impl MySqlSource {
             current_binlog_coordinates(&mut connection, self.source_server_id).await?;
         connection.disconnect().await.map_err(mysql_error)?;
         Ok(coordinates)
-    }
-
-    async fn refresh_schemas(&self) -> Result<HashMap<(String, String), TableSchema>> {
-        let mut connection = connect(&self.config).await?;
-        let schemas = discover_tables(&mut connection, &self.config, &self.connector_name).await?;
-        connection.disconnect().await.map_err(mysql_error)?;
-        Ok(schemas)
     }
 
     async fn open_binlog_stream(&self, coordinates: &BinlogCoordinates) -> Result<BinlogStream> {
@@ -315,15 +305,28 @@ impl MySqlSource {
                 .collect(),
             EventData::QueryEvent(query) => {
                 let query_text = query.query().into_owned();
-                if is_schema_change(&query_text) {
-                    let schemas = self.refresh_schemas().await?;
-                    self.schemas = schemas.clone();
-                    state.schemas = schemas;
+                let current_database = query.schema().into_owned();
+                let schema_change = is_schema_change(&query_text);
+                let mut record =
+                    state.handle_query(&query_text, event_start, header.server_id(), source_time);
+                if schema_change && let Some(record) = &mut record {
+                    if let Err(error) = apply_ddl(
+                        &mut state.schemas,
+                        &query_text,
+                        &current_database,
+                        &self.config,
+                        &self.connector_name,
+                    ) {
+                        if self.config.schema_history_skip_unparseable_ddl {
+                            warn!(ddl = %query_text, %error, "skipping unparseable MySQL DDL");
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                    self.schemas.clone_from(&state.schemas);
+                    record.connector_state = Some(encode_schema_history(&state.schemas)?);
                 }
-                state
-                    .handle_query(&query_text, event_start, header.server_id(), source_time)
-                    .into_iter()
-                    .collect()
+                record.into_iter().collect()
             }
             _ => Vec::new(),
         };
@@ -410,6 +413,24 @@ impl SourceConnector for MySqlSource {
             ));
         }
 
+        let checkpoint_has_schema_history = checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.connector_state.as_ref())
+            .is_some();
+        if !snapshot_needed {
+            if let Some(connector_state) = checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.connector_state.as_ref())
+            {
+                self.schemas = decode_schema_history(connector_state)?;
+            } else if checkpoint.is_some() {
+                return Err(Error::State(
+                    "MySQL checkpoint predates persistent schema history and cannot safely replay destructive DDL; reset the checkpoint and run a new initial snapshot"
+                        .into(),
+                ));
+            }
+        }
+
         let coordinates = if snapshot_needed {
             let outcome = self.run_snapshot(&context.output).await?;
             self.schemas = outcome.schemas;
@@ -425,6 +446,29 @@ impl SourceConnector for MySqlSource {
         } else {
             self.current_coordinates().await?
         };
+
+        if !snapshot_needed && !checkpoint_has_schema_history {
+            let position = resume_position.clone().unwrap_or_else(|| {
+                mysql_position(
+                    &coordinates.filename,
+                    coordinates.position,
+                    coordinates.gtid_set.clone(),
+                    coordinates.source_server_id,
+                    0,
+                    false,
+                )
+            });
+            context
+                .output
+                .send(Ok(SourceRecord {
+                    event: None,
+                    position,
+                    boundary: RecordBoundary::Heartbeat,
+                    connector_state: Some(encode_schema_history(&self.schemas)?),
+                }))
+                .await
+                .map_err(|_| Error::Cancelled)?;
+        }
 
         let mut state = StreamingState::new(
             coordinates.filename.clone(),
@@ -735,6 +779,7 @@ impl StreamingState {
             event: None,
             position,
             boundary: RecordBoundary::TransactionCommit,
+            connector_state: None,
         })
     }
 
@@ -931,9 +976,7 @@ async fn discover_tables(
         .map_err(mysql_error)?;
     let mut schemas = HashMap::new();
     for (database, table) in tables {
-        if (!config.databases.is_empty() && !config.databases.contains(&database))
-            || !config.tables.includes(&database, &table)
-        {
+        if !config.databases.is_empty() && !config.databases.contains(&database) {
             continue;
         }
         let schema = discover_table_schema(connection, connector_name, &database, &table).await?;
@@ -1372,6 +1415,13 @@ fn mysql_error(error: impl std::fmt::Display) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
+    use rustium_config::TableSelection;
+    use rustium_core::{Checkpoint, ConnectorIdentity};
+    use tokio::sync::{mpsc, watch};
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
 
     #[test]
@@ -1431,6 +1481,60 @@ mod tests {
                 .as_ref()
                 .map(|transaction| transaction.id.as_str()),
             Some("8f5f4a9a-6b2d-4dd5-915e-1df9d53d2850:42")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_legacy_mysql_checkpoint_without_schema_history() {
+        let config = MySqlSourceConfig {
+            hostname: "localhost".into(),
+            port: 3306,
+            username: "rustium".into(),
+            password: "secret".into(),
+            databases: vec!["inventory".into()],
+            server_id: 5_401,
+            tables: TableSelection::default(),
+            ssl_mode: "disabled".into(),
+            connect_timeout: std::time::Duration::from_secs(1),
+            connect_keep_alive: true,
+            connect_keep_alive_interval: std::time::Duration::from_secs(1),
+            reconnect_max_attempts: 1,
+            schema_history_skip_unparseable_ddl: false,
+        };
+        let mut source = MySqlSource::new(
+            "inventory-mysql",
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+            },
+        );
+        let position = mysql_position("mysql-bin.000001", 128, None, 184, 1, false);
+        let checkpoint = Checkpoint {
+            schema_version: 1,
+            connector_name: "inventory-mysql".into(),
+            generation: ConnectorIdentity::new("inventory-mysql").generation,
+            source_position: position.clone(),
+            snapshot_completed: true,
+            config_fingerprint: "legacy".into(),
+            updated_at: SystemTime::now(),
+            connector_state: None,
+        };
+        let (output, _records) = mpsc::channel(1);
+        let (_acknowledged, acknowledgements) = watch::channel(Some(position));
+
+        let error = source
+            .run(SourceContext {
+                output,
+                acknowledged: acknowledgements,
+                initial_checkpoint: Some(checkpoint),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, Error::State(message) if message.contains("predates persistent schema history"))
         );
     }
 }

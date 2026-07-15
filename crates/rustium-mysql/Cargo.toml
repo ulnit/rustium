@@ -17,6 +17,8 @@ mysql_async.workspace = true
 rustium-config = { path = "../rustium-config" }
 rustium-core = { path = "../rustium-core" }
 serde_json.workspace = true
+serde.workspace = true
+sqlparser.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
@@ -28,3 +30,7 @@ workspace = true
 [[test]]
 name = "mysql_docker"
 path = "tests/mysql_docker.rs"
+
+[[test]]
+name = "mysql_external"
+path = "tests/mysql_external.rs"

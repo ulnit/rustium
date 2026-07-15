@@ -9,6 +9,24 @@ use uuid::Uuid;
 
 pub type Row = IndexMap<String, DataValue>;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorStateEnvelope {
+    pub format: String,
+    pub version: u32,
+    pub payload: serde_json::Value,
+}
+
+impl ConnectorStateEnvelope {
+    #[must_use]
+    pub fn new(format: impl Into<String>, version: u32, payload: serde_json::Value) -> Self {
+        Self {
+            format: format.into(),
+            version,
+            payload,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum DataValue {
@@ -266,6 +284,8 @@ pub struct SourceRecord {
     pub event: Option<ChangeEvent>,
     pub position: SourcePosition,
     pub boundary: RecordBoundary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_state: Option<ConnectorStateEnvelope>,
 }
 
 impl SourceRecord {
@@ -275,7 +295,14 @@ impl SourceRecord {
             position: event.position.clone(),
             event: Some(event),
             boundary: RecordBoundary::Data,
+            connector_state: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_connector_state(mut self, connector_state: ConnectorStateEnvelope) -> Self {
+        self.connector_state = Some(connector_state);
+        self
     }
 }
 

@@ -5,7 +5,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::{ChangeEvent, DeliveryBatch, EncodedEvent, Result, SourcePosition, SourceRecord};
+use crate::{
+    ChangeEvent, ConnectorStateEnvelope, DeliveryBatch, EncodedEvent, Result, SourcePosition,
+    SourceRecord,
+};
+
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -16,6 +21,8 @@ pub struct Checkpoint {
     pub snapshot_completed: bool,
     pub config_fingerprint: String,
     pub updated_at: SystemTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_state: Option<ConnectorStateEnvelope>,
 }
 
 #[async_trait]

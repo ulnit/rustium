@@ -143,6 +143,11 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
                 "rustium.source.reconnect.max.attempts",
                 default_mysql_reconnect_max_attempts(),
             )?,
+            schema_history_skip_unparseable_ddl: bool_value(
+                properties,
+                "schema.history.internal.skip.unparseable.ddl",
+                false,
+            )?,
         }),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -579,6 +584,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "bootstrap.servers",
         "rustium.sink.type",
         "rustium.source.reconnect.max.attempts",
+        "schema.history.internal.skip.unparseable.ddl",
         "rustium.kafka.bootstrap.servers",
         "rustium.kafka.acks",
         "rustium.kafka.compression.type",
@@ -648,6 +654,7 @@ topic.prefix=inventory
 connect.keep.alive=false
 connect.keep.alive.interval.ms=250
 rustium.source.reconnect.max.attempts=3
+schema.history.internal.skip.unparseable.ddl=true
 "#,
         )
         .unwrap();
@@ -660,6 +667,7 @@ rustium.source.reconnect.max.attempts=3
             Duration::from_millis(250)
         );
         assert_eq!(source.reconnect_max_attempts, 3);
+        assert!(source.schema_history_skip_unparseable_ddl);
         assert!(source.tables.includes("inventory", "orders"));
         assert!(!source.tables.includes("inventory", "products"));
     }

@@ -7,11 +7,12 @@ mod traits;
 
 pub use error::{Error, Result};
 pub use event::{
-    ChangeEvent, ConnectorIdentity, DataValue, DeliveryBatch, EncodedEvent, EventId, EventSchema,
-    FieldSchema, MySqlPosition, Operation, PostgresPosition, RecordBoundary, Row, SourceMetadata,
-    SourcePosition, SourceRecord, SqlServerPosition, TransactionMetadata,
+    ChangeEvent, ConnectorIdentity, ConnectorStateEnvelope, DataValue, DeliveryBatch, EncodedEvent,
+    EventId, EventSchema, FieldSchema, MySqlPosition, Operation, PostgresPosition, RecordBoundary,
+    Row, SourceMetadata, SourcePosition, SourceRecord, SqlServerPosition, TransactionMetadata,
 };
 pub use runtime::{ConnectorRuntime, ConnectorState, RuntimeConfig, RuntimeStatus, StatusSnapshot};
 pub use traits::{
-    Checkpoint, CheckpointStore, Durability, EventEncoder, Sink, SourceConnector, SourceContext,
+    CHECKPOINT_SCHEMA_VERSION, Checkpoint, CheckpointStore, Durability, EventEncoder, Sink,
+    SourceConnector, SourceContext,
 };

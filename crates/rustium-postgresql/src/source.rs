@@ -242,6 +242,7 @@ impl PostgresSource {
                         snapshot: true,
                     }),
                     boundary: RecordBoundary::SnapshotComplete,
+                    connector_state: None,
                 }))
                 .map_err(|_| Error::Cancelled)?;
             Ok(SnapshotOutcome {
@@ -702,6 +703,7 @@ impl StreamingState {
             event: None,
             position,
             boundary: RecordBoundary::TransactionCommit,
+            connector_state: None,
         }))
     }
 

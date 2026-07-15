@@ -108,6 +108,7 @@ async fn snapshots_streams_and_resumes_from_checkpoint() -> TestResult {
             snapshot_completed: true,
             config_fingerprint: "sqlserver-external-test".into(),
             updated_at: SystemTime::now(),
+            connector_state: None,
         };
         run_resumed_capture(
             &mut client,

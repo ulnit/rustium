@@ -1,8 +1,14 @@
-use std::{process::Command, time::Duration};
+use std::{
+    process::Command,
+    time::{Duration, SystemTime},
+};
 
 use mysql_async::{Conn, OptsBuilder, prelude::Queryable};
 use rustium_config::{MySqlSourceConfig, SnapshotConfig, SnapshotMode, TableSelection};
-use rustium_core::{Operation, RecordBoundary, SourceConnector, SourceContext};
+use rustium_core::{
+    CHECKPOINT_SCHEMA_VERSION, Checkpoint, DataValue, Operation, RecordBoundary, SourceConnector,
+    SourceContext,
+};
 use rustium_mysql::MySqlSource;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -112,10 +118,11 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
         connect_keep_alive: true,
         connect_keep_alive_interval: Duration::from_millis(100),
         reconnect_max_attempts: 5,
+        schema_history_skip_unparseable_ddl: false,
     };
     let mut source = MySqlSource::new(
         "inventory-mysql",
-        config,
+        config.clone(),
         SnapshotConfig {
             mode: SnapshotMode::Initial,
             fetch_size: 1,
@@ -139,19 +146,21 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
     });
 
     let mut snapshot_rows = 0;
-    loop {
+    let snapshot_schema_history = loop {
         let record = tokio::time::timeout(Duration::from_secs(20), output_rx.recv())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
         if record.boundary == RecordBoundary::SnapshotComplete {
-            break;
+            break record
+                .connector_state
+                .expect("snapshot completion should carry MySQL schema history");
         }
         let event = record.event.unwrap();
         assert_eq!(event.operation, Operation::Read);
         snapshot_rows += 1;
-    }
+    };
     assert_eq!(snapshot_rows, 2);
 
     for query in [
@@ -203,23 +212,131 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
 
     let mut operations = Vec::new();
     let mut orders = Vec::new();
-    loop {
+    let checkpoint_position = loop {
         let record = tokio::time::timeout(Duration::from_secs(20), output_rx.recv())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
         if record.boundary == RecordBoundary::TransactionCommit {
-            break;
+            break record.position;
         }
         let event = record.event.unwrap();
         operations.push(event.operation);
         orders.push(event.transaction.unwrap().total_order.unwrap());
-    }
+    };
     assert_eq!(operations, [Operation::Create]);
     assert_eq!(orders, [1]);
 
     cancellation.cancel();
     source_task.await.unwrap().unwrap();
+
+    let checkpoint = Checkpoint {
+        schema_version: CHECKPOINT_SCHEMA_VERSION,
+        connector_name: "inventory-mysql".into(),
+        generation: uuid::Uuid::new_v4(),
+        source_position: checkpoint_position.clone(),
+        snapshot_completed: true,
+        config_fingerprint: "mysql-docker-test".into(),
+        updated_at: SystemTime::now(),
+        connector_state: Some(snapshot_schema_history),
+    };
+
+    root.query_drop(
+        "INSERT INTO inventory.orders (id, customer, amount) VALUES (6, 'Finn', 32.10)",
+    )
+    .await
+    .unwrap();
+    root.query_drop(
+        "ALTER TABLE inventory.orders DROP COLUMN customer, ADD COLUMN status VARCHAR(20) NOT NULL AFTER amount",
+    )
+    .await
+    .unwrap();
+    root.query_drop("INSERT INTO inventory.orders (id, amount, status) VALUES (7, 64.20, 'ready')")
+        .await
+        .unwrap();
+
+    let mut resumed_source = MySqlSource::new(
+        "inventory-mysql",
+        config,
+        SnapshotConfig {
+            mode: SnapshotMode::Initial,
+            fetch_size: 1,
+        },
+    );
+    resumed_source.validate().await.unwrap();
+    let (resumed_tx, mut resumed_rx) = mpsc::channel(32);
+    let (_resumed_ack_tx, resumed_ack_rx) = watch::channel(Some(checkpoint_position));
+    let resumed_cancellation = CancellationToken::new();
+    let resumed_cancel = resumed_cancellation.clone();
+    let resumed_task = tokio::spawn(async move {
+        resumed_source
+            .run(SourceContext {
+                output: resumed_tx,
+                acknowledged: resumed_ack_rx,
+                initial_checkpoint: Some(checkpoint),
+                cancellation: resumed_cancel,
+            })
+            .await
+    });
+
+    let old_record = tokio::time::timeout(Duration::from_secs(20), resumed_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let old_event = old_record.event.expect("old-schema row event");
+    assert_eq!(old_event.operation, Operation::Create);
+    assert_eq!(old_event.schema.version, 1);
+    let old_after = old_event.after.unwrap();
+    assert_eq!(
+        old_after.get("customer"),
+        Some(&DataValue::String("Finn".into()))
+    );
+    assert!(!old_after.contains_key("status"));
+
+    let old_commit = tokio::time::timeout(Duration::from_secs(20), resumed_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(old_commit.boundary, RecordBoundary::TransactionCommit);
+
+    let ddl_commit = tokio::time::timeout(Duration::from_secs(20), resumed_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(ddl_commit.boundary, RecordBoundary::TransactionCommit);
+    let ddl_state = ddl_commit
+        .connector_state
+        .expect("DDL commit should carry updated MySQL schema history");
+    assert_eq!(ddl_state.format, "rustium.mysql.schema-history");
+    assert_eq!(ddl_state.version, 1);
+
+    let new_record = tokio::time::timeout(Duration::from_secs(20), resumed_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let new_event = new_record.event.expect("new-schema row event");
+    assert_eq!(new_event.operation, Operation::Create);
+    assert_eq!(new_event.schema.version, 2);
+    let new_after = new_event.after.unwrap();
+    assert_eq!(
+        new_after.get("status"),
+        Some(&DataValue::String("ready".into()))
+    );
+    assert!(!new_after.contains_key("customer"));
+
+    let new_commit = tokio::time::timeout(Duration::from_secs(20), resumed_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(new_commit.boundary, RecordBoundary::TransactionCommit);
+
+    resumed_cancellation.cancel();
+    resumed_task.await.unwrap().unwrap();
     root.disconnect().await.unwrap();
 }

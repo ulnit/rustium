@@ -142,7 +142,9 @@ fn state_error(error: rusqlite::Error) -> Error {
 mod tests {
     use std::time::SystemTime;
 
-    use rustium_core::{PostgresPosition, SourcePosition};
+    use rustium_core::{
+        CHECKPOINT_SCHEMA_VERSION, ConnectorStateEnvelope, PostgresPosition, SourcePosition,
+    };
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -155,7 +157,7 @@ mod tests {
             .await
             .unwrap();
         let checkpoint = Checkpoint {
-            schema_version: 1,
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
             connector_name: "orders".into(),
             generation: Uuid::new_v4(),
             source_position: SourcePosition::Postgres(PostgresPosition {
@@ -168,10 +170,40 @@ mod tests {
             snapshot_completed: true,
             config_fingerprint: "abc".into(),
             updated_at: SystemTime::now(),
+            connector_state: Some(ConnectorStateEnvelope::new(
+                "rustium.test",
+                1,
+                serde_json::json!({"schema": "v1"}),
+            )),
         };
         store.save(&checkpoint).await.unwrap();
         assert_eq!(store.load("orders").await.unwrap(), Some(checkpoint));
         store.delete("orders").await.unwrap();
         assert!(store.load("orders").await.unwrap().is_none());
+    }
+
+    #[test]
+    fn loads_checkpoint_without_connector_state() {
+        let checkpoint = Checkpoint {
+            schema_version: 1,
+            connector_name: "legacy".into(),
+            generation: Uuid::new_v4(),
+            source_position: SourcePosition::Postgres(PostgresPosition {
+                lsn: 7,
+                commit_lsn: Some(7),
+                transaction_id: None,
+                event_serial: 1,
+                snapshot: false,
+            }),
+            snapshot_completed: true,
+            config_fingerprint: "legacy".into(),
+            updated_at: SystemTime::now(),
+            connector_state: None,
+        };
+        let serialized = serde_json::to_value(&checkpoint).unwrap();
+        assert!(serialized.get("connector_state").is_none());
+
+        let loaded: Checkpoint = serde_json::from_value(serialized).unwrap();
+        assert_eq!(loaded.connector_state, None);
     }
 }

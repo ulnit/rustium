@@ -177,6 +177,7 @@ impl SourceConfig {
                 "databases": config.databases,
                 "server_id": config.server_id,
                 "tables": config.tables,
+                "schema_history_skip_unparseable_ddl": config.schema_history_skip_unparseable_ddl,
             }),
             Self::Sqlserver(config) => serde_json::json!({
                 "type": "sqlserver",
@@ -292,6 +293,8 @@ pub struct MySqlSourceConfig {
     pub connect_keep_alive_interval: Duration,
     #[serde(default = "default_mysql_reconnect_max_attempts")]
     pub reconnect_max_attempts: u32,
+    #[serde(default)]
+    pub schema_history_skip_unparseable_ddl: bool,
 }
 
 impl MySqlSourceConfig {
