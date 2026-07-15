@@ -257,6 +257,8 @@ The read lock is held only for transaction establishment and coordinate capture,
 
 Row events produce typed before/after images. FULL, MINIMAL, and NOBLOB images are accepted; omitted values are explicit `Unavailable` values. GTID transactions carry total order and collection order. DDL query events refresh current table schemas before later row events are decoded.
 
+When `connect.keep.alive=true`, an ended or failed binlog stream is reopened from the last SourceRecord successfully sent into the bounded runtime queue. The rewind restores the binlog filename, table-map anchor, GTID transaction counters, row ordinal, and replay filter so completed records are skipped deterministically. `connect.keep.alive.interval.ms` controls the delay between attempts; `rustium.source.reconnect.max.attempts` is Rustium's finite extension and defaults to 10. The attempt number and last error are logged, and the budget resets after new source progress.
+
 #### 10.4 TLS modes
 
 - `disabled`: plaintext only.
@@ -269,16 +271,16 @@ Custom Debezium truststore/keystore mapping is not implemented yet.
 
 #### 10.5 Verified recovery
 
-The MySQL 8.4 test gates cover:
+The MySQL 8.4 Docker gate covers:
 
 - two-row snapshot and snapshot completion;
 - one transaction with multi-row insert, update, and delete;
 - transaction order 1 through 5;
-- restart without snapshot repetition;
-- restart from row 1 of a two-row event, correctly resuming at row 2;
-- GTID preservation;
-- decimal, JSON, boolean, and timestamp conversion;
-- DDL schema refresh and capture of a newly added column.
+- forced termination of the active binlog dump connection;
+- reconnect from the last completed transaction without duplicate events;
+- capture of the first transaction written while the connection is down.
+
+Unit gates cover replay-state rewind, scalar conversions, and DDL query detection.
 
 #### 10.6 Remaining MySQL gates
 
@@ -286,7 +288,6 @@ The MySQL 8.4 test gates cover:
 - GTID source include/exclude filters;
 - heartbeat and signaling records;
 - incremental snapshots;
-- automatic reconnect and finite retry budgets;
 - tombstone records;
 - custom trust/key stores and wider type fixtures;
 - exact reconstruction of server-side partial JSON diffs.
@@ -336,7 +337,7 @@ Metrics currently expose connector state, delivered events, failed events, and p
 
 - Configuration and capability errors fail before capture.
 - Unknown protocol/data errors stop the connector.
-- General source/sink retry orchestration is not implemented yet; retries must be finite and observable when added.
+- General source/sink retry orchestration is not implemented yet. MySQL has connector-local, finite, logged binlog reconnect handling.
 - Queues are bounded and backpressure blocks source output.
 - Database and Kafka TLS are configuration-controlled.
 - The management server binds to loopback by default.
@@ -363,6 +364,8 @@ The ignored MySQL Docker test is runnable with:
 ```bash
 cargo test -p rustium-mysql --test mysql_docker -- --ignored --nocapture
 ```
+
+The gate forcibly kills the active replication connection and verifies reconnect from the last safe source position.
 
 The ignored external PostgreSQL test reads connection settings from the environment and does not contain repository credentials:
 
@@ -399,7 +402,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 ### 16. Roadmap
 
 1. Close PostgreSQL durable-schema-history, tombstone, incremental-snapshot, type/failure-fixture, and Kafka gates.
-2. Close MySQL historical-schema, retry, signaling, TLS-store, type, and Kafka gates.
+2. Close MySQL historical-schema, signaling, TLS-store, type, and Kafka gates.
 3. Close SQL Server CDC container-portability, retention-failure, concurrency, wider-type, and Kafka gates.
 4. Only then consider additional databases.
 5. Add Schema Registry formats, packaging, security policy, operational runbooks, and stable upgrade migrations before `1.0`.
@@ -651,6 +654,8 @@ Slot 会保留快照期间提交的变更，因此切换不存在缺口。
 
 行事件生成强类型 before/after。FULL、MINIMAL 和 NOBLOB image 均可接受；省略值使用显式 `Unavailable`。GTID 事务包含全局顺序和集合内顺序。DDL query 事件会在后续行事件解码前刷新当前表 schema。
 
+当 `connect.keep.alive=true` 时，结束或失败的 binlog stream 会从最后一个成功送入有界运行时队列的 SourceRecord 重新打开。回卷过程恢复 binlog 文件名、table-map 锚点、GTID 事务计数、行序号和重放过滤器，从而确定性跳过已完成记录。`connect.keep.alive.interval.ms` 控制尝试间隔；`rustium.source.reconnect.max.attempts` 是 Rustium 的有限扩展，默认 10。日志会记录尝试次数和最后错误，产生新的源端进度后预算重置。
+
 #### 10.4 TLS 模式
 
 - `disabled`：仅明文。
@@ -663,16 +668,16 @@ Slot 会保留快照期间提交的变更，因此切换不存在缺口。
 
 #### 10.5 已验证恢复
 
-MySQL 8.4 测试门槛覆盖：
+MySQL 8.4 Docker 门槛覆盖：
 
 - 两行快照和快照完成；
 - 一个包含多行 insert、update、delete 的事务；
 - 事务顺序 1 到 5；
-- 重启不重复快照；
-- 从两行事件的第 1 行重启，正确从第 2 行继续；
-- GTID 保留；
-- decimal、JSON、boolean、timestamp 转换；
-- DDL schema 刷新和新增列捕获。
+- 强制终止活动 binlog dump 连接；
+- 从最后完成事务重连且不产生重复事件；
+- 捕获连接中断期间写入的第一个事务。
+
+单元门槛覆盖重放状态回卷、标量转换和 DDL query 检测。
 
 #### 10.6 MySQL 剩余门槛
 
@@ -680,7 +685,6 @@ MySQL 8.4 测试门槛覆盖：
 - GTID source include/exclude 过滤；
 - heartbeat 和信号记录；
 - 增量快照；
-- 自动重连和有限重试预算；
 - tombstone；
 - 自定义 trust/key store 和更广类型样例；
 - 服务端 partial JSON diff 的精确重建。
@@ -730,7 +734,7 @@ stdout 是 best-effort，仅用于开发。Kafka 使用 `librdkafka`，支持可
 
 - 配置和能力错误在捕获前失败。
 - 未知协议/数据错误停止连接器。
-- 通用 Source/Sink 重试协调尚未实现；未来重试必须有限且可观测。
+- 通用 Source/Sink 重试协调尚未实现。MySQL 已具备连接器内有限且记录日志的 binlog 重连处理。
 - 队列有界，背压会阻塞 Source 输出。
 - 数据库和 Kafka TLS 由配置控制。
 - 管理 Server 默认绑定 loopback。
@@ -757,6 +761,8 @@ stdout 是 best-effort，仅用于开发。Kafka 使用 `librdkafka`，支持可
 ```bash
 cargo test -p rustium-mysql --test mysql_docker -- --ignored --nocapture
 ```
+
+该门槛会强制终止活动复制连接，并验证从最后安全源位点重连。
 
 被忽略的 PostgreSQL 外部测试从环境变量读取连接配置，仓库中不包含测试凭据：
 
@@ -793,7 +799,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 ### 16. 路线图
 
 1. 补齐 PostgreSQL 持久 schema history、tombstone、增量快照、类型/故障样例和 Kafka 门槛。
-2. 补齐 MySQL 历史 schema、重试、信号、TLS store、类型和 Kafka 门槛。
+2. 补齐 MySQL 历史 schema、信号、TLS store、类型和 Kafka 门槛。
 3. 补齐 SQL Server CDC 容器可移植性、retention 故障、并发、更广类型和 Kafka 门槛。
 4. 只有完成前三项后才考虑其他数据库。
 5. 在 `1.0` 前补 Schema Registry 格式、打包、安全策略、运维手册和稳定升级迁移。

@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use futures::StreamExt;
 use mysql_async::{
-    BinlogStreamRequest, Conn, Opts, OptsBuilder, Row as MySqlRow, SslOpts, Value,
+    BinlogStream, BinlogStreamRequest, Conn, Opts, OptsBuilder, Row as MySqlRow, SslOpts, Value,
     binlog::{
-        events::{EventData, RowsEventData, TableMapEvent},
+        events::{Event as BinlogEvent, EventData, RowsEventData, TableMapEvent},
         row::BinlogRow,
         value::BinlogValue,
     },
@@ -238,6 +238,145 @@ impl MySqlSource {
         connection.disconnect().await.map_err(mysql_error)?;
         Ok(schemas)
     }
+
+    async fn open_binlog_stream(&self, coordinates: &BinlogCoordinates) -> Result<BinlogStream> {
+        let mut connection = connect(&self.config).await?;
+        let row_value_options = connection
+            .query_first::<String, _>("SELECT @@SESSION.binlog_row_value_options")
+            .await
+            .map_err(mysql_error)?
+            .unwrap_or_default();
+        if !row_value_options.is_empty() {
+            warn!(
+                value = %row_value_options,
+                "partial JSON row values are enabled; changed JSON fields may be marked unavailable"
+            );
+        }
+        let filename = coordinates.filename.as_bytes().to_vec();
+        let request = BinlogStreamRequest::new(self.config.server_id)
+            .with_filename(&filename)
+            .with_pos(coordinates.position);
+        connection
+            .get_binlog_stream(request)
+            .await
+            .map_err(mysql_error)
+    }
+
+    async fn process_binlog_event(
+        &mut self,
+        event: BinlogEvent,
+        stream: &BinlogStream,
+        state: &mut StreamingState,
+        context: &mut SourceContext,
+    ) -> Result<Option<SourcePosition>> {
+        let header = event.header();
+        let event_start =
+            u64::from(header.log_pos()).saturating_sub(u64::from(header.event_size()));
+        let source_time = mysql_source_time(header.timestamp());
+        let Some(data) = event.read_data().map_err(mysql_error)? else {
+            return Ok(None);
+        };
+
+        let records = match data {
+            EventData::RotateEvent(rotate) => {
+                state.rotate(rotate.name().into_owned());
+                Vec::new()
+            }
+            EventData::TableMapEvent(table_map) => {
+                state.register_table_map(table_map.table_id(), event_start);
+                Vec::new()
+            }
+            EventData::GtidEvent(gtid) => {
+                state.begin_gtid(&gtid, source_time);
+                Vec::new()
+            }
+            EventData::RowsEvent(rows) => {
+                let table_map = stream.get_tme(rows.table_id()).ok_or_else(|| {
+                    Error::Source(format!(
+                        "missing TABLE_MAP_EVENT for MySQL table id {} at {}:{}",
+                        rows.table_id(),
+                        state.current_filename,
+                        event_start
+                    ))
+                })?;
+                state.convert_rows(
+                    &rows,
+                    table_map,
+                    event_start,
+                    header.server_id(),
+                    source_time,
+                    &self.connector_name,
+                    &self.config,
+                )?
+            }
+            EventData::XidEvent(xid) => state
+                .commit_record(event_start, header.server_id(), Some(xid.xid.to_string()))
+                .into_iter()
+                .collect(),
+            EventData::QueryEvent(query) => {
+                let query_text = query.query().into_owned();
+                if is_schema_change(&query_text) {
+                    let schemas = self.refresh_schemas().await?;
+                    self.schemas = schemas.clone();
+                    state.schemas = schemas;
+                }
+                state
+                    .handle_query(&query_text, event_start, header.server_id(), source_time)
+                    .into_iter()
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
+        let mut last_position = None;
+        for record in records {
+            last_position = Some(record.position.clone());
+            context
+                .output
+                .send(Ok(record))
+                .await
+                .map_err(|_| Error::Cancelled)?;
+        }
+        Ok(last_position)
+    }
+
+    async fn consume_binlog_stream(
+        &mut self,
+        stream: &mut BinlogStream,
+        state: &mut StreamingState,
+        context: &mut SourceContext,
+        last_safe_position: &mut Option<SourcePosition>,
+        reconnect_attempts: &mut u32,
+    ) -> Result<Option<Error>> {
+        loop {
+            tokio::select! {
+                _ = context.cancellation.cancelled() => return Ok(None),
+                changed = context.acknowledged.changed() => {
+                    if changed.is_err() {
+                        return Err(Error::Cancelled);
+                    }
+                }
+                event = stream.next() => {
+                    let event = match event {
+                        Some(Ok(event)) => event,
+                        Some(Err(error)) => return Ok(Some(mysql_error(error))),
+                        None => {
+                            return Ok(Some(Error::Source(
+                                "MySQL binary log stream ended unexpectedly".into(),
+                            )));
+                        }
+                    };
+                    if let Some(position) = self
+                        .process_binlog_event(event, stream, state, context)
+                        .await?
+                    {
+                        *last_safe_position = Some(position);
+                        *reconnect_attempts = 0;
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -287,120 +426,78 @@ impl SourceConnector for MySqlSource {
             self.current_coordinates().await?
         };
 
-        let mut connection = connect(&self.config).await?;
-        let row_value_options = connection
-            .query_first::<String, _>("SELECT @@SESSION.binlog_row_value_options")
-            .await
-            .map_err(mysql_error)?
-            .unwrap_or_default();
-        if !row_value_options.is_empty() {
-            warn!(
-                value = %row_value_options,
-                "partial JSON row values are enabled; changed JSON fields may be marked unavailable"
-            );
-        }
-        let filename = coordinates.filename.as_bytes().to_vec();
-        let request = BinlogStreamRequest::new(self.config.server_id)
-            .with_filename(&filename)
-            .with_pos(coordinates.position);
-        let mut stream = connection
-            .get_binlog_stream(request)
-            .await
-            .map_err(mysql_error)?;
         let mut state = StreamingState::new(
             coordinates.filename.clone(),
             self.schemas.clone(),
-            resume_position,
+            resume_position.clone(),
         );
-
-        info!(
-            connector = %self.connector_name,
-            file = %coordinates.filename,
-            position = coordinates.position,
-            "MySQL streaming started"
-        );
+        let mut stream_coordinates = coordinates.clone();
+        let mut last_safe_position = resume_position;
+        let mut reconnect_attempts = 0_u32;
 
         loop {
-            tokio::select! {
-                _ = context.cancellation.cancelled() => {
-                    stream.close().await.map_err(mysql_error)?;
-                    return Ok(());
-                }
-                changed = context.acknowledged.changed() => {
-                    if changed.is_err() {
-                        return Err(Error::Cancelled);
+            let open_result = tokio::select! {
+                _ = context.cancellation.cancelled() => return Ok(()),
+                result = self.open_binlog_stream(&stream_coordinates) => result,
+            };
+            let mut stream = match open_result {
+                Ok(stream) => stream,
+                Err(error) => {
+                    if !wait_for_reconnect(
+                        &self.config,
+                        &mut context,
+                        &mut reconnect_attempts,
+                        error,
+                    )
+                    .await?
+                    {
+                        return Ok(());
                     }
+                    stream_coordinates = last_safe_position
+                        .as_ref()
+                        .and_then(binlog_coordinates_from_position)
+                        .unwrap_or_else(|| coordinates.clone());
+                    state.rewind(&stream_coordinates, last_safe_position.clone());
+                    continue;
                 }
-                event = stream.next() => {
-                    let Some(event) = event else {
-                        return Err(Error::Source("MySQL binary log stream ended unexpectedly".into()));
-                    };
-                    let event = event.map_err(mysql_error)?;
-                    let header = event.header();
-                    let event_start = u64::from(header.log_pos()).saturating_sub(u64::from(header.event_size()));
-                    let source_time = mysql_source_time(header.timestamp());
-                    let data = event.read_data().map_err(mysql_error)?;
-                    let Some(data) = data else { continue };
+            };
 
-                    match data {
-                        EventData::RotateEvent(rotate) => {
-                            state.rotate(rotate.name().into_owned());
-                        }
-                        EventData::TableMapEvent(table_map) => {
-                            state.register_table_map(table_map.table_id(), event_start);
-                        }
-                        EventData::GtidEvent(gtid) => {
-                            state.begin_gtid(&gtid, source_time);
-                        }
-                        EventData::RowsEvent(rows) => {
-                            let table_map = stream.get_tme(rows.table_id()).ok_or_else(|| {
-                                Error::Source(format!(
-                                    "missing TABLE_MAP_EVENT for MySQL table id {} at {}:{}",
-                                    rows.table_id(), state.current_filename, event_start
-                                ))
-                            })?;
-                            let records = state.convert_rows(
-                                &rows,
-                                table_map,
-                                event_start,
-                                header.server_id(),
-                                source_time,
-                                &self.connector_name,
-                                &self.config,
-                            )?;
-                            for record in records {
-                                context.output.send(Ok(record)).await.map_err(|_| Error::Cancelled)?;
-                            }
-                        }
-                        EventData::XidEvent(xid) => {
-                            if let Some(record) = state.commit_record(
-                                event_start,
-                                header.server_id(),
-                                Some(xid.xid.to_string()),
-                            ) {
-                                context.output.send(Ok(record)).await.map_err(|_| Error::Cancelled)?;
-                            }
-                        }
-                        EventData::QueryEvent(query) => {
-                            let query_text = query.query().into_owned();
-                            if is_schema_change(&query_text) {
-                                let schemas = self.refresh_schemas().await?;
-                                self.schemas = schemas.clone();
-                                state.schemas = schemas;
-                            }
-                            if let Some(record) = state.handle_query(
-                                &query_text,
-                                event_start,
-                                header.server_id(),
-                                source_time,
-                            ) {
-                                context.output.send(Ok(record)).await.map_err(|_| Error::Cancelled)?;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+            info!(
+                connector = %self.connector_name,
+                file = %stream_coordinates.filename,
+                position = stream_coordinates.position,
+                reconnect_attempts,
+                "MySQL streaming started"
+            );
+
+            let failure = self
+                .consume_binlog_stream(
+                    &mut stream,
+                    &mut state,
+                    &mut context,
+                    &mut last_safe_position,
+                    &mut reconnect_attempts,
+                )
+                .await?;
+
+            let close_result = stream.close().await.map_err(mysql_error);
+            let Some(failure) = failure else {
+                close_result?;
+                return Ok(());
+            };
+            if let Err(error) = close_result {
+                debug!(%error, "failed to close disconnected MySQL binlog stream");
             }
+            if !wait_for_reconnect(&self.config, &mut context, &mut reconnect_attempts, failure)
+                .await?
+            {
+                return Ok(());
+            }
+            stream_coordinates = last_safe_position
+                .as_ref()
+                .and_then(binlog_coordinates_from_position)
+                .unwrap_or_else(|| coordinates.clone());
+            state.rewind(&stream_coordinates, last_safe_position.clone());
         }
     }
 }
@@ -421,17 +518,7 @@ impl StreamingState {
         schemas: HashMap<(String, String), TableSchema>,
         resume_position: Option<SourcePosition>,
     ) -> Self {
-        let transaction = match &resume_position {
-            Some(SourcePosition::MySql(position)) => {
-                position.gtid_set.as_ref().map(|gtid| ActiveTransaction {
-                    id: gtid.clone(),
-                    source_time: None,
-                    total_order: 0,
-                    collection_order: HashMap::new(),
-                })
-            }
-            _ => None,
-        };
+        let transaction = transaction_from_resume(&resume_position);
         Self {
             current_filename,
             schemas,
@@ -441,6 +528,15 @@ impl StreamingState {
             event_serial: 0,
             resume_position,
         }
+    }
+
+    fn rewind(&mut self, coordinates: &BinlogCoordinates, resume_position: Option<SourcePosition>) {
+        self.current_filename = coordinates.filename.clone();
+        self.table_anchors.clear();
+        self.transaction = transaction_from_resume(&resume_position);
+        self.previous_position = None;
+        self.event_serial = 0;
+        self.resume_position = resume_position;
     }
 
     fn rotate(&mut self, filename: String) {
@@ -663,6 +759,71 @@ impl StreamingState {
         } else {
             self.resume_position = None;
             false
+        }
+    }
+}
+
+fn transaction_from_resume(resume_position: &Option<SourcePosition>) -> Option<ActiveTransaction> {
+    match resume_position {
+        Some(SourcePosition::MySql(position)) => {
+            position.gtid_set.as_ref().map(|gtid| ActiveTransaction {
+                id: gtid.clone(),
+                source_time: None,
+                total_order: 0,
+                collection_order: HashMap::new(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn binlog_coordinates_from_position(position: &SourcePosition) -> Option<BinlogCoordinates> {
+    match position {
+        SourcePosition::MySql(position) => Some(BinlogCoordinates {
+            filename: position.binlog_filename.clone(),
+            position: position.binlog_position,
+            gtid_set: position.gtid_set.clone(),
+            source_server_id: position.server_id,
+        }),
+        SourcePosition::Postgres(_) | SourcePosition::SqlServer(_) => None,
+    }
+}
+
+async fn wait_for_reconnect(
+    config: &MySqlSourceConfig,
+    context: &mut SourceContext,
+    attempts: &mut u32,
+    error: Error,
+) -> Result<bool> {
+    if !config.connect_keep_alive {
+        return Err(error);
+    }
+    if *attempts >= config.reconnect_max_attempts {
+        return Err(Error::Source(format!(
+            "MySQL reconnect budget exhausted after {} attempts; last error: {error}",
+            config.reconnect_max_attempts
+        )));
+    }
+    *attempts += 1;
+    warn!(
+        attempt = *attempts,
+        max_attempts = config.reconnect_max_attempts,
+        delay_ms = config.connect_keep_alive_interval.as_millis(),
+        %error,
+        "MySQL binlog stream disconnected; scheduling reconnect"
+    );
+
+    let delay = tokio::time::sleep(config.connect_keep_alive_interval);
+    tokio::pin!(delay);
+    loop {
+        tokio::select! {
+            _ = context.cancellation.cancelled() => return Ok(false),
+            changed = context.acknowledged.changed() => {
+                if changed.is_err() {
+                    return Err(Error::Cancelled);
+                }
+            }
+            () = &mut delay => return Ok(true),
         }
     }
 }
@@ -1239,5 +1400,37 @@ mod tests {
         assert!(is_schema_change("ALTER TABLE orders ADD COLUMN note text"));
         assert!(is_schema_change(" truncate table orders"));
         assert!(!is_schema_change("BEGIN"));
+    }
+
+    #[test]
+    fn rewinds_streaming_state_to_a_safe_position() {
+        let position = mysql_position(
+            "mysql-bin.000002",
+            128,
+            Some("8f5f4a9a-6b2d-4dd5-915e-1df9d53d2850:42".into()),
+            223_344,
+            2,
+            false,
+        );
+        let coordinates = binlog_coordinates_from_position(&position).unwrap();
+        let mut state = StreamingState::new("mysql-bin.000001".into(), HashMap::new(), None);
+        state.table_anchors.insert(7, 64);
+        state.previous_position = Some(("mysql-bin.000001".into(), 64));
+        state.event_serial = 3;
+
+        state.rewind(&coordinates, Some(position.clone()));
+
+        assert_eq!(state.current_filename, "mysql-bin.000002");
+        assert!(state.table_anchors.is_empty());
+        assert_eq!(state.previous_position, None);
+        assert_eq!(state.event_serial, 0);
+        assert_eq!(state.resume_position, Some(position));
+        assert_eq!(
+            state
+                .transaction
+                .as_ref()
+                .map(|transaction| transaction.id.as_str()),
+            Some("8f5f4a9a-6b2d-4dd5-915e-1df9d53d2850:42")
+        );
     }
 }

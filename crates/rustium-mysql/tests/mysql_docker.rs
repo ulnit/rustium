@@ -15,9 +15,26 @@ impl Drop for DockerContainer {
     }
 }
 
+async fn replication_connection_id(root: &mut Conn) -> u64 {
+    for _ in 0..100 {
+        let connection_id = root
+            .query_first::<u64, _>(
+                "SELECT ID FROM information_schema.PROCESSLIST \
+                 WHERE USER = 'rustium' AND COMMAND LIKE 'Binlog Dump%'",
+            )
+            .await
+            .unwrap();
+        if let Some(connection_id) = connection_id {
+            return connection_id;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("MySQL replication connection did not become visible");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker and the mysql:8.4 image"]
-async fn snapshots_streams_and_preserves_transaction_order() {
+async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let name = format!("rustium-mysql-{suffix}");
     let port = 34_000 + u16::try_from(std::process::id() % 1_000).unwrap();
@@ -92,6 +109,9 @@ async fn snapshots_streams_and_preserves_transaction_order() {
         },
         ssl_mode: "disabled".into(),
         connect_timeout: Duration::from_secs(10),
+        connect_keep_alive: true,
+        connect_keep_alive_interval: Duration::from_millis(100),
+        reconnect_max_attempts: 5,
     };
     let mut source = MySqlSource::new(
         "inventory-mysql",
@@ -170,6 +190,34 @@ async fn snapshots_streams_and_preserves_transaction_order() {
         ]
     );
     assert_eq!(orders, [1, 2, 3, 4, 5]);
+
+    let replication_connection = replication_connection_id(&mut root).await;
+    root.query_drop(format!("KILL CONNECTION {replication_connection}"))
+        .await
+        .unwrap();
+    root.query_drop(
+        "INSERT INTO inventory.orders (id, customer, amount) VALUES (5, 'Erin', 89.10)",
+    )
+    .await
+    .unwrap();
+
+    let mut operations = Vec::new();
+    let mut orders = Vec::new();
+    loop {
+        let record = tokio::time::timeout(Duration::from_secs(20), output_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if record.boundary == RecordBoundary::TransactionCommit {
+            break;
+        }
+        let event = record.event.unwrap();
+        operations.push(event.operation);
+        orders.push(event.transaction.unwrap().total_order.unwrap());
+    }
+    assert_eq!(operations, [Operation::Create]);
+    assert_eq!(orders, [1]);
 
     cancellation.cancel();
     source_task.await.unwrap().unwrap();

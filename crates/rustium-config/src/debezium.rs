@@ -132,6 +132,17 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
                 "connect.timeout.ms",
                 default_connect_timeout(),
             )?,
+            connect_keep_alive: bool_value(properties, "connect.keep.alive", true)?,
+            connect_keep_alive_interval: duration_ms(
+                properties,
+                "connect.keep.alive.interval.ms",
+                default_mysql_keep_alive_interval(),
+            )?,
+            reconnect_max_attempts: u32_value(
+                properties,
+                "rustium.source.reconnect.max.attempts",
+                default_mysql_reconnect_max_attempts(),
+            )?,
         }),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -539,6 +550,8 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "database.include.list",
         "database.exclude.list",
         "connect.timeout.ms",
+        "connect.keep.alive",
+        "connect.keep.alive.interval.ms",
         "database.names",
         "database.encrypt",
         "database.trustServerCertificate",
@@ -565,6 +578,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "offset.storage.file.filename",
         "bootstrap.servers",
         "rustium.sink.type",
+        "rustium.source.reconnect.max.attempts",
         "rustium.kafka.bootstrap.servers",
         "rustium.kafka.acks",
         "rustium.kafka.compression.type",
@@ -631,12 +645,21 @@ database.server.id=7001
 database.include.list=inventory
 table.include.list=inventory\.(orders|customers)
 topic.prefix=inventory
+connect.keep.alive=false
+connect.keep.alive.interval.ms=250
+rustium.source.reconnect.max.attempts=3
 "#,
         )
         .unwrap();
         let source = config.source.as_mysql().unwrap();
         assert_eq!(source.server_id, 7001);
         assert_eq!(source.databases, ["inventory"]);
+        assert!(!source.connect_keep_alive);
+        assert_eq!(
+            source.connect_keep_alive_interval,
+            Duration::from_millis(250)
+        );
+        assert_eq!(source.reconnect_max_attempts, 3);
         assert!(source.tables.includes("inventory", "orders"));
         assert!(!source.tables.includes("inventory", "products"));
     }

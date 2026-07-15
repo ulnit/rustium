@@ -285,6 +285,13 @@ pub struct MySqlSourceConfig {
     #[serde(default = "default_connect_timeout")]
     #[serde(with = "humantime_serde")]
     pub connect_timeout: Duration,
+    #[serde(default = "default_true")]
+    pub connect_keep_alive: bool,
+    #[serde(default = "default_mysql_keep_alive_interval")]
+    #[serde(with = "humantime_serde")]
+    pub connect_keep_alive_interval: Duration,
+    #[serde(default = "default_mysql_reconnect_max_attempts")]
+    pub reconnect_max_attempts: u32,
 }
 
 impl MySqlSourceConfig {
@@ -297,6 +304,17 @@ impl MySqlSourceConfig {
         if self.server_id == 0 {
             return Err(Error::Configuration(
                 "source.server_id must be greater than zero".into(),
+            ));
+        }
+        if self.connect_keep_alive_interval.is_zero() {
+            return Err(Error::Configuration(
+                "source.connect_keep_alive_interval must be greater than zero".into(),
+            ));
+        }
+        if self.connect_keep_alive && self.reconnect_max_attempts == 0 {
+            return Err(Error::Configuration(
+                "source.reconnect_max_attempts must be greater than zero when connect_keep_alive is enabled"
+                    .into(),
             ));
         }
         if !matches!(
@@ -728,6 +746,12 @@ const fn default_mysql_server_id() -> u32 {
 }
 fn default_mysql_ssl_mode() -> String {
     "preferred".into()
+}
+fn default_mysql_keep_alive_interval() -> Duration {
+    Duration::from_secs(60)
+}
+const fn default_mysql_reconnect_max_attempts() -> u32 {
+    10
 }
 fn default_poll_interval() -> Duration {
     Duration::from_millis(500)
