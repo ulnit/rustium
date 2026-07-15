@@ -428,7 +428,7 @@ DDL parsing failures stop the connector by default. Debezium-compatible `schema.
 
 Checkpoint v1 JSON remains readable, but a completed MySQL v1 checkpoint has no historical schema baseline and is rejected for resume. Reset that checkpoint and run a new initial snapshot once to establish checkpoint v2 schema history.
 
-Known MySQL gaps include signaling records, custom trust/key stores, incremental snapshots, and wider DDL/type fixtures. When `binlog_row_value_options=PARTIAL_JSON` is enabled, a diff without a complete before image remains explicitly unavailable rather than being guessed.
+Known MySQL gaps include signaling records, custom trust/key stores, incremental snapshots, and wider DDL/type fixtures. MySQL `signal.*` and incremental-snapshot properties emit an explicit compatibility warning until those capabilities are implemented. When `binlog_row_value_options=PARTIAL_JSON` is enabled, a diff without a complete before image remains explicitly unavailable rather than being guessed.
 
 ### SQL Server
 
@@ -949,7 +949,7 @@ DDL 默认解析失败即停止连接器。可使用 Debezium 兼容参数 `sche
 
 Checkpoint v1 JSON 仍可读取，但已完成的 MySQL v1 checkpoint 不含历史 schema 基线，因此会拒绝恢复。升级后需要重置该 checkpoint 并执行一次新的 initial snapshot，以建立 checkpoint v2 schema history。
 
-MySQL 已知缺口包括信号记录、自定义 trust/key store、增量快照，以及更广的 DDL/类型样例。启用 `binlog_row_value_options=PARTIAL_JSON` 时，如果 diff 没有完整 before image，仍会明确标记为 unavailable，而不会猜测结果。
+MySQL 已知缺口包括信号记录、自定义 trust/key store、增量快照，以及更广的 DDL/类型样例。MySQL 的 `signal.*` 和增量快照参数在对应能力实现前会输出明确的兼容性警告。启用 `binlog_row_value_options=PARTIAL_JSON` 时，如果 diff 没有完整 before image，仍会明确标记为 unavailable，而不会猜测结果。
 
 ### Debezium 配置兼容
 

@@ -216,6 +216,37 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
                 .into(),
         );
     }
+    if [
+        "signal.data.collection",
+        "signal.enabled.channels",
+        "signal.file",
+        "signal.poll.interval.ms",
+        "signal.kafka.topic",
+        "signal.kafka.groupId",
+        "signal.kafka.bootstrap.servers",
+        "signal.kafka.poll.timeout.ms",
+        "incremental.snapshot.chunk.size",
+        "incremental.snapshot.allow.schema.changes",
+        "incremental.snapshot.watermarking.strategy",
+        "read.only",
+    ]
+    .iter()
+    .any(|key| properties.contains_key(*key))
+    {
+        warnings.push(
+            "MySQL signal and incremental snapshot properties are recognized for migration but are not implemented yet; they were ignored"
+                .into(),
+        );
+    }
+    if properties
+        .keys()
+        .any(|key| key.starts_with("signal.consumer."))
+    {
+        warnings.push(
+            "signal.consumer.* is recognized for migration but MySQL signaling is not implemented yet; the properties were ignored"
+                .into(),
+        );
+    }
     let gtid_source_includes = csv_property(properties.get("gtid.source.includes"));
     let gtid_source_excludes = csv_property(properties.get("gtid.source.excludes"));
     if !gtid_source_includes.is_empty() && !gtid_source_excludes.is_empty() {
@@ -1039,6 +1070,35 @@ gtid.source.includes=(unterminated
             invalid_regex
                 .to_string()
                 .contains("valid regular expression")
+        );
+    }
+
+    #[test]
+    fn warns_when_mysql_signal_properties_are_not_implemented() {
+        let config = parse(
+            r#"
+name=mysql
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+signal.enabled.channels=file
+signal.file=/run/rustium/signals.jsonl
+incremental.snapshot.chunk.size=128
+read.only=true
+signal.consumer.security.protocol=SASL_SSL
+"#,
+        )
+        .unwrap();
+        assert!(config.compatibility_warnings.iter().any(|warning| {
+            warning.contains("MySQL signal and incremental snapshot properties")
+        }));
+        assert!(
+            config
+                .compatibility_warnings
+                .iter()
+                .any(|warning| { warning.contains("signal.consumer.*") })
         );
     }
 
