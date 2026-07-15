@@ -343,10 +343,12 @@ impl PostgresSourceConfig {
             ));
         }
         if self.signal_enabled_channels.iter().any(|channel| {
-            channel.trim().is_empty() || !matches!(channel.as_str(), "source" | "file")
+            channel.trim().is_empty()
+                || !matches!(channel.as_str(), "source" | "file" | "in-process")
         }) {
             return Err(Error::Configuration(
-                "source.signal_enabled_channels currently supports source and file".into(),
+                "source.signal_enabled_channels currently supports source, file, and in-process"
+                    .into(),
             ));
         }
         if self

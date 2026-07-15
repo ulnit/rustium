@@ -143,6 +143,7 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
                 output: output_tx,
                 acknowledged: ack_rx,
                 initial_checkpoint: None,
+                signals: rustium_core::signal_channel(1).1,
                 cancellation: source_cancel,
             })
             .await
@@ -278,6 +279,7 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
                 output: resumed_tx,
                 acknowledged: resumed_ack_rx,
                 initial_checkpoint: Some(checkpoint),
+                signals: rustium_core::signal_channel(1).1,
                 cancellation: resumed_cancel,
             })
             .await

@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
         },
         status,
     );
+    let _signal_sender = runtime.signal_sender();
 
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();

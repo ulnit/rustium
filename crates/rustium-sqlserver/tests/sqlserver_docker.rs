@@ -149,6 +149,7 @@ async fn snapshots_and_streams_cdc_changes() {
                 output: output_tx,
                 acknowledged: ack_rx,
                 initial_checkpoint: None,
+                signals: rustium_core::signal_channel(1).1,
                 cancellation: source_cancel,
             })
             .await

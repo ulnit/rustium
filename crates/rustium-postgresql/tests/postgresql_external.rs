@@ -624,7 +624,7 @@ async fn runs_incremental_snapshot_from_file_signal() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
-async fn runs_read_only_file_snapshot_without_signal_table() -> TestResult {
+async fn runs_read_only_external_snapshots_without_signal_table() -> TestResult {
     let settings = TestSettings::from_env()?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let table_name = format!("rustium_pg_ro_file_{}", &suffix[..12]);
@@ -648,7 +648,7 @@ async fn runs_read_only_file_snapshot_without_signal_table() -> TestResult {
             .await?;
 
         let mut config = settings.source_config(&publication, &slot_name, &table_name);
-        config.signal_enabled_channels = vec!["file".into()];
+        config.signal_enabled_channels = vec!["file".into(), "in-process".into()];
         config.signal_file = signal_path.to_string_lossy().into_owned();
         config.signal_poll_interval = Duration::from_millis(20);
         config.incremental_snapshot_chunk_size = 2;
@@ -662,7 +662,8 @@ async fn runs_read_only_file_snapshot_without_signal_table() -> TestResult {
             },
         );
         source.validate().await?;
-        let (mut output, cancellation, source_task) = start_source(source, None);
+        let (mut output, cancellation, source_task, signal_sender) =
+            start_source_with_signals(source, None);
 
         wait_for_active_slot(&client, &slot_name).await?;
         let signal = serde_json::json!({
@@ -694,8 +695,8 @@ async fn runs_read_only_file_snapshot_without_signal_table() -> TestResult {
             )
             .await?;
 
-        let capture_result: TestResult<Vec<i64>> = async {
-            let mut ids = Vec::new();
+        let capture_result: TestResult<(Vec<i64>, Vec<i64>)> = async {
+            let mut file_ids = Vec::new();
             let mut saw_streamed_update = false;
             loop {
                 let record = receive(&mut output).await?;
@@ -707,14 +708,14 @@ async fn runs_read_only_file_snapshot_without_signal_table() -> TestResult {
                         .and_then(serde_json::Value::as_str)
                         == Some("incremental")
                     {
-                        ids.push(row_id(event.after.as_ref())?);
+                        file_ids.push(row_id(event.after.as_ref())?);
                     } else if event.operation == Operation::Update
                         && row_id(event.after.as_ref())? == 1
                     {
                         saw_streamed_update = true;
                     }
                 }
-                if ids.len() == 2
+                if file_ids.len() == 2
                     && record
                         .connector_state
                         .as_ref()
@@ -724,20 +725,87 @@ async fn runs_read_only_file_snapshot_without_signal_table() -> TestResult {
                         saw_streamed_update,
                         "read-only file snapshot did not stream the concurrent update",
                     )?;
-                    break Ok(ids);
+                    break;
                 }
             }
+            require(
+                file_ids == [2, 3],
+                "read-only file snapshot did not deduplicate the updated key",
+            )?;
+            require(
+                std::fs::read_to_string(&signal_path)?.is_empty(),
+                "read-only file signal was not cleared after polling",
+            )?;
+
+            signal_sender
+                .send(rustium_core::SignalRecord::new(
+                    format!("read-only-in-process-{suffix}"),
+                    "execute-snapshot",
+                    serde_json::json!({
+                        "type": "incremental",
+                        "data-collections": [format!(r"public\.{table_name}")]
+                    }),
+                ))
+                .await?;
+            loop {
+                let record = receive(&mut output).await?;
+                if record.boundary == RecordBoundary::TransactionCommit
+                    && record
+                        .connector_state
+                        .as_ref()
+                        .and_then(|state| state.payload.get("incremental_snapshot"))
+                        .is_some()
+                {
+                    break;
+                }
+            }
+            client
+                .execute(
+                    &format!("UPDATE public.{table_name} SET value = 'two-updated' WHERE id = 2"),
+                    &[],
+                )
+                .await?;
+
+            let mut in_process_ids = Vec::new();
+            let mut saw_in_process_update = false;
+            loop {
+                let record = receive(&mut output).await?;
+                if let Some(event) = record.event {
+                    if event
+                        .source
+                        .attributes
+                        .get("rustium.snapshot.kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("incremental")
+                    {
+                        in_process_ids.push(row_id(event.after.as_ref())?);
+                    } else if event.operation == Operation::Update
+                        && row_id(event.after.as_ref())? == 2
+                    {
+                        saw_in_process_update = true;
+                    }
+                }
+                if in_process_ids.len() == 2
+                    && record
+                        .connector_state
+                        .as_ref()
+                        .is_some_and(|state| state.payload.get("incremental_snapshot").is_none())
+                {
+                    require(
+                        saw_in_process_update,
+                        "in-process snapshot did not stream the concurrent update",
+                    )?;
+                    break;
+                }
+            }
+            Ok((file_ids, in_process_ids))
         }
         .await;
         let stop_result = stop_source(cancellation, source_task).await;
-        let ids = combine_capture_and_stop(capture_result, stop_result)?;
+        let (_, in_process_ids) = combine_capture_and_stop(capture_result, stop_result)?;
         require(
-            ids == [2, 3],
-            "read-only file snapshot did not deduplicate the updated key",
-        )?;
-        require(
-            std::fs::read_to_string(&signal_path)?.is_empty(),
-            "read-only file signal was not cleared after polling",
+            in_process_ids == [1, 3],
+            "read-only in-process snapshot did not deduplicate the updated key",
         )
     }
     .await;
@@ -1967,14 +2035,29 @@ async fn run_resumed_capture(
 }
 
 fn start_source(
-    mut source: PostgresSource,
+    source: PostgresSource,
     initial_checkpoint: Option<Checkpoint>,
 ) -> (
     mpsc::Receiver<rustium_core::Result<SourceRecord>>,
     CancellationToken,
     JoinHandle<rustium_core::Result<()>>,
 ) {
+    let (output, cancellation, source_task, _signal_sender) =
+        start_source_with_signals(source, initial_checkpoint);
+    (output, cancellation, source_task)
+}
+
+fn start_source_with_signals(
+    mut source: PostgresSource,
+    initial_checkpoint: Option<Checkpoint>,
+) -> (
+    mpsc::Receiver<rustium_core::Result<SourceRecord>>,
+    CancellationToken,
+    JoinHandle<rustium_core::Result<()>>,
+    rustium_core::SignalSender,
+) {
     let (output_tx, output_rx) = mpsc::channel(64);
+    let (signal_sender, signals) = rustium_core::signal_channel(64);
     let acknowledged_position = initial_checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.source_position.clone());
@@ -1988,11 +2071,12 @@ fn start_source(
                 output: output_tx,
                 acknowledged: ack_rx,
                 initial_checkpoint,
+                signals,
                 cancellation: source_cancel,
             })
             .await
     });
-    (output_rx, cancellation, source_task)
+    (output_rx, cancellation, source_task, signal_sender)
 }
 
 async fn stop_source(

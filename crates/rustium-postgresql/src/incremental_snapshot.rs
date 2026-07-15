@@ -6,7 +6,7 @@ use pg_walstream::{
     sql_builder::{quote_ident, quote_literal},
 };
 use rustium_config::PostgresSourceConfig;
-use rustium_core::{ChangeEvent, DataValue, Error, Result, Row};
+use rustium_core::{ChangeEvent, DataValue, Error, Result, Row, SignalRecord};
 use serde::Deserialize;
 
 use crate::{
@@ -117,21 +117,23 @@ impl IncrementalSnapshotController {
     }
 
     pub(crate) fn parse_external_signal(line: &str) -> Result<Signal> {
-        let envelope: ExternalSignalEnvelope = serde_json::from_str(line).map_err(|error| {
+        let record: SignalRecord = serde_json::from_str(line).map_err(|error| {
             Error::Source(format!(
                 "PostgreSQL external signal has invalid JSON: {error}"
             ))
         })?;
-        if envelope.id.trim().is_empty() || envelope.signal_type.trim().is_empty() {
+        Self::parse_external_record(&record)
+    }
+
+    pub(crate) fn parse_external_record(record: &SignalRecord) -> Result<Signal> {
+        if record.id.trim().is_empty() || record.signal_type.trim().is_empty() {
             return Err(Error::Source(
                 "PostgreSQL external signal requires non-empty id and type".into(),
             ));
         }
-        let data = envelope
-            .data
-            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
-            .to_string();
-        let signal = Self::parse_signal_fields(envelope.id, envelope.signal_type, &data)?;
+        let data = record.data.to_string();
+        let signal =
+            Self::parse_signal_fields(record.id.clone(), record.signal_type.clone(), &data)?;
         if matches!(
             &signal,
             Signal::WindowOpen { .. } | Signal::WindowClose { .. }
@@ -577,15 +579,6 @@ impl IncrementalSnapshotController {
         self.prepare_after_commit = false;
         self.read_only_watermarks = None;
     }
-}
-
-#[derive(Deserialize)]
-struct ExternalSignalEnvelope {
-    id: String,
-    #[serde(rename = "type")]
-    signal_type: String,
-    #[serde(default)]
-    data: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]

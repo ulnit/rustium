@@ -1666,6 +1666,7 @@ mod tests {
                 output,
                 acknowledged: acknowledgements,
                 initial_checkpoint: Some(checkpoint),
+                signals: rustium_core::signal_channel(1).1,
                 cancellation: CancellationToken::new(),
             })
             .await

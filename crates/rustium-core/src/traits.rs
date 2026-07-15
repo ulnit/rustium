@@ -6,8 +6,8 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ChangeEvent, ConnectorStateEnvelope, DeliveryBatch, EncodedEvent, Result, SourcePosition,
-    SourceRecord,
+    ChangeEvent, ConnectorStateEnvelope, DeliveryBatch, EncodedEvent, Result, SignalRecord,
+    SourcePosition, SourceRecord,
 };
 
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
@@ -36,6 +36,7 @@ pub struct SourceContext {
     pub output: mpsc::Sender<Result<SourceRecord>>,
     pub acknowledged: watch::Receiver<Option<SourcePosition>>,
     pub initial_checkpoint: Option<Checkpoint>,
+    pub signals: mpsc::Receiver<SignalRecord>,
     pub cancellation: CancellationToken,
 }
 

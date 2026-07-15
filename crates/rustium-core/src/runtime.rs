@@ -13,7 +13,8 @@ use tracing::{error, info};
 use crate::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, CheckpointStore, ConnectorIdentity,
     ConnectorStateEnvelope, DeliveryBatch, EncodedEvent, Error, EventEncoder, RecordBoundary,
-    Result, Sink, SourceConnector, SourceContext, SourcePosition, SourceRecord,
+    Result, SignalSender, Sink, SourceConnector, SourceContext, SourcePosition, SourceRecord,
+    signal_channel,
 };
 
 #[derive(Debug, Clone)]
@@ -113,6 +114,8 @@ pub struct ConnectorRuntime {
     checkpoint_store: Arc<dyn CheckpointStore>,
     config: RuntimeConfig,
     status: RuntimeStatus,
+    signal_sender: SignalSender,
+    signal_receiver: Option<mpsc::Receiver<crate::SignalRecord>>,
 }
 
 impl ConnectorRuntime {
@@ -126,6 +129,7 @@ impl ConnectorRuntime {
         config: RuntimeConfig,
         status: RuntimeStatus,
     ) -> Self {
+        let (signal_sender, signal_receiver) = signal_channel(config.channel_capacity);
         Self {
             identity,
             source: Some(source),
@@ -134,7 +138,14 @@ impl ConnectorRuntime {
             checkpoint_store,
             config,
             status,
+            signal_sender,
+            signal_receiver: Some(signal_receiver),
         }
+    }
+
+    #[must_use]
+    pub fn signal_sender(&self) -> SignalSender {
+        self.signal_sender.clone()
     }
 
     pub async fn run(mut self, cancellation: CancellationToken) -> Result<()> {
@@ -156,6 +167,10 @@ impl ConnectorRuntime {
         }
 
         let (source_tx, mut source_rx) = mpsc::channel(self.config.channel_capacity);
+        let signals = self
+            .signal_receiver
+            .take()
+            .ok_or_else(|| Error::Invariant("runtime signal channel already started".into()))?;
         let (ack_tx, ack_rx) = watch::channel(
             initial_checkpoint
                 .as_ref()
@@ -175,6 +190,7 @@ impl ConnectorRuntime {
                     output: source_tx,
                     acknowledged: ack_rx,
                     initial_checkpoint,
+                    signals,
                     cancellation: source_cancel,
                 })
                 .await
@@ -407,6 +423,10 @@ mod tests {
         record: SourceRecord,
     }
 
+    struct SignalSource {
+        received: Arc<Mutex<Option<crate::SignalRecord>>>,
+    }
+
     #[async_trait]
     impl SourceConnector for StateSource {
         fn source_type(&self) -> &'static str {
@@ -428,6 +448,23 @@ mod tests {
                 .changed()
                 .await
                 .map_err(|_| Error::Cancelled)?;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SourceConnector for SignalSource {
+        fn source_type(&self) -> &'static str {
+            "signal-test"
+        }
+
+        async fn validate(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn run(&mut self, mut context: SourceContext) -> Result<()> {
+            let signal = context.signals.recv().await.ok_or(Error::Cancelled)?;
+            *self.received.lock().unwrap() = Some(signal);
             Ok(())
         }
     }
@@ -591,6 +628,33 @@ mod tests {
         assert_eq!(checkpoint.schema_version, CHECKPOINT_SCHEMA_VERSION);
         assert_eq!(checkpoint.source_position, position);
         assert_eq!(checkpoint.connector_state, Some(connector_state));
+    }
+
+    #[tokio::test]
+    async fn exposes_a_typed_signal_sender_before_runtime_start() {
+        let received = Arc::new(Mutex::new(None));
+        let runtime = ConnectorRuntime::new(
+            ConnectorIdentity::new("runtime-signal-test"),
+            Box::new(SignalSource {
+                received: received.clone(),
+            }),
+            Arc::new(UnusedEncoder),
+            Box::new(NoopSink),
+            Arc::new(MemoryCheckpointStore::default()),
+            RuntimeConfig::default(),
+            RuntimeStatus::new("runtime-signal-test"),
+        );
+        let sender = runtime.signal_sender();
+        let signal = crate::SignalRecord::new(
+            "snapshot-1",
+            "execute-snapshot",
+            serde_json::json!({"type": "incremental"}),
+        );
+        sender.send(signal.clone()).await.unwrap();
+
+        runtime.run(CancellationToken::new()).await.unwrap();
+
+        assert_eq!(*received.lock().unwrap(), Some(signal));
     }
 
     #[tokio::test]

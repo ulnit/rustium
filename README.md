@@ -41,7 +41,7 @@ The repository contains a runnable alpha implementation.
 | Native JSON and Debezium-compatible JSON, including delete tombstones | Implemented |
 | stdout sink | Implemented |
 | Kafka sink with idempotent producer settings | Implemented; end-to-end Kafka test pending |
-| PostgreSQL 14+ snapshot, `pgoutput`, persistent schema history, heartbeat records, source signaling, incremental snapshots, and core type matrix | Implemented; external gates pass with PostgreSQL 17 |
+| PostgreSQL 14+ snapshot, `pgoutput`, persistent schema history, heartbeat records, multi-channel signaling, incremental snapshots, and core type matrix | Implemented; external gates pass with PostgreSQL 17 |
 | MySQL 8+ snapshot, row-binlog streaming, persistent schema history, and heartbeat records | Implemented; Docker and external recovery/heartbeat gates pass with MySQL 8.4 |
 | SQL Server CDC | Implemented; external integration test passes with SQL Server 2022 Developer CU25 |
 | CLI, health, status, stop, and Prometheus endpoints | Implemented |
@@ -126,7 +126,7 @@ export RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
 ```
 
-The tests create uniquely named tables, signal tables, publications, replication roles, managed slots, and signal files. They cover snapshot handoff, transaction ordering, checkpoint stop, destructive DDL with historical `Relation` replay, restart without a repeated snapshot, periodic heartbeat records, `heartbeat.action.query`, heartbeat-table filtering, resumable source/file-signaled incremental snapshots, immediate external-signal state checkpointing, additional conditions, concurrent-update deduplication, pause/resume/scoped-stop controls, read-only transaction-snapshot watermarking with no signal-table writes, file-only read-only signaling without any signal table, validated surrogate-key ordering, and identical snapshot/WAL conversion for high-precision numeric, special values, JSONB, UUID, bytea, temporal, network, range, bit, array, hstore, domain, enum, and tsvector types. These gates pass against PostgreSQL 17 with `wal_level=logical`.
+The tests create uniquely named tables, signal tables, publications, replication roles, managed slots, and signal files. They cover snapshot handoff, transaction ordering, checkpoint stop, destructive DDL with historical `Relation` replay, restart without a repeated snapshot, periodic heartbeat records, `heartbeat.action.query`, heartbeat-table filtering, resumable source/file/in-process-signaled incremental snapshots, immediate external-signal state checkpointing, additional conditions, concurrent-update deduplication, pause/resume/scoped-stop controls, read-only transaction-snapshot watermarking with no signal-table writes, file and in-process read-only signaling without any signal table, validated surrogate-key ordering, and identical snapshot/WAL conversion for high-precision numeric, special values, JSONB, UUID, bytea, temporal, network, range, bit, array, hstore, domain, enum, and tsvector types. These gates pass against PostgreSQL 17 with `wal_level=logical`.
 
 Run the external SQL Server 2017+ CDC integration test without storing credentials in the repository:
 
@@ -155,6 +155,7 @@ rustium-format-json = { git = "https://github.com/ulnit/rustium", branch = "main
 rustium-postgresql = { git = "https://github.com/ulnit/rustium", branch = "main" }
 rustium-sink-stdout = { git = "https://github.com/ulnit/rustium", branch = "main" }
 rustium-state = { git = "https://github.com/ulnit/rustium", branch = "main" }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-util = "0.7"
 ```
@@ -216,6 +217,7 @@ async fn main() -> Result<()> {
         },
         status,
     );
+    let _signal_sender = runtime.signal_sender();
 
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();
@@ -228,6 +230,25 @@ async fn main() -> Result<()> {
 ```
 
 The checked source is [crates/rustium-cli/examples/embed_postgresql.rs](crates/rustium-cli/examples/embed_postgresql.rs). Place the connector configuration at `rustium.yaml` and run it with `cargo run -p rustium --example embed_postgresql`.
+
+When `signal.enabled.channels` contains `in-process`, retain the sender returned before `run` consumes the runtime and clone it into application request handlers. Sending is bounded by `runtime.channel_capacity` and returns only after the command is admitted to the connector queue:
+
+```rust,no_run
+use rustium_core::{Result, SignalRecord, SignalSender};
+
+async fn refresh_orders(sender: &SignalSender) -> Result<()> {
+    sender
+        .send(SignalRecord::new(
+            "orders-refresh-2026-07-16",
+            "execute-snapshot",
+            serde_json::json!({
+                "type": "incremental",
+                "data-collections": ["public\\.orders"]
+            }),
+        ))
+        .await
+}
+```
 
 For MySQL or SQL Server, depend on `rustium-mysql` or `rustium-sqlserver` and construct `MySqlSource` or `SqlServerSource` with the corresponding `SourceConfig` value. Replace `StdoutSink` with `KafkaSink` from `rustium-sink-kafka` for durable Kafka delivery, or implement the async `Sink` trait for application-specific delivery. A custom sink must return from `write` only after the batch is durably accepted; Rustium checkpoints and acknowledges the database source afterward.
 
@@ -266,7 +287,7 @@ Implemented behavior:
 - relation-driven historical column layout, type OID/typmod, key metadata, and schema version increments after table DDL
 - periodic heartbeat records from the latest safe WAL position, with optional `heartbeat.action.query`
 - one shared text conversion path for snapshot and WAL values, including exact numeric precision, arrays, domains, enums, `hstore`, `tsvector`, pgvector values, and spatial EWKB
-- source-table `execute-snapshot` signaling with bounded, checkpointed incremental snapshots
+- source-table, file, and in-process `execute-snapshot` signaling with bounded, checkpointed incremental snapshots
 - `read.only=true` incremental watermarking without connector writes to the signal table
 
 The source requires `wal_level=logical`, an existing publication, and a user with the required replication and table-read permissions. See [examples/postgresql.yaml](examples/postgresql.yaml).
@@ -310,7 +331,20 @@ signal.poll.interval.ms=5000
 {"id":"inventory-file-refresh","type":"execute-snapshot","data":{"type":"incremental","data-collections":["public\\.orders"]}}
 ```
 
-`source` and `file` can be enabled together. A writable incremental snapshot still requires `signal.data.collection` in the publication because Rustium writes its internal open/close watermarks there; `read.only=true` with `file` does not require a signal table. Valid external control state is checkpointed immediately at the current safe LSN, including on a fresh idle slot. Invalid JSON lines and unsupported actions are logged and skipped, the internal watermark action types are rejected, and, like Debezium's non-source channels, file delivery has no retry policy. Native YAML uses `source.signal_enabled_channels`, `source.signal_file`, and `source.signal_poll_interval`.
+The `in-process` channel accepts the same typed JSON envelope through the embedded `SignalSender` or the management API:
+
+```properties
+signal.enabled.channels=in-process
+read.only=true
+```
+
+```bash
+curl --fail-with-body -X POST http://127.0.0.1:8080/v1/connector/signals \
+  -H 'content-type: application/json' \
+  -d '{"id":"inventory-api-refresh","type":"execute-snapshot","data":{"type":"incremental","data-collections":["public\\.orders"]}}'
+```
+
+The HTTP route additionally requires `rustium.server.enable.mutations=true` or native `server.enable_mutations: true`; it returns `202 Accepted` after bounded queue admission, `403` when mutations are disabled, and `409` when `in-process` is not enabled. `source`, `file`, and `in-process` can be enabled together. A writable incremental snapshot still requires `signal.data.collection` in the publication because Rustium writes its internal open/close watermarks there; `read.only=true` with `file` or `in-process` does not require a signal table. Valid external control state is checkpointed immediately at the current safe LSN, including on a fresh idle slot. Invalid file records or in-process commands and unsupported actions are logged and skipped, internal watermark action types are rejected, and file delivery has no retry policy. Native YAML uses `source.signal_enabled_channels`, `source.signal_file`, and `source.signal_poll_interval`.
 
 The execute payload also accepts Debezium `additional-conditions`, each containing a `data-collection` regular expression and a SQL `filter`. The filter constrains both the captured maximum key and every chunk query. Optional `surrogate-key` replaces primary-key chunk ordering when that column is `NOT NULL` and backed by a valid single-column unique index; the table still needs a primary key for WAL deduplication. `pause-snapshot` pauses after the current bounded chunk, `resume-snapshot` continues from its checkpointed key, and `stop-snapshot` stops all work or only collections matched by its optional `data-collections` list.
 
@@ -318,7 +352,7 @@ The signal table must contain exactly `id`, `type`, and `data` in that order and
 
 Set Debezium `read.only=true` or native `source.read_only: true` to replace inserted watermarks with `pg_current_snapshot()` low/high transaction watermarks. Rustium compares WAL transaction IDs against those snapshots, keeps the window open until every transaction visible across the chunk has passed, and applies the same primary-key deduplication. The connector requires only `SELECT` on captured tables plus logical-replication access and writes no watermark records. A source signal table remains necessary only when the `source` channel is used.
 
-Current PostgreSQL signaling supports the Debezium `source` and `file` channels and incremental snapshot actions. Writable mode supports `insert_insert`; read-only mode uses transaction snapshots. With `incremental.snapshot.allow.schema.changes=false`, Rustium compares the catalog after opening every window and also rejects a changed WAL `Relation` for the active table, preserving the previous checkpoint instead of querying or emitting mismatched layouts. Debezium's PostgreSQL connector does not support schema changes during an incremental snapshot, so Rustium rejects `incremental.snapshot.allow.schema.changes=true` instead of exposing unsafe semantics. Remaining PostgreSQL gates include Kafka/JMX/in-process signal channels, metadata unavailable from transient historical `Relation` records, broader failure fixtures, live PostGIS/pgvector fixtures where those server extensions are installed, and Kafka end-to-end recovery coverage.
+Current PostgreSQL signaling supports the Debezium `source`, `file`, and `in-process` channels and incremental snapshot actions. Writable mode supports `insert_insert`; read-only mode uses transaction snapshots. With `incremental.snapshot.allow.schema.changes=false`, Rustium compares the catalog after opening every window and also rejects a changed WAL `Relation` for the active table, preserving the previous checkpoint instead of querying or emitting mismatched layouts. Debezium's PostgreSQL connector does not support schema changes during an incremental snapshot, so Rustium rejects `incremental.snapshot.allow.schema.changes=true` instead of exposing unsafe semantics. Remaining PostgreSQL gates include Kafka/JMX signal channels, metadata unavailable from transient historical `Relation` records, broader failure fixtures, live PostGIS/pgvector fixtures where those server extensions are installed, and Kafka end-to-end recovery coverage.
 
 ### MySQL
 
@@ -450,6 +484,7 @@ The server binds to `127.0.0.1:8080` by default.
 | `GET /health/ready` | Connector readiness |
 | `GET /v1/connector/status` | State, position, checkpoint time, queue, and delivery counters |
 | `POST /v1/connector/stop` | Graceful stop when mutations are enabled |
+| `POST /v1/connector/signals` | Submit a Debezium-compatible in-process signal when mutations and the channel are enabled |
 | `GET /metrics` | Prometheus exposition |
 
 ### Documentation and Contribution Policy
@@ -494,7 +529,7 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 | 原生 JSON 与 Debezium 兼容 JSON，包括 delete tombstone | 已实现 |
 | stdout Sink | 已实现 |
 | 带幂等 Producer 设置的 Kafka Sink | 已实现；Kafka 端到端测试待补 |
-| PostgreSQL 14+ 快照、`pgoutput`、持久 schema history、heartbeat record、source 信号、增量快照和核心类型矩阵 | 已实现；PostgreSQL 17 外部门槛通过 |
+| PostgreSQL 14+ 快照、`pgoutput`、持久 schema history、heartbeat record、多 channel 信号、增量快照和核心类型矩阵 | 已实现；PostgreSQL 17 外部门槛通过 |
 | MySQL 8+ 快照、行级 binlog、持久 schema history 和 heartbeat record | 已实现；MySQL 8.4 Docker、外部恢复和 heartbeat 门槛通过 |
 | SQL Server CDC | 已实现；SQL Server 2022 Developer CU25 外部集成测试通过 |
 | CLI、健康、状态、停止和 Prometheus 端点 | 已实现 |
@@ -579,7 +614,7 @@ export RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
 ```
 
-测试会创建唯一命名的业务表、信号表、publication、复制角色、托管 slot 和信号文件，覆盖快照切换、事务顺序、checkpoint 停止、跨破坏性 DDL 的历史 `Relation` 重放、重启不重复快照、周期 heartbeat record、`heartbeat.action.query`、heartbeat 表过滤、可恢复的 source/file 信号增量快照、外部信号状态即时 checkpoint、additional condition、并发更新去重、pause/resume/scoped-stop 控制、不写信号表的只读事务快照 watermark、完全无信号表的 file-only 只读信号、经验证的 surrogate-key 排序，以及高精度 numeric、特殊值、JSONB、UUID、bytea、时间、网络、range、bit、数组、hstore、domain、enum 和 tsvector 类型在快照/WAL 路径上的一致转换。这些门槛已在启用 `wal_level=logical` 的 PostgreSQL 17 上通过。
+测试会创建唯一命名的业务表、信号表、publication、复制角色、托管 slot 和信号文件，覆盖快照切换、事务顺序、checkpoint 停止、跨破坏性 DDL 的历史 `Relation` 重放、重启不重复快照、周期 heartbeat record、`heartbeat.action.query`、heartbeat 表过滤、可恢复的 source/file/in-process 信号增量快照、外部信号状态即时 checkpoint、additional condition、并发更新去重、pause/resume/scoped-stop 控制、不写信号表的只读事务快照 watermark、完全无信号表的 file 和 in-process 只读信号、经验证的 surrogate-key 排序，以及高精度 numeric、特殊值、JSONB、UUID、bytea、时间、网络、range、bit、数组、hstore、domain、enum 和 tsvector 类型在快照/WAL 路径上的一致转换。这些门槛已在启用 `wal_level=logical` 的 PostgreSQL 17 上通过。
 
 运行外部 SQL Server 2017+ CDC 集成测试，凭据无需存入仓库：
 
@@ -608,6 +643,7 @@ rustium-format-json = { git = "https://github.com/ulnit/rustium", branch = "main
 rustium-postgresql = { git = "https://github.com/ulnit/rustium", branch = "main" }
 rustium-sink-stdout = { git = "https://github.com/ulnit/rustium", branch = "main" }
 rustium-state = { git = "https://github.com/ulnit/rustium", branch = "main" }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-util = "0.7"
 ```
@@ -669,6 +705,7 @@ async fn main() -> Result<()> {
         },
         status,
     );
+    let _signal_sender = runtime.signal_sender();
 
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();
@@ -681,6 +718,25 @@ async fn main() -> Result<()> {
 ```
 
 仓库中持续编译校验的源码位于 [crates/rustium-cli/examples/embed_postgresql.rs](crates/rustium-cli/examples/embed_postgresql.rs)。将连接器配置保存为 `rustium.yaml` 后，可通过 `cargo run -p rustium --example embed_postgresql` 运行。
+
+当 `signal.enabled.channels` 包含 `in-process` 时，请在 `run` 消费 runtime 前保留 sender，并将其 clone 到应用请求处理器。发送操作受 `runtime.channel_capacity` 有界约束，命令进入连接器队列后才返回：
+
+```rust,no_run
+use rustium_core::{Result, SignalRecord, SignalSender};
+
+async fn refresh_orders(sender: &SignalSender) -> Result<()> {
+    sender
+        .send(SignalRecord::new(
+            "orders-refresh-2026-07-16",
+            "execute-snapshot",
+            serde_json::json!({
+                "type": "incremental",
+                "data-collections": ["public\\.orders"]
+            }),
+        ))
+        .await
+}
+```
 
 MySQL 或 SQL Server 项目分别依赖 `rustium-mysql` 或 `rustium-sqlserver`，并使用对应 `SourceConfig` 构造 `MySqlSource` 或 `SqlServerSource`。需要持久 Kafka 投递时，用 `rustium-sink-kafka` 的 `KafkaSink` 替换 `StdoutSink`；应用也可以实现异步 `Sink` trait。自定义 Sink 的 `write` 只有在批次已经持久接收后才能返回，之后 Rustium 才会保存 checkpoint 并确认数据库 Source。
 
@@ -719,7 +775,7 @@ PostgreSQL 连接器使用逻辑复制和 `pgoutput` 协议版本 2。
 - 表 DDL 后由 Relation 消息驱动历史列布局、类型 OID/typmod、key 元数据和 schema 版本递增
 - 从最新安全 WAL 位点周期发送 heartbeat record，并支持可选的 `heartbeat.action.query`
 - 快照和 WAL 共用同一文本转换路径，包括精确 numeric 精度、数组、domain、enum、`hstore`、`tsvector`、pgvector 值和空间 EWKB
-- 通过 source 表 `execute-snapshot` 信号执行有界且可 checkpoint 的增量快照
+- 通过 source 表、file 和 in-process `execute-snapshot` 信号执行有界且可 checkpoint 的增量快照
 - 通过 `read.only=true` 执行无需连接器写入信号表的增量 watermark
 
 Source 需要 `wal_level=logical`、已存在的 publication，以及具备复制和表读取权限的用户。配置示例见 [examples/postgresql.yaml](examples/postgresql.yaml)。
@@ -763,7 +819,20 @@ signal.poll.interval.ms=5000
 {"id":"inventory-file-refresh","type":"execute-snapshot","data":{"type":"incremental","data-collections":["public\\.orders"]}}
 ```
 
-`source` 与 `file` 可以同时启用。可写增量快照仍要求 publication 中存在 `signal.data.collection`，因为 Rustium 会在其中写入内部 open/close watermark；`read.only=true` 配合 `file` 时不需要信号表。有效的外部控制状态会立即在当前安全 LSN checkpoint，包括 fresh idle slot。无效 JSON 行和不支持的 action 会记录日志并跳过，内部 watermark action type 会被拒绝；与 Debezium 其他非 source channel 一样，file 投递没有重试策略。原生 YAML 使用 `source.signal_enabled_channels`、`source.signal_file` 和 `source.signal_poll_interval`。
+`in-process` channel 通过嵌入式 `SignalSender` 或管理 API 接收相同的强类型 JSON envelope：
+
+```properties
+signal.enabled.channels=in-process
+read.only=true
+```
+
+```bash
+curl --fail-with-body -X POST http://127.0.0.1:8080/v1/connector/signals \
+  -H 'content-type: application/json' \
+  -d '{"id":"inventory-api-refresh","type":"execute-snapshot","data":{"type":"incremental","data-collections":["public\\.orders"]}}'
+```
+
+HTTP 路由还要求 `rustium.server.enable.mutations=true` 或原生 `server.enable_mutations: true`；命令进入有界队列后返回 `202 Accepted`，禁用变更端点时返回 `403`，未启用 `in-process` 时返回 `409`。`source`、`file` 和 `in-process` 可以同时启用。可写增量快照仍要求 publication 中存在 `signal.data.collection`，因为 Rustium 会在其中写入内部 open/close watermark；`read.only=true` 配合 `file` 或 `in-process` 时不需要信号表。有效的外部控制状态会立即在当前安全 LSN checkpoint，包括 fresh idle slot。无效 file record 或 in-process command 和不支持的 action 会记录日志并跳过，内部 watermark action type 会被拒绝；file 投递没有重试策略。原生 YAML 使用 `source.signal_enabled_channels`、`source.signal_file` 和 `source.signal_poll_interval`。
 
 Execute payload 还接受 Debezium `additional-conditions`；每项包含一个 `data-collection` 正则和一个 SQL `filter`。该 filter 同时约束最大捕获主键与每次 chunk 查询。可选 `surrogate-key` 在该列为 `NOT NULL` 且具有有效单列唯一索引时替代主键进行 chunk 排序；目标表仍需主键用于 WAL 去重。`pause-snapshot` 在当前有界 chunk 后暂停，`resume-snapshot` 从已 checkpoint 的主键继续，`stop-snapshot` 可停止全部工作，或只停止可选 `data-collections` 列表匹配的集合。
 
@@ -771,7 +840,7 @@ Execute payload 还接受 Debezium `additional-conditions`；每项包含一个 
 
 设置 Debezium `read.only=true` 或原生 `source.read_only: true`，即可用 `pg_current_snapshot()` 低/高事务水位替代插入 watermark。Rustium 将 WAL transaction ID 与这些快照比较，直到跨 chunk 可见的事务全部通过后才关闭窗口，并执行相同的主键去重。连接器只需要捕获表 `SELECT` 和逻辑复制权限，不写入 watermark 记录。只有使用 `source` channel 时才仍需 source 信号表。
 
-当前 PostgreSQL 信号能力支持 Debezium `source`、`file` channel 和增量快照 action。可写模式支持 `insert_insert`，只读模式使用事务快照。当 `incremental.snapshot.allow.schema.changes=false` 时，Rustium 会在每次打开窗口后比较 catalog，并拒绝活动表发生变化的 WAL `Relation`；它保留旧 checkpoint，不会查询或发出布局不匹配的数据。Debezium PostgreSQL 连接器不支持增量快照期间的 schema change，因此 Rustium 会拒绝 `incremental.snapshot.allow.schema.changes=true`，不会暴露不安全语义。PostgreSQL 剩余门槛包括 Kafka/JMX/in-process 信号 channel、短暂历史 `Relation` 无法提供的元数据、更广故障样例、服务器安装相应扩展时的 PostGIS/pgvector 实测，以及 Kafka 端到端恢复覆盖。
+当前 PostgreSQL 信号能力支持 Debezium `source`、`file`、`in-process` channel 和增量快照 action。可写模式支持 `insert_insert`，只读模式使用事务快照。当 `incremental.snapshot.allow.schema.changes=false` 时，Rustium 会在每次打开窗口后比较 catalog，并拒绝活动表发生变化的 WAL `Relation`；它保留旧 checkpoint，不会查询或发出布局不匹配的数据。Debezium PostgreSQL 连接器不支持增量快照期间的 schema change，因此 Rustium 会拒绝 `incremental.snapshot.allow.schema.changes=true`，不会暴露不安全语义。PostgreSQL 剩余门槛包括 Kafka/JMX 信号 channel、短暂历史 `Relation` 无法提供的元数据、更广故障样例、服务器安装相应扩展时的 PostGIS/pgvector 实测，以及 Kafka 端到端恢复覆盖。
 
 ### MySQL
 
@@ -903,6 +972,7 @@ Server 默认绑定 `127.0.0.1:8080`。
 | `GET /health/ready` | 连接器就绪状态 |
 | `GET /v1/connector/status` | 状态、位点、checkpoint 时间、队列和投递计数 |
 | `POST /v1/connector/stop` | 启用变更端点时优雅停止 |
+| `POST /v1/connector/signals` | 启用变更端点和 channel 时提交 Debezium 兼容 in-process 信号 |
 | `GET /metrics` | Prometheus 指标 |
 
 ### 文档与贡献策略

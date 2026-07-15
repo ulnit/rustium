@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use prometheus::{Encoder, IntGauge, Registry, TextEncoder};
-use rustium_core::{ConnectorState, Error, Result, RuntimeStatus};
+use rustium_core::{ConnectorState, Error, Result, RuntimeStatus, SignalRecord, SignalSender};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -21,6 +21,7 @@ struct AppState {
     status: RuntimeStatus,
     cancellation: CancellationToken,
     enable_mutations: bool,
+    signal_sender: Option<SignalSender>,
     metrics: Arc<Metrics>,
 }
 
@@ -78,11 +79,13 @@ pub async fn serve(
     status: RuntimeStatus,
     cancellation: CancellationToken,
     enable_mutations: bool,
+    signal_sender: Option<SignalSender>,
 ) -> Result<()> {
     let state = AppState {
         status,
         cancellation: cancellation.clone(),
         enable_mutations,
+        signal_sender,
         metrics: Arc::new(Metrics::new()?),
     };
     let app = Router::new()
@@ -90,6 +93,7 @@ pub async fn serve(
         .route("/health/ready", get(ready))
         .route("/v1/connector/status", get(connector_status))
         .route("/v1/connector/stop", post(stop_connector))
+        .route("/v1/connector/signals", post(submit_signal))
         .route("/metrics", get(metrics))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -134,6 +138,37 @@ async fn stop_connector(State(state): State<AppState>) -> Response {
     }
     state.cancellation.cancel();
     (StatusCode::ACCEPTED, Json(json!({"status": "stopping"}))).into_response()
+}
+
+async fn submit_signal(
+    State(state): State<AppState>,
+    Json(signal): Json<SignalRecord>,
+) -> Response {
+    if !state.enable_mutations {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "mutating management endpoints are disabled"})),
+        )
+            .into_response();
+    }
+    let Some(sender) = &state.signal_sender else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "in-process signal channel is not enabled"})),
+        )
+            .into_response();
+    };
+    match sender.send(signal).await {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"status": "accepted"}))).into_response(),
+        Err(Error::Configuration(message)) => {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response()
+        }
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 async fn metrics(State(state): State<AppState>) -> Response {
@@ -187,4 +222,40 @@ const fn state_number(state: ConnectorState) -> i64 {
 
 fn metrics_error(error: prometheus::Error) -> Error {
     Error::Source(format!("metrics initialization failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use rustium_core::signal_channel;
+
+    use super::*;
+
+    fn app_state(enable_mutations: bool, signal_sender: Option<SignalSender>) -> AppState {
+        AppState {
+            status: RuntimeStatus::new("test"),
+            cancellation: CancellationToken::new(),
+            enable_mutations,
+            signal_sender,
+            metrics: Arc::new(Metrics::new().unwrap()),
+        }
+    }
+
+    #[tokio::test]
+    async fn gates_and_delivers_management_signals() {
+        let (sender, mut receiver) = signal_channel(1);
+        let signal = SignalRecord::new(
+            "snapshot-1",
+            "execute-snapshot",
+            json!({"type": "incremental"}),
+        );
+        let response =
+            submit_signal(State(app_state(true, Some(sender))), Json(signal.clone())).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(receiver.recv().await, Some(signal.clone()));
+
+        let response = submit_signal(State(app_state(false, None)), Json(signal.clone())).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = submit_signal(State(app_state(true, None)), Json(signal)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
 }

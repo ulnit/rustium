@@ -404,6 +404,7 @@ fn start_source(
                 output: output_tx,
                 acknowledged: ack_rx,
                 initial_checkpoint,
+                signals: rustium_core::signal_channel(1).1,
                 cancellation: source_cancel,
             })
             .await

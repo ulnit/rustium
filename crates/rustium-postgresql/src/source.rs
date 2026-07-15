@@ -464,17 +464,43 @@ impl SourceConnector for PostgresSource {
                         if let Signal::Unsupported { id, signal_type } = &signal {
                             warn!(%id, %signal_type, "unsupported PostgreSQL file signal ignored");
                         }
-                        incremental
-                            .handle_signal(signal, &self.config, &state.schemas)
-                            .await?;
-                        if self.config.read_only {
-                            incremental
-                                .prepare_read_only_continuation(&self.config, &state.schemas)
-                                .await?;
-                        } else {
-                            incremental.after_commit(&self.config, &state.schemas).await?;
-                        }
+                        apply_external_signal(
+                            &mut incremental,
+                            signal,
+                            &self.config,
+                            &state.schemas,
+                        ).await?;
                     }
+                    checkpoint_external_signal_state(
+                        &mut state,
+                        &mut incremental,
+                        &context.output,
+                        last_safe_position.as_ref(),
+                    ).await?;
+                }
+                signal = context.signals.recv(),
+                    if signal_channel_enabled(&self.config, "in-process")
+                        && state.transaction.is_none() =>
+                {
+                    let signal = signal.ok_or_else(|| {
+                        Error::Source("PostgreSQL in-process signal channel closed".into())
+                    })?;
+                    let signal = match IncrementalSnapshotController::parse_external_record(&signal) {
+                        Ok(signal) => signal,
+                        Err(error) => {
+                            warn!(%error, "invalid PostgreSQL in-process signal ignored");
+                            continue;
+                        }
+                    };
+                    if let Signal::Unsupported { id, signal_type } = &signal {
+                        warn!(%id, %signal_type, "unsupported PostgreSQL in-process signal ignored");
+                    }
+                    apply_external_signal(
+                        &mut incremental,
+                        signal,
+                        &self.config,
+                        &state.schemas,
+                    ).await?;
                     checkpoint_external_signal_state(
                         &mut state,
                         &mut incremental,
@@ -699,6 +725,23 @@ async fn checkpoint_external_signal_state(
         .await
         .map_err(|_| Error::Cancelled)?;
     state.schema_dirty = false;
+    Ok(())
+}
+
+async fn apply_external_signal(
+    incremental: &mut IncrementalSnapshotController,
+    signal: Signal,
+    config: &PostgresSourceConfig,
+    schemas: &HashMap<(String, String), TableSchema>,
+) -> Result<()> {
+    incremental.handle_signal(signal, config, schemas).await?;
+    if config.read_only {
+        incremental
+            .prepare_read_only_continuation(config, schemas)
+            .await?;
+    } else {
+        incremental.after_commit(config, schemas).await?;
+    }
     Ok(())
 }
 
@@ -2307,6 +2350,7 @@ mod tests {
                 output,
                 acknowledged: acknowledgements,
                 initial_checkpoint: Some(checkpoint),
+                signals: rustium_core::signal_channel(1).1,
                 cancellation: CancellationToken::new(),
             })
             .await

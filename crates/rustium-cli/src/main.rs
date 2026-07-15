@@ -79,6 +79,8 @@ async fn run(config: Config) -> Result<()> {
     install_signal_handler(cancellation.clone());
 
     let status = RuntimeStatus::new(&config.metadata.name);
+    let runtime = build_runtime(&config, status.clone()).await?;
+    let signal_sender = in_process_signals_enabled(&config).then(|| runtime.signal_sender());
     let bind: SocketAddr = config.server.bind.parse().map_err(|error| {
         rustium_core::Error::Configuration(format!("invalid server.bind: {error}"))
     })?;
@@ -86,10 +88,16 @@ async fn run(config: Config) -> Result<()> {
     let server_status = status.clone();
     let enable_mutations = config.server.enable_mutations;
     let server = tokio::spawn(async move {
-        rustium_server::serve(bind, server_status, server_cancel, enable_mutations).await
+        rustium_server::serve(
+            bind,
+            server_status,
+            server_cancel,
+            enable_mutations,
+            signal_sender,
+        )
+        .await
     });
 
-    let runtime = build_runtime(&config, status).await?;
     let runtime_result = runtime.run(cancellation.clone()).await;
     cancellation.cancel();
     let server_result = server.await.map_err(|error| {
@@ -97,6 +105,15 @@ async fn run(config: Config) -> Result<()> {
     })?;
     runtime_result?;
     server_result
+}
+
+fn in_process_signals_enabled(config: &Config) -> bool {
+    config.source.as_postgresql().is_some_and(|source| {
+        source
+            .signal_enabled_channels
+            .iter()
+            .any(|channel| channel == "in-process")
+    })
 }
 
 async fn validate(config: Config) -> Result<()> {

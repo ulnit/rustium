@@ -56,7 +56,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
     };
     let signal_enabled_channels = requested_signal_channels
         .iter()
-        .filter(|channel| matches!(channel.as_str(), "source" | "file"))
+        .filter(|channel| matches!(channel.as_str(), "source" | "file" | "in-process"))
         .cloned()
         .collect::<Vec<_>>();
     if signal_enabled_channels.is_empty() {
@@ -67,7 +67,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
     let mut warnings = Vec::new();
     for channel in requested_signal_channels
         .iter()
-        .filter(|channel| !matches!(channel.as_str(), "source" | "file"))
+        .filter(|channel| !matches!(channel.as_str(), "source" | "file" | "in-process"))
     {
         warnings.push(format!(
             "signal.enabled.channels={channel} is not implemented and was ignored"
@@ -743,7 +743,7 @@ heartbeat.action.query=INSERT INTO public.rustium_heartbeat (id) VALUES (1)
 topic.heartbeat.prefix=__pg-heartbeat
 topic.heartbeat.name=shared-pg-heartbeat
 signal.data.collection=public.rustium_signal
-signal.enabled.channels=source,file
+signal.enabled.channels=source,file,in-process
 signal.file=/run/rustium/orders-signals.jsonl
 signal.poll.interval.ms=250
 incremental.snapshot.chunk.size=128
@@ -775,7 +775,10 @@ max.batch.size=1000
             source.signal_data_collection.as_deref(),
             Some("public.rustium_signal")
         );
-        assert_eq!(source.signal_enabled_channels, ["source", "file"]);
+        assert_eq!(
+            source.signal_enabled_channels,
+            ["source", "file", "in-process"]
+        );
         assert_eq!(source.signal_file, "/run/rustium/orders-signals.jsonl");
         assert_eq!(source.signal_poll_interval, Duration::from_millis(250));
         assert_eq!(source.incremental_snapshot_chunk_size, 128);
