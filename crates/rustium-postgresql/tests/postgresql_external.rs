@@ -854,6 +854,115 @@ async fn reconnects_after_replication_backend_termination() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn rejects_checkpoint_resume_after_replication_slot_loss() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_slot_loss_{}", &suffix[..12]);
+    let publication = format!("rustium_slot_loss_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_slot_loss_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-slot-loss-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (id BIGINT PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT INTO public.{table_name} VALUES (1, 'checkpointed'); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+        let config = settings.source_config(&publication, &slot_name, &table_name);
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let (position, connector_state) = loop {
+            let record = receive(&mut output).await?;
+            if record.boundary == RecordBoundary::SnapshotComplete {
+                break (
+                    record.position,
+                    record.connector_state.ok_or_else(|| {
+                        test_error("slot-loss snapshot completion has no connector state")
+                    })?,
+                );
+            }
+        };
+        stop_source(cancellation, source_task).await?;
+
+        client
+            .execute("SELECT pg_drop_replication_slot($1)", &[&slot_name])
+            .await?;
+        client
+            .execute(
+                &format!("INSERT INTO public.{table_name} VALUES (2, 'would-be-lost')"),
+                &[],
+            )
+            .await?;
+        let checkpoint = Checkpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            connector_name: connector_name.clone(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: position,
+            snapshot_completed: true,
+            config_fingerprint: "postgresql-slot-loss-test".into(),
+            updated_at: SystemTime::now(),
+            connector_state: Some(connector_state),
+        };
+        let mut resumed_source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+            },
+        );
+        resumed_source.validate().await?;
+        let (_output, _cancellation, source_task) = start_source(resumed_source, Some(checkpoint));
+        let source_result = tokio::time::timeout(Duration::from_secs(10), source_task)
+            .await
+            .map_err(|_| test_error("slot-loss resume did not fail promptly"))??;
+        let error = source_result
+            .expect_err("PostgreSQL checkpoint resume unexpectedly recreated a missing slot");
+        let message = error.to_string();
+        require(
+            message.contains("replication slot")
+                && message.contains("is missing")
+                && message.contains("reset the checkpoint"),
+            "PostgreSQL slot-loss failure did not explain the required recovery action",
+        )?;
+        let slot_exists = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+                &[&slot_name],
+            )
+            .await?
+            .get::<_, bool>(0);
+        require(
+            !slot_exists,
+            "PostgreSQL slot-loss guard recreated the missing replication slot",
+        )
+    }
+    .await;
+
+    let cleanup_result = cleanup(&client, &publication, &slot_name, &[&table_name]).await;
+    connection_task.abort();
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL slot-loss test cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
 async fn runs_incremental_snapshot_from_file_signal() -> TestResult {
     let settings = TestSettings::from_env()?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();

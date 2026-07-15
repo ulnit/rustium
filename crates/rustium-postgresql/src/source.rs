@@ -321,6 +321,8 @@ impl SourceConnector for PostgresSource {
 
         if snapshot_needed {
             self.prepare_snapshot_slot().await?;
+        } else if checkpoint.is_some() {
+            validate_resume_slot(&self.config).await?;
         }
 
         let replication_url = self.config.connection_url(true)?;
@@ -829,6 +831,41 @@ async fn query_slot_safe_lsn(config: &PostgresSourceConfig) -> Result<u64> {
     })
     .await
     .map_err(|error| Error::Source(format!("slot LSN query task failed: {error}")))?
+}
+
+async fn validate_resume_slot(config: &PostgresSourceConfig) -> Result<()> {
+    let connection_url = config.connection_url(false)?;
+    let slot_name = config.slot_name.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut connection = connect(&connection_url)?;
+        let slot = quote_literal(&slot_name).map_err(pg_error)?;
+        let result = connection
+            .exec(&format!(
+                "SELECT plugin, COALESCE(wal_status, '') \
+                 FROM pg_replication_slots WHERE slot_name = {slot}"
+            ))
+            .map_err(pg_error)?;
+        if result.ntuples() == 0 {
+            return Err(Error::State(format!(
+                "PostgreSQL replication slot {slot_name:?} is missing; the checkpoint cannot be resumed without a possible WAL gap; reset the checkpoint and run a new initial snapshot"
+            )));
+        }
+        let plugin = required_value(&result, 0, 0, "slot plugin")?;
+        if plugin != "pgoutput" {
+            return Err(Error::State(format!(
+                "PostgreSQL replication slot {slot_name:?} uses plugin {plugin:?}; the checkpoint requires pgoutput"
+            )));
+        }
+        let wal_status = required_value(&result, 0, 1, "slot WAL status")?;
+        if matches!(wal_status.as_str(), "unreserved" | "lost") {
+            return Err(Error::State(format!(
+                "PostgreSQL replication slot {slot_name:?} has wal_status={wal_status:?}; required WAL may be unavailable, so reset the checkpoint and run a new initial snapshot"
+            )));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| Error::Source(format!("slot continuity task failed: {error}")))?
 }
 
 async fn execute_heartbeat_action(
