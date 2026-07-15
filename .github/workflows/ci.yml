@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -18,12 +18,18 @@ jobs:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake pkg-config libssl-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            libsasl2-dev \
+            libssl-dev \
+            pkg-config
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check workspace
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --locked
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
