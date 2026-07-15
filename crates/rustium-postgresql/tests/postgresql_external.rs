@@ -67,6 +67,9 @@ impl TestSettings {
             heartbeat_action_query: None,
             heartbeat_topics_prefix: "__debezium-heartbeat".into(),
             heartbeat_topic_name: None,
+            signal_data_collection: None,
+            incremental_snapshot_chunk_size: 1_024,
+            incremental_snapshot_watermarking_strategy: "insert_insert".into(),
         }
     }
 }
@@ -447,6 +450,219 @@ async fn keeps_snapshot_and_streaming_type_conversion_identical() -> TestResult 
         eprintln!("PostgreSQL type test cleanup also failed: {cleanup_error}");
     }
     outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn resumes_signal_incremental_snapshot_from_chunk_checkpoint() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_incremental_{}", &suffix[..12]);
+    let signal_table = format!("rustium_pg_signal_{}", &suffix[..12]);
+    let publication = format!("rustium_inc_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_inc_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-incremental-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (\
+                    id BIGINT PRIMARY KEY, value TEXT NOT NULL\
+                 ); \
+                 INSERT INTO public.{table_name} \
+                    SELECT id, 'value-' || id::text FROM generate_series(1, 5) AS id; \
+                 CREATE TABLE public.{signal_table} (\
+                    id VARCHAR(64), type VARCHAR(32), data VARCHAR(2048)\
+                 ); \
+                 CREATE PUBLICATION {publication} FOR TABLE \
+                    public.{table_name}, public.{signal_table};"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        config.signal_data_collection = Some(format!("public.{signal_table}"));
+        config.incremental_snapshot_chunk_size = 2;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+
+        wait_for_active_slot(&client, &slot_name).await?;
+        insert_execute_snapshot_signal(&client, &signal_table, &table_name).await?;
+        let first_capture: TestResult<(SourcePosition, ConnectorStateEnvelope, Vec<i64>)> = async {
+            let mut ids = Vec::new();
+            loop {
+                let record = receive(&mut output).await?;
+                if record.boundary == RecordBoundary::Data {
+                    let event = record.event.ok_or_else(|| {
+                        test_error("incremental snapshot data record has no event")
+                    })?;
+                    require_incremental_event(&event, &table_name)?;
+                    ids.push(row_id(event.after.as_ref())?);
+                }
+                if record.boundary == RecordBoundary::TransactionCommit && ids.len() >= 2 {
+                    let state = record.connector_state.ok_or_else(|| {
+                        test_error("incremental snapshot chunk commit has no connector state")
+                    })?;
+                    require(
+                        state.payload.get("incremental_snapshot").is_some(),
+                        "incremental snapshot progress was not checkpointed",
+                    )?;
+                    break Ok((record.position, state, ids));
+                }
+            }
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        let (position, connector_state, first_ids) =
+            combine_capture_and_stop(first_capture, stop_result)?;
+        require(
+            first_ids == [1, 2],
+            "first incremental snapshot chunk is incorrect",
+        )?;
+
+        let checkpoint = Checkpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            connector_name: connector_name.clone(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: position,
+            snapshot_completed: true,
+            config_fingerprint: "postgresql-incremental-test".into(),
+            updated_at: SystemTime::now(),
+            connector_state: Some(connector_state),
+        };
+        let mut resumed_source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        resumed_source.validate().await?;
+        let (mut resumed_output, cancellation, source_task) =
+            start_source(resumed_source, Some(checkpoint));
+        let resumed_capture: TestResult<Vec<i64>> = async {
+            let mut ids = Vec::new();
+            loop {
+                let record = receive(&mut resumed_output).await?;
+                if record.boundary == RecordBoundary::Data {
+                    let event = record.event.ok_or_else(|| {
+                        test_error("resumed incremental snapshot record has no event")
+                    })?;
+                    require_incremental_event(&event, &table_name)?;
+                    ids.push(row_id(event.after.as_ref())?);
+                }
+                if record.boundary == RecordBoundary::TransactionCommit && ids.len() >= 3 {
+                    let state = record.connector_state.ok_or_else(|| {
+                        test_error("completed incremental snapshot has no connector state")
+                    })?;
+                    require(
+                        state.version == 2,
+                        "PostgreSQL connector state did not upgrade to version 2",
+                    )?;
+                    require(
+                        state.payload.get("incremental_snapshot").is_none(),
+                        "completed incremental snapshot retained active progress",
+                    )?;
+                    break Ok(ids);
+                }
+            }
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        let resumed_ids = combine_capture_and_stop(resumed_capture, stop_result)?;
+        require(
+            resumed_ids == [3, 4, 5],
+            "incremental snapshot did not resume at the next chunk",
+        )
+    }
+    .await;
+
+    let cleanup_result = cleanup(
+        &client,
+        &publication,
+        &slot_name,
+        &[&table_name, &signal_table],
+    )
+    .await;
+    connection_task.abort();
+
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL incremental snapshot cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
+async fn insert_execute_snapshot_signal(
+    client: &Client,
+    signal_table: &str,
+    table_name: &str,
+) -> TestResult {
+    let id = uuid::Uuid::new_v4().to_string();
+    let signal_type = "execute-snapshot";
+    let data = serde_json::json!({
+        "type": "incremental",
+        "data-collections": [format!(r"public\.{table_name}")],
+    })
+    .to_string();
+    client
+        .execute(
+            &format!("INSERT INTO public.{signal_table} (id, type, data) VALUES ($1, $2, $3)"),
+            &[&id, &signal_type, &data],
+        )
+        .await?;
+    Ok(())
+}
+
+fn require_incremental_event(event: &rustium_core::ChangeEvent, table_name: &str) -> TestResult {
+    require(
+        event.operation == Operation::Read,
+        "incremental snapshot event is not a read",
+    )?;
+    require(
+        event.source.snapshot,
+        "incremental snapshot event has no snapshot marker",
+    )?;
+    require(
+        event.source.table.as_deref() == Some(table_name),
+        "signal table was exposed as a business event",
+    )?;
+    require(
+        event.source.attributes.get("rustium.snapshot.kind") == Some(&"incremental".into()),
+        "incremental snapshot kind is missing",
+    )?;
+    let id = event
+        .schema
+        .fields
+        .iter()
+        .find(|field| field.name == "id")
+        .ok_or_else(|| test_error("incremental snapshot schema has no id field"))?;
+    require(
+        id.primary_key,
+        "PostgreSQL catalog did not discover the id primary key",
+    )?;
+    require(
+        !id.optional,
+        "PostgreSQL catalog marked the id primary key nullable",
+    )
+}
+
+fn row_id(row: Option<&Row>) -> TestResult<i64> {
+    match row.and_then(|row| row.get("id")) {
+        Some(DataValue::Int64(id)) => Ok(*id),
+        _ => Err(test_error("incremental snapshot row has no bigint id")),
+    }
 }
 
 async fn insert_type_row(client: &Client, table_name: &str, id: i64) -> TestResult {

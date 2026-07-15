@@ -183,6 +183,19 @@ impl SourceConfig {
                     &config.heartbeat_topics_prefix,
                     config.heartbeat_topic_name.as_deref(),
                 );
+                if let Some(signal_data_collection) = &config.signal_data_collection {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "incremental_snapshot".into(),
+                            serde_json::json!({
+                                "signal_data_collection": signal_data_collection,
+                                "chunk_size": config.incremental_snapshot_chunk_size,
+                                "watermarking_strategy": config.incremental_snapshot_watermarking_strategy,
+                            }),
+                        );
+                }
                 semantic
             }
             Self::Mysql(config) => serde_json::json!({
@@ -237,6 +250,12 @@ pub struct PostgresSourceConfig {
     pub heartbeat_topics_prefix: String,
     #[serde(default)]
     pub heartbeat_topic_name: Option<String>,
+    #[serde(default)]
+    pub signal_data_collection: Option<String>,
+    #[serde(default = "default_incremental_snapshot_chunk_size")]
+    pub incremental_snapshot_chunk_size: usize,
+    #[serde(default = "default_incremental_snapshot_watermarking_strategy")]
+    pub incremental_snapshot_watermarking_strategy: String,
 }
 
 impl PostgresSourceConfig {
@@ -265,6 +284,30 @@ impl PostgresSourceConfig {
             self.heartbeat_topic_name.as_deref(),
             self.heartbeat_action_query.as_deref(),
         )?;
+        if self.incremental_snapshot_chunk_size == 0 {
+            return Err(Error::Configuration(
+                "source.incremental_snapshot_chunk_size must be greater than zero".into(),
+            ));
+        }
+        if self.incremental_snapshot_watermarking_strategy != "insert_insert" {
+            return Err(Error::Configuration(
+                "source.incremental_snapshot_watermarking_strategy currently supports only insert_insert"
+                    .into(),
+            ));
+        }
+        if let Some(collection) = &self.signal_data_collection {
+            let mut parts = collection.split('.');
+            let schema = parts.next().unwrap_or_default();
+            let table = parts.next().unwrap_or_default();
+            if schema.is_empty() || table.is_empty() || parts.next().is_some() {
+                return Err(Error::Configuration(
+                    "source.signal_data_collection must be a schema-qualified PostgreSQL table"
+                        .into(),
+                ));
+            }
+            validate_name(schema, "source.signal_data_collection schema")?;
+            validate_name(table, "source.signal_data_collection table")?;
+        }
         Ok(())
     }
 
@@ -871,6 +914,12 @@ const fn default_connect_timeout() -> Duration {
 }
 const fn default_snapshot_fetch_size() -> usize {
     10_000
+}
+const fn default_incremental_snapshot_chunk_size() -> usize {
+    1_024
+}
+fn default_incremental_snapshot_watermarking_strategy() -> String {
+    "insert_insert".into()
 }
 fn default_unavailable_value() -> String {
     "__rustium_unavailable_value".into()

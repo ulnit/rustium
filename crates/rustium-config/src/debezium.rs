@@ -41,6 +41,41 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
             .into_iter()
             .map(|schema| format!("(?:{schema})\\..+")),
     );
+    let signal_collections = csv_property(properties.get("signal.data.collection"));
+    if signal_collections.len() > 1 {
+        return Err(Error::Configuration(
+            "Rustium PostgreSQL currently accepts one table in signal.data.collection".into(),
+        ));
+    }
+    let signal_data_collection = signal_collections.into_iter().next();
+    let signal_channels = csv_property(properties.get("signal.enabled.channels"));
+    if signal_data_collection.is_some()
+        && !signal_channels.is_empty()
+        && !signal_channels.iter().any(|channel| channel == "source")
+    {
+        return Err(Error::Configuration(
+            "PostgreSQL signal.data.collection requires the source signal channel".into(),
+        ));
+    }
+    let mut warnings = Vec::new();
+    for channel in signal_channels
+        .iter()
+        .filter(|channel| channel.as_str() != "source")
+    {
+        warnings.push(format!(
+            "signal.enabled.channels={channel} is not implemented and was ignored"
+        ));
+    }
+    if bool_value(
+        &properties,
+        "incremental.snapshot.allow.schema.changes",
+        false,
+    )? {
+        return Err(Error::Configuration(
+            "incremental.snapshot.allow.schema.changes=true is not implemented for PostgreSQL"
+                .into(),
+        ));
+    }
 
     assemble_config(
         &properties,
@@ -83,6 +118,16 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 .cloned()
                 .unwrap_or_else(default_heartbeat_topics_prefix),
             heartbeat_topic_name: properties.get("topic.heartbeat.name").cloned(),
+            signal_data_collection,
+            incremental_snapshot_chunk_size: usize_value(
+                &properties,
+                "incremental.snapshot.chunk.size",
+                default_incremental_snapshot_chunk_size(),
+            )?,
+            incremental_snapshot_watermarking_strategy: properties
+                .get("incremental.snapshot.watermarking.strategy")
+                .cloned()
+                .unwrap_or_else(default_incremental_snapshot_watermarking_strategy),
         }),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -96,7 +141,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 default_snapshot_fetch_size(),
             )?,
         },
-        Vec::new(),
+        warnings,
     )
 }
 
@@ -615,6 +660,11 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "heartbeat.topics.prefix",
         "topic.heartbeat.prefix",
         "topic.heartbeat.name",
+        "signal.data.collection",
+        "signal.enabled.channels",
+        "incremental.snapshot.chunk.size",
+        "incremental.snapshot.allow.schema.changes",
+        "incremental.snapshot.watermarking.strategy",
         "offset.storage.file.filename",
         "bootstrap.servers",
         "rustium.sink.type",
@@ -666,6 +716,11 @@ heartbeat.interval.ms=2500
 heartbeat.action.query=INSERT INTO public.rustium_heartbeat (id) VALUES (1)
 topic.heartbeat.prefix=__pg-heartbeat
 topic.heartbeat.name=shared-pg-heartbeat
+signal.data.collection=public.rustium_signal
+signal.enabled.channels=source
+incremental.snapshot.chunk.size=128
+incremental.snapshot.allow.schema.changes=false
+incremental.snapshot.watermarking.strategy=insert_insert
 max.queue.size=4096
 max.batch.size=1000
 "#,
@@ -686,6 +741,15 @@ max.batch.size=1000
             source.heartbeat_topic_name.as_deref(),
             Some("shared-pg-heartbeat")
         );
+        assert_eq!(
+            source.signal_data_collection.as_deref(),
+            Some("public.rustium_signal")
+        );
+        assert_eq!(source.incremental_snapshot_chunk_size, 128);
+        assert_eq!(
+            source.incremental_snapshot_watermarking_strategy,
+            "insert_insert"
+        );
         assert!(!config.format.tombstones_on_delete);
         assert!(
             config
@@ -693,6 +757,44 @@ max.batch.size=1000
                 .iter()
                 .all(|warning| !warning.contains("tombstone"))
         );
+    }
+
+    #[test]
+    fn rejects_unsupported_postgres_incremental_snapshot_options() {
+        let unsupported_channel = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+signal.data.collection=public.rustium_signal
+signal.enabled.channels=kafka
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            unsupported_channel
+                .to_string()
+                .contains("source signal channel")
+        );
+
+        let schema_changes = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+incremental.snapshot.allow.schema.changes=true
+"#,
+        )
+        .unwrap_err();
+        assert!(schema_changes.to_string().contains("allow.schema.changes"));
     }
 
     #[test]

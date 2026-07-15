@@ -19,11 +19,14 @@ use rustium_core::{
     SourceRecord, TransactionMetadata,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::schema_history::{
-    PostgresColumnType, TableSchema, decode_schema_history, encode_schema_history,
-    schema_from_relation,
+use crate::{
+    incremental_snapshot::{ClosedWindow, IncrementalSnapshotController, Signal},
+    schema_history::{
+        PostgresColumnType, TableSchema, decode_connector_state, encode_connector_state,
+        encode_schema_history, schema_from_relation,
+    },
 };
 
 const CONNECTOR_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -96,6 +99,7 @@ impl PostgresSource {
                     config.publication
                 )));
             }
+            validate_signal_table(&mut connection, &config)?;
 
             let slot = quote_literal(&config.slot_name).map_err(pg_error)?;
             let slot_result = connection
@@ -296,12 +300,15 @@ impl SourceConnector for PostgresSource {
                 .is_none_or(|checkpoint| !checkpoint.snapshot_completed),
         };
 
+        let mut incremental_progress = None;
         if !snapshot_needed {
             if let Some(connector_state) = checkpoint
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.connector_state.as_ref())
             {
-                self.schemas = decode_schema_history(connector_state)?;
+                let state = decode_connector_state(connector_state)?;
+                self.schemas = state.schemas;
+                incremental_progress = state.incremental_snapshot;
             } else if checkpoint.is_some() {
                 return Err(Error::State(
                     "PostgreSQL checkpoint predates persistent schema history and cannot safely replay relation changes; reset the checkpoint and run a new initial snapshot"
@@ -391,6 +398,8 @@ impl SourceConnector for PostgresSource {
         );
         let mut heartbeat = heartbeat_timer(self.config.heartbeat_interval);
         let mut heartbeat_connection = open_heartbeat_connection(&self.config).await?;
+        let mut incremental = IncrementalSnapshotController::new(incremental_progress);
+        incremental.resume(&self.config, &state.schemas).await?;
         info!(
             connector = %self.connector_name,
             slot = %self.config.slot_name,
@@ -451,7 +460,8 @@ impl SourceConnector for PostgresSource {
                             relation_name,
                             columns,
                             ..
-                        } if self.config.tables.includes(namespace, relation_name) => {
+                        } if self.config.tables.includes(namespace, relation_name)
+                            && !is_signal_table(&self.config, namespace, relation_name) => {
                             Some((
                                 namespace.to_string(),
                                 relation_name.to_string(),
@@ -482,18 +492,51 @@ impl SourceConnector for PostgresSource {
                             );
                         }
                     }
+                    if let EventType::Insert { schema, table, data, .. } = &event.event_type
+                        && is_signal_table(&self.config, schema, table)
+                    {
+                        let signal = IncrementalSnapshotController::parse_signal(data)?;
+                        if let Signal::Unsupported { id, signal_type } = &signal {
+                            warn!(%id, %signal_type, "unsupported PostgreSQL signal ignored");
+                        }
+                        if let Some(closed) = incremental
+                            .handle_signal(signal, &self.config, &state.schemas)
+                            .await?
+                        {
+                            for record in state.incremental_snapshot_records(
+                                event.lsn.value(),
+                                &self.connector_name,
+                                &self.config,
+                                closed,
+                            ) {
+                                context.output.send(Ok(record)).await.map_err(|_| Error::Cancelled)?;
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(mut record) = state.convert(
                         event,
                         &self.connector_name,
                         &self.config,
                     )? {
-                        if state.schema_dirty {
-                            record.connector_state = Some(encode_schema_history(&state.schemas)?);
+                        if let Some(event) = &record.event {
+                            incremental.deduplicate(event);
+                        }
+                        let incremental_dirty = incremental.take_state_dirty();
+                        if state.schema_dirty || incremental_dirty {
+                            record.connector_state = Some(encode_connector_state(
+                                &state.schemas,
+                                incremental.progress(),
+                            )?);
                             state.schema_dirty = false;
                         }
+                        let committed = record.boundary == RecordBoundary::TransactionCommit;
                         let position = record.position.clone();
                         context.output.send(Ok(record)).await.map_err(|_| Error::Cancelled)?;
                         last_safe_position = Some(position);
+                        if committed {
+                            incremental.after_commit(&self.config, &state.schemas).await?;
+                        }
                     }
                 }
             }
@@ -808,6 +851,62 @@ impl StreamingState {
         changed.then_some(version)
     }
 
+    fn incremental_snapshot_records(
+        &mut self,
+        lsn: u64,
+        connector_name: &str,
+        config: &PostgresSourceConfig,
+        closed: ClosedWindow,
+    ) -> Vec<SourceRecord> {
+        closed
+            .rows
+            .into_iter()
+            .map(|after| {
+                let event_serial = self.next_serial(lsn);
+                let position = SourcePosition::Postgres(PostgresPosition {
+                    lsn,
+                    commit_lsn: None,
+                    transaction_id: None,
+                    event_serial,
+                    snapshot: true,
+                });
+                let mut source = source_metadata(
+                    connector_name,
+                    config,
+                    &closed.schema.schema,
+                    &closed.schema.table,
+                    true,
+                    0,
+                );
+                source
+                    .attributes
+                    .insert("rustium.snapshot.kind".into(), "incremental".into());
+                let event = ChangeEvent {
+                    id: EventId::deterministic(
+                        connector_name,
+                        &config.database,
+                        &position,
+                        &format!(
+                            "{}.{}.{}",
+                            config.database, closed.schema.schema, closed.schema.table
+                        ),
+                        event_serial,
+                    ),
+                    source,
+                    position,
+                    transaction: None,
+                    operation: Operation::Read,
+                    before: None,
+                    after: Some(after),
+                    schema: closed.schema.event_schema.clone(),
+                    source_time: None,
+                    observed_time: Utc::now(),
+                };
+                SourceRecord::data(event)
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn data_record(
         &mut self,
@@ -822,7 +921,9 @@ impl StreamingState {
         new_data: Option<RowData>,
         key_columns: Option<Vec<String>>,
     ) -> Result<Option<SourceRecord>> {
-        if !config.tables.includes(schema_name, table_name) {
+        if !config.tables.includes(schema_name, table_name)
+            || is_signal_table(config, schema_name, table_name)
+        {
             return Ok(None);
         }
         let key = (schema_name.to_string(), table_name.to_string());
@@ -1076,13 +1177,86 @@ fn discover_tables(
     for index in 0..tables.ntuples() {
         let schema = required_value(&tables, index, 0, "publication schema")?;
         let table = required_value(&tables, index, 1, "publication table")?;
-        if !config.tables.includes(&schema, &table) {
+        if !config.tables.includes(&schema, &table) || is_signal_table(config, &schema, &table) {
             continue;
         }
         let table_schema = discover_table_schema(connection, config, &schema, &table)?;
         schemas.insert(table_schema.key(), table_schema);
     }
     Ok(schemas)
+}
+
+fn validate_signal_table(
+    connection: &mut PgReplicationConnection,
+    config: &PostgresSourceConfig,
+) -> Result<()> {
+    let Some(collection) = &config.signal_data_collection else {
+        return Ok(());
+    };
+    let (schema, table) = collection.split_once('.').ok_or_else(|| {
+        Error::Configuration("signal_data_collection must be schema-qualified".into())
+    })?;
+    let publication = quote_literal(&config.publication).map_err(pg_error)?;
+    let schema_literal = quote_literal(schema).map_err(pg_error)?;
+    let table_literal = quote_literal(table).map_err(pg_error)?;
+    let published = scalar(
+        connection,
+        &format!(
+            "SELECT EXISTS (\
+                SELECT 1 FROM pg_catalog.pg_publication_tables \
+                WHERE pubname = {publication} \
+                  AND schemaname = {schema_literal} \
+                  AND tablename = {table_literal}\
+             )"
+        ),
+    )?;
+    if published != "t" {
+        return Err(Error::Configuration(format!(
+            "PostgreSQL signal table {collection:?} is not part of publication {:?}",
+            config.publication
+        )));
+    }
+    let columns = connection
+        .exec(&format!(
+            "SELECT column_name, data_type \
+             FROM information_schema.columns \
+             WHERE table_schema = {schema_literal} AND table_name = {table_literal} \
+             ORDER BY ordinal_position"
+        ))
+        .map_err(pg_error)?;
+    if columns.ntuples() != 3 {
+        return Err(Error::Configuration(format!(
+            "PostgreSQL signal table {collection:?} must contain exactly id, type, and data columns"
+        )));
+    }
+    for (index, expected) in ["id", "type", "data"].iter().enumerate() {
+        let index = i32::try_from(index)
+            .map_err(|_| Error::Invariant("signal column index overflow".into()))?;
+        let name = required_value(&columns, index, 0, "signal column name")?;
+        let data_type = required_value(&columns, index, 1, "signal column type")?;
+        if name != *expected
+            || !matches!(
+                data_type.as_str(),
+                "text" | "character varying" | "character"
+            )
+        {
+            return Err(Error::Configuration(format!(
+                "PostgreSQL signal table {collection:?} column {} must be text-compatible {expected}",
+                index + 1
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_signal_table(config: &PostgresSourceConfig, schema: &str, table: &str) -> bool {
+    config
+        .signal_data_collection
+        .as_deref()
+        .and_then(|collection| collection.split_once('.'))
+        .is_some_and(|(signal_schema, signal_table)| {
+            signal_schema == schema && signal_table == table
+        })
 }
 
 fn discover_table_schema(
@@ -1107,14 +1281,14 @@ fn query_table_schema(
         .exec(&format!(
             r#"SELECT a.attname,
                       format_type(a.atttypid, a.atttypmod),
-                      (NOT a.attnotnull)::text,
+                      NOT a.attnotnull,
                       EXISTS (
                         SELECT 1
                         FROM pg_index i
                         WHERE i.indrelid = c.oid
                           AND i.indisprimary
-                          AND a.attnum = ANY(i.indkey)
-                      )::text,
+                          AND a.attnum = ANY(i.indkey::smallint[])
+                      ),
                       a.atttypid::oid::text,
                       a.atttypmod::text
                FROM pg_attribute a
@@ -1191,7 +1365,7 @@ fn convert_value(value: &ColumnValue, type_name: &str) -> DataValue {
     }
 }
 
-fn convert_text(value: &str, type_name: &str) -> DataValue {
+pub(crate) fn convert_text(value: &str, type_name: &str) -> DataValue {
     if let Some(element_type) = type_name.trim().strip_suffix("[]") {
         return parse_postgres_array(value, element_type)
             .unwrap_or_else(|| DataValue::String(value.into()));
@@ -1604,6 +1778,9 @@ mod tests {
             heartbeat_action_query: None,
             heartbeat_topics_prefix: "__debezium-heartbeat".into(),
             heartbeat_topic_name: None,
+            signal_data_collection: None,
+            incremental_snapshot_chunk_size: 1_024,
+            incremental_snapshot_watermarking_strategy: "insert_insert".into(),
         };
         let mut source = PostgresSource::new(
             "inventory-postgresql",

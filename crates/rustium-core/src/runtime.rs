@@ -269,7 +269,14 @@ impl ConnectorRuntime {
         }
 
         if let Some(event) = &record.event {
+            let incremental_snapshot = event
+                .source
+                .attributes
+                .get("rustium.snapshot.kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("incremental");
             if event.source.snapshot
+                && !incremental_snapshot
                 && self.status.snapshot().await.state != ConnectorState::Snapshotting
             {
                 self.status

@@ -5,7 +5,7 @@ use rustium_core::{ConnectorStateEnvelope, Error, EventSchema, FieldSchema, Resu
 use serde::{Deserialize, Serialize};
 
 pub(crate) const POSTGRES_SCHEMA_HISTORY_FORMAT: &str = "rustium.postgresql.schema-history";
-const POSTGRES_SCHEMA_HISTORY_VERSION: u32 = 1;
+const POSTGRES_SCHEMA_HISTORY_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PostgresColumnType {
@@ -29,16 +29,44 @@ impl TableSchema {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct IncrementalSnapshotProgress {
+    pub(crate) signal_id: String,
+    pub(crate) data_collections: Vec<String>,
+    pub(crate) current_collection: usize,
+    pub(crate) last_key: Option<Vec<String>>,
+    pub(crate) maximum_key: Option<Vec<String>>,
+    pub(crate) chunk_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PostgresConnectorState {
+    pub(crate) schemas: HashMap<(String, String), TableSchema>,
+    pub(crate) incremental_snapshot: Option<IncrementalSnapshotProgress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PostgresSchemaHistoryState {
     tables: Vec<TableSchema>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incremental_snapshot: Option<IncrementalSnapshotProgress>,
 }
 
 pub(crate) fn encode_schema_history(
     schemas: &HashMap<(String, String), TableSchema>,
 ) -> Result<ConnectorStateEnvelope> {
+    encode_connector_state(schemas, None)
+}
+
+pub(crate) fn encode_connector_state(
+    schemas: &HashMap<(String, String), TableSchema>,
+    incremental_snapshot: Option<&IncrementalSnapshotProgress>,
+) -> Result<ConnectorStateEnvelope> {
     let mut tables = schemas.values().cloned().collect::<Vec<_>>();
     tables.sort_by_key(TableSchema::key);
-    let payload = serde_json::to_value(PostgresSchemaHistoryState { tables })?;
+    let payload = serde_json::to_value(PostgresSchemaHistoryState {
+        tables,
+        incremental_snapshot: incremental_snapshot.cloned(),
+    })?;
     Ok(ConnectorStateEnvelope::new(
         POSTGRES_SCHEMA_HISTORY_FORMAT,
         POSTGRES_SCHEMA_HISTORY_VERSION,
@@ -46,19 +74,26 @@ pub(crate) fn encode_schema_history(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn decode_schema_history(
     envelope: &ConnectorStateEnvelope,
 ) -> Result<HashMap<(String, String), TableSchema>> {
+    Ok(decode_connector_state(envelope)?.schemas)
+}
+
+pub(crate) fn decode_connector_state(
+    envelope: &ConnectorStateEnvelope,
+) -> Result<PostgresConnectorState> {
     if envelope.format != POSTGRES_SCHEMA_HISTORY_FORMAT {
         return Err(Error::State(format!(
             "PostgreSQL checkpoint has connector state format {:?}, expected {:?}",
             envelope.format, POSTGRES_SCHEMA_HISTORY_FORMAT
         )));
     }
-    if envelope.version != POSTGRES_SCHEMA_HISTORY_VERSION {
+    if !matches!(envelope.version, 1 | POSTGRES_SCHEMA_HISTORY_VERSION) {
         return Err(Error::State(format!(
-            "unsupported PostgreSQL schema history version {}; expected {}",
-            envelope.version, POSTGRES_SCHEMA_HISTORY_VERSION
+            "unsupported PostgreSQL schema history version {}; expected 1 or {}",
+            envelope.version, POSTGRES_SCHEMA_HISTORY_VERSION,
         )));
     }
     let state: PostgresSchemaHistoryState = serde_json::from_value(envelope.payload.clone())?;
@@ -72,7 +107,10 @@ pub(crate) fn decode_schema_history(
             )));
         }
     }
-    Ok(schemas)
+    Ok(PostgresConnectorState {
+        schemas,
+        incremental_snapshot: state.incremental_snapshot,
+    })
 }
 
 pub(crate) fn schema_from_relation(
@@ -193,7 +231,45 @@ mod tests {
         let envelope = encode_schema_history(&schemas).unwrap();
 
         assert_eq!(envelope.format, POSTGRES_SCHEMA_HISTORY_FORMAT);
+        assert_eq!(envelope.version, 2);
+        assert!(envelope.payload.get("incremental_snapshot").is_none());
         assert_eq!(decode_schema_history(&envelope).unwrap(), schemas);
+    }
+
+    #[test]
+    fn reads_version_one_schema_history_without_incremental_progress() {
+        let table = baseline();
+        let schemas = HashMap::from([(table.key(), table.clone())]);
+        let envelope = ConnectorStateEnvelope::new(
+            POSTGRES_SCHEMA_HISTORY_FORMAT,
+            1,
+            serde_json::json!({ "tables": [table] }),
+        );
+
+        let decoded = decode_connector_state(&envelope).unwrap();
+        assert_eq!(decoded.schemas, schemas);
+        assert_eq!(decoded.incremental_snapshot, None);
+    }
+
+    #[test]
+    fn round_trips_version_two_incremental_snapshot_progress() {
+        let table = baseline();
+        let schemas = HashMap::from([(table.key(), table)]);
+        let progress = IncrementalSnapshotProgress {
+            signal_id: "snapshot-1".into(),
+            data_collections: vec!["public.orders".into(), "public.customers".into()],
+            current_collection: 1,
+            last_key: Some(vec!["acme".into(), "42".into()]),
+            maximum_key: Some(vec!["zenith".into(), "9000".into()]),
+            chunk_sequence: 7,
+        };
+
+        let envelope = encode_connector_state(&schemas, Some(&progress)).unwrap();
+        let decoded = decode_connector_state(&envelope).unwrap();
+
+        assert_eq!(envelope.version, 2);
+        assert_eq!(decoded.schemas, schemas);
+        assert_eq!(decoded.incremental_snapshot, Some(progress));
     }
 
     #[test]

@@ -189,7 +189,7 @@ fn debezium_source(event: &ChangeEvent, source_ts: Option<i64>) -> Result<serde_
         "connector": event.source.connector,
         "name": event.source.connector_name,
         "ts_ms": source_ts,
-        "snapshot": if event.source.snapshot { "true" } else { "false" },
+        "snapshot": snapshot_marker(event),
         "db": event.source.database,
         "schema": event.source.schema,
         "table": event.source.table,
@@ -227,6 +227,22 @@ fn debezium_source(event: &ChangeEvent, source_ts: Option<i64>) -> Result<serde_
         }
     }
     Ok(source.into())
+}
+
+fn snapshot_marker(event: &ChangeEvent) -> &'static str {
+    if event
+        .source
+        .attributes
+        .get("rustium.snapshot.kind")
+        .and_then(serde_json::Value::as_str)
+        == Some("incremental")
+    {
+        "incremental"
+    } else if event.source.snapshot {
+        "true"
+    } else {
+        "false"
+    }
 }
 
 fn event_key(row: &Row, event: &ChangeEvent, unavailable_value: &str) -> Option<serde_json::Value> {
@@ -343,6 +359,30 @@ mod tests {
         assert_eq!(value["op"], "c");
         assert_eq!(value["after"]["name"], "Alice");
         assert!(encoded.key.is_some());
+    }
+
+    #[test]
+    fn emits_incremental_snapshot_marker() {
+        let mut event = event();
+        event.operation = Operation::Read;
+        event.source.snapshot = true;
+        event
+            .source
+            .attributes
+            .insert("rustium.snapshot.kind".into(), "incremental".into());
+        let encoded = DebeziumJsonEncoder::new(JsonEncoderConfig {
+            topic_prefix: "app".into(),
+            unavailable_value: "__unavailable".into(),
+            tombstones_on_delete: true,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
+        })
+        .encode(&event)
+        .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(encoded.payload.as_ref().unwrap()).unwrap();
+        assert_eq!(value["op"], "r");
+        assert_eq!(value["source"]["snapshot"], "incremental");
     }
 
     #[test]
