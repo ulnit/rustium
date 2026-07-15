@@ -976,11 +976,22 @@ fn snapshot_table(
     } else {
         ordering.join(", ")
     };
+    let projection = schema
+        .event_schema
+        .fields
+        .iter()
+        .map(|field| {
+            quote_ident(&field.name)
+                .map(|name| format!("{name}::text"))
+                .map_err(pg_error)
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
 
     let mut offset = 0_usize;
     loop {
         let query = format!(
-            "SELECT row_to_json(r)::text FROM (SELECT * FROM {qualified} ORDER BY {ordering} LIMIT {fetch_size} OFFSET {offset}) AS r"
+            "SELECT {projection} FROM {qualified} ORDER BY {ordering} LIMIT {fetch_size} OFFSET {offset}"
         );
         let result = connection.exec(&query).map_err(pg_error)?;
         if result.ntuples() == 0 {
@@ -988,8 +999,6 @@ fn snapshot_table(
         }
         let row_count = result.ntuples();
         for row_index in 0..row_count {
-            let json = required_value(&result, row_index, 0, "snapshot row")?;
-            let value: serde_json::Value = serde_json::from_str(&json)?;
             *ordinal += 1;
             let position = SourcePosition::Postgres(PostgresPosition {
                 lsn: anchor_lsn,
@@ -998,7 +1007,23 @@ fn snapshot_table(
                 event_serial: *ordinal,
                 snapshot: true,
             });
-            let after = json_row(&value, &schema.event_schema)?;
+            let after = schema
+                .event_schema
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(column_index, field)| {
+                    let column_index = i32::try_from(column_index).map_err(|_| {
+                        Error::Invariant("PostgreSQL snapshot has too many columns".into())
+                    })?;
+                    let value = result
+                        .get_value(row_index, column_index)
+                        .map_or(DataValue::Null, |value| {
+                            convert_text(&value, &field.type_name)
+                        });
+                    Ok((field.name.clone(), value))
+                })
+                .collect::<Result<Row>>()?;
             let event = ChangeEvent {
                 id: EventId::deterministic(
                     connector_name,
@@ -1167,6 +1192,10 @@ fn convert_value(value: &ColumnValue, type_name: &str) -> DataValue {
 }
 
 fn convert_text(value: &str, type_name: &str) -> DataValue {
+    if let Some(element_type) = type_name.trim().strip_suffix("[]") {
+        return parse_postgres_array(value, element_type)
+            .unwrap_or_else(|| DataValue::String(value.into()));
+    }
     let base_type = type_name.split('(').next().unwrap_or(type_name).trim();
     match base_type {
         "boolean" => DataValue::Boolean(matches!(value, "t" | "true" | "1")),
@@ -1176,14 +1205,20 @@ fn convert_text(value: &str, type_name: &str) -> DataValue {
         "bigint" => value
             .parse::<i64>()
             .map_or_else(|_| DataValue::String(value.into()), DataValue::Int64),
-        "real" | "double precision" => value
-            .parse::<f64>()
-            .map_or_else(|_| DataValue::String(value.into()), DataValue::Float64),
+        "real" | "double precision" => match value {
+            "NaN" | "Infinity" | "-Infinity" => DataValue::String(value.into()),
+            _ => value
+                .parse::<f64>()
+                .map_or_else(|_| DataValue::String(value.into()), DataValue::Float64),
+        },
         "numeric" | "decimal" | "money" => DataValue::Decimal(value.into()),
         "json" | "jsonb" => serde_json::from_str(value)
             .map_or_else(|_| DataValue::String(value.into()), DataValue::Json),
         "uuid" => uuid::Uuid::parse_str(value)
             .map_or_else(|_| DataValue::String(value.into()), DataValue::Uuid),
+        "oid" => value
+            .parse::<u64>()
+            .map_or_else(|_| DataValue::String(value.into()), DataValue::UInt64),
         "date" => DataValue::Date(value.into()),
         "time" | "time without time zone" | "time with time zone" => DataValue::Time(value.into()),
         "timestamp" | "timestamp without time zone" | "timestamp with time zone" => {
@@ -1195,41 +1230,129 @@ fn convert_text(value: &str, type_name: &str) -> DataValue {
     }
 }
 
-fn json_row(value: &serde_json::Value, schema: &EventSchema) -> Result<Row> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| Error::Source("snapshot row is not a JSON object".into()))?;
-    Ok(object
-        .iter()
-        .map(|(name, value)| {
-            let type_name = schema
-                .fields
-                .iter()
-                .find(|field| field.name == *name)
-                .map_or("text", |field| field.type_name.as_str());
-            (name.clone(), json_value(value, type_name))
-        })
-        .collect())
+fn parse_postgres_array(value: &str, element_type: &str) -> Option<DataValue> {
+    let start = value.find('{')?;
+    let dimensions = &value[..start];
+    if !(dimensions.is_empty() || dimensions.starts_with('[') && dimensions.ends_with("]=")) {
+        return None;
+    }
+    let delimiter = if element_type
+        .split('(')
+        .next()
+        .is_some_and(|name| name.trim() == "box")
+    {
+        b';'
+    } else {
+        b','
+    };
+    let mut parser = PostgresArrayParser {
+        input: value.as_bytes(),
+        index: start,
+        delimiter,
+        element_type,
+    };
+    let parsed = parser.parse_array()?;
+    parser.skip_whitespace();
+    (parser.index == parser.input.len()).then_some(parsed)
 }
 
-fn json_value(value: &serde_json::Value, type_name: &str) -> DataValue {
-    match value {
-        serde_json::Value::Null => DataValue::Null,
-        serde_json::Value::Bool(value) => DataValue::Boolean(*value),
-        serde_json::Value::Number(value) => value
-            .as_i64()
-            .map(DataValue::Int64)
-            .or_else(|| value.as_u64().map(DataValue::UInt64))
-            .or_else(|| value.as_f64().map(DataValue::Float64))
-            .unwrap_or_else(|| DataValue::Decimal(value.to_string())),
-        serde_json::Value::String(value) => convert_text(value, type_name),
-        serde_json::Value::Array(values) => DataValue::Array(
-            values
-                .iter()
-                .map(|value| json_value(value, "text"))
-                .collect(),
-        ),
-        serde_json::Value::Object(_) => DataValue::Json(value.clone()),
+struct PostgresArrayParser<'a> {
+    input: &'a [u8],
+    index: usize,
+    delimiter: u8,
+    element_type: &'a str,
+}
+
+impl PostgresArrayParser<'_> {
+    fn parse_array(&mut self) -> Option<DataValue> {
+        self.consume(b'{')?;
+        self.skip_whitespace();
+        let mut values = Vec::new();
+        if self.peek()? == b'}' {
+            self.index += 1;
+            return Some(DataValue::Array(values));
+        }
+        loop {
+            self.skip_whitespace();
+            let value = if self.peek()? == b'{' {
+                self.parse_array()?
+            } else {
+                self.parse_element()?
+            };
+            values.push(value);
+            self.skip_whitespace();
+            match self.peek()? {
+                byte if byte == self.delimiter => self.index += 1,
+                b'}' => {
+                    self.index += 1;
+                    return Some(DataValue::Array(values));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn parse_element(&mut self) -> Option<DataValue> {
+        if self.peek()? == b'"' {
+            self.index += 1;
+            let mut value = Vec::new();
+            loop {
+                match self.peek()? {
+                    b'"' => {
+                        self.index += 1;
+                        let value = std::str::from_utf8(&value).ok()?;
+                        return Some(convert_text(value, self.element_type));
+                    }
+                    b'\\' => {
+                        self.index += 1;
+                        value.push(self.peek()?);
+                        self.index += 1;
+                    }
+                    byte => {
+                        value.push(byte);
+                        self.index += 1;
+                    }
+                }
+            }
+        }
+
+        let mut value = Vec::new();
+        while let Some(byte) = self.peek() {
+            if byte == self.delimiter || byte == b'}' {
+                break;
+            }
+            if byte == b'\\' {
+                self.index += 1;
+                value.push(self.peek()?);
+                self.index += 1;
+            } else {
+                value.push(byte);
+                self.index += 1;
+            }
+        }
+        let value = std::str::from_utf8(&value).ok()?.trim();
+        if value.is_empty() {
+            return None;
+        }
+        if value == "NULL" {
+            Some(DataValue::Null)
+        } else {
+            Some(convert_text(value, self.element_type))
+        }
+    }
+
+    fn consume(&mut self, expected: u8) -> Option<()> {
+        (self.peek()? == expected).then(|| self.index += 1)
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.input.get(self.index).copied()
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
+            self.index += 1;
+        }
     }
 }
 
@@ -1344,6 +1467,49 @@ mod tests {
             convert_text("12.30", "numeric(10,2)"),
             DataValue::Decimal("12.30".into())
         );
+        assert_eq!(
+            convert_text("NaN", "double precision"),
+            DataValue::String("NaN".into())
+        );
+        assert_eq!(
+            convert_text("4294967295", "oid"),
+            DataValue::UInt64(4_294_967_295)
+        );
+    }
+
+    #[test]
+    fn converts_postgres_text_and_multidimensional_arrays() {
+        assert_eq!(
+            convert_text(
+                r#"{alpha,"comma,value","NULL",NULL,"quote\"value","slash\\value"}"#,
+                "text[]",
+            ),
+            DataValue::Array(vec![
+                DataValue::String("alpha".into()),
+                DataValue::String("comma,value".into()),
+                DataValue::String("NULL".into()),
+                DataValue::Null,
+                DataValue::String("quote\"value".into()),
+                DataValue::String("slash\\value".into()),
+            ])
+        );
+        assert_eq!(
+            convert_text("[0:1][2:3]={{1,2},{3,NULL}}", "integer[]"),
+            DataValue::Array(vec![
+                DataValue::Array(vec![DataValue::Int32(1), DataValue::Int32(2)]),
+                DataValue::Array(vec![DataValue::Int32(3), DataValue::Null]),
+            ])
+        );
+    }
+
+    #[test]
+    fn preserves_malformed_postgres_arrays_as_strings() {
+        for value in ["{one,two", "garbage{one,two}", "{one,,two}"] {
+            assert_eq!(
+                convert_text(value, "text[]"),
+                DataValue::String(value.into())
+            );
+        }
     }
 
     #[test]

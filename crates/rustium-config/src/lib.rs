@@ -80,6 +80,11 @@ impl Config {
         validate_name(&self.metadata.name, "metadata.name")?;
         self.source.validate()?;
         self.sink.validate()?;
+        if self.snapshot.fetch_size == 0 {
+            return Err(Error::Configuration(
+                "snapshot.fetch_size must be greater than zero".into(),
+            ));
+        }
         if self.runtime.channel_capacity == 0 {
             return Err(Error::Configuration(
                 "runtime.channel_capacity must be greater than zero".into(),
@@ -954,6 +959,14 @@ sink:
     fn rejects_unknown_fields() {
         let error = Config::from_yaml(&format!("{CONFIG}\nunknown: true\n")).unwrap_err();
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn rejects_zero_snapshot_fetch_size() {
+        let error =
+            Config::from_yaml(&CONFIG.replace("sink:\n", "snapshot:\n  fetch_size: 0\nsink:\n"))
+                .unwrap_err();
+        assert!(error.to_string().contains("snapshot.fetch_size"));
     }
 
     #[test]

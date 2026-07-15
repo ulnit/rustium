@@ -62,7 +62,7 @@ The workspace contains a runnable alpha service.
 | SQLite checkpoint v2 and connector state | Implemented; version 1 JSON remains readable |
 | Native and Debezium JSON | Implemented |
 | stdout and Kafka sinks | Implemented |
-| PostgreSQL source | Implemented; destructive-DDL restart and heartbeat/action-query gates pass with PostgreSQL 17 |
+| PostgreSQL source | Implemented; recovery, heartbeat/action-query, and core type-matrix gates pass with PostgreSQL 17 |
 | MySQL source | Implemented; Docker and external destructive-DDL restart gates pass with MySQL 8.4 |
 | SQL Server source | Implemented and externally integration-tested with SQL Server 2022 Developer CU25 |
 | CLI and HTTP management | Implemented |
@@ -229,12 +229,14 @@ The PostgreSQL connector-state payload persists the snapshot table layout plus e
 
 PostgreSQL does not put original DDL or column nullability/default metadata into `Relation`. If a transient historical column no longer exists in the current catalog and was not present in the checkpoint baseline, Rustium resolves its type from OID/typmod and conservatively marks it optional. This preserves row decoding and ordering without claiming unavailable metadata.
 
+Snapshot queries project every selected column through PostgreSQL's `::text` output function instead of routing rows through JSON. Snapshot values and `pgoutput` values therefore share one converter and preserve numeric scale/precision, bytea, JSON text, temporal formatting, and array syntax identically. The array parser handles quoted and escaped elements, SQL NULL versus the string `"NULL"`, explicit lower bounds, nested dimensions, and type-aware scalar conversion. Malformed array text is preserved as a string instead of being partially decoded.
+
 `heartbeat.interval.ms` defaults to zero. A positive interval emits a visible heartbeat at the latest SourceRecord position already admitted to the bounded queue, or at the completed snapshot anchor before the first streaming event. No heartbeat is emitted when no source position exists. `heartbeat.action.query` optionally executes first on a reused ordinary SQL connection at each interval. Its WAL is not treated as progress until `pgoutput` returns it, and query failures stop the source with the database error. Heartbeat-table changes can be included in the publication but excluded by the table selector; their transaction commit still advances the safe WAL position without exposing a business-table event.
 
 #### 9.4 Remaining PostgreSQL gates
 
 - incremental snapshots and signaling;
-- broader type and failure fixtures;
+- extension-type and broader failure fixtures;
 - Kafka end-to-end recovery tests.
 
 ### 10. MySQL Connector
@@ -409,7 +411,7 @@ RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo \
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
 ```
 
-These tests create isolated table/publication/slot names and verify snapshot rows, ordered transactional create/update/delete events, checkpoint stop, an old-schema row, destructive drop/add-column DDL, a new-schema row, historical `Relation` replay with schema versions 1 and 2, restart without snapshot replay, periodic heartbeat records at a safe WAL position, `heartbeat.action.query`, heartbeat-table filtering, and cleanup. They pass against PostgreSQL 17 with `wal_level=logical`.
+These tests create isolated table/publication/slot names and verify snapshot rows, ordered transactional create/update/delete events, checkpoint stop, an old-schema row, destructive drop/add-column DDL, a new-schema row, historical `Relation` replay with schema versions 1 and 2, restart without snapshot replay, periodic heartbeat records at a safe WAL position, `heartbeat.action.query`, heartbeat-table filtering, and identical snapshot/WAL conversion across the core PostgreSQL type matrix. They pass against PostgreSQL 17 with `wal_level=logical`.
 
 The ignored external SQL Server test reads connection settings from the environment and does not contain repository credentials:
 
@@ -432,7 +434,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. Roadmap
 
-1. Close PostgreSQL incremental-snapshot, transient-metadata, type/failure-fixture, and Kafka gates.
+1. Close PostgreSQL incremental-snapshot, transient-metadata, extension-type/failure-fixture, and Kafka gates.
 2. Close MySQL signaling, TLS-store, wider DDL/type, and Kafka gates.
 3. Close SQL Server CDC container-portability, retention-failure, concurrency, wider-type, and Kafka gates.
 4. Only then consider additional databases.
@@ -490,7 +492,7 @@ Workspace 已包含可运行的 alpha 服务。
 | SQLite checkpoint v2 与连接器状态 | 已实现；仍可读取 version 1 JSON |
 | 原生和 Debezium JSON | 已实现 |
 | stdout 和 Kafka Sink | 已实现 |
-| PostgreSQL Source | 已实现；PostgreSQL 17 破坏性 DDL 重启及 heartbeat/action-query 门槛通过 |
+| PostgreSQL Source | 已实现；PostgreSQL 17 恢复、heartbeat/action-query 和核心类型矩阵门槛通过 |
 | MySQL Source | 已实现；MySQL 8.4 Docker 和外部破坏性 DDL 重启门槛通过 |
 | SQL Server Source | 已实现并通过 SQL Server 2022 Developer CU25 外部集成测试 |
 | CLI 和 HTTP 管理 | 已实现 |
@@ -657,12 +659,14 @@ PostgreSQL connector-state payload 持久化快照表布局，以及每列的类
 
 PostgreSQL 不会在 `Relation` 中记录原始 DDL、列可空性或 default。如果短暂历史列已经从当前 catalog 消失，且 checkpoint 基线中也不存在，Rustium 会通过 OID/typmod 解析类型，并保守地标记为 optional。这样可保持行解码和顺序正确，同时不伪造 WAL 未提供的元数据。
 
+快照查询通过 PostgreSQL 的 `::text` 输出函数逐列投影，不再让整行经过 JSON 中间层。快照值和 `pgoutput` 值因此共用同一个转换器，可一致保留 numeric scale/precision、bytea、JSON 文本、时间格式和数组语法。数组解析器支持带引号和转义的元素、SQL NULL 与字符串 `"NULL"` 的区别、显式下界、嵌套维度和按元素类型转换。畸形数组文本会完整保留为字符串，不会被部分解码。
+
 `heartbeat.interval.ms` 默认为零。设置为正数后，会在最新已进入有界队列的 SourceRecord 位点发送可见 heartbeat；首条 streaming event 之前则使用已完成快照的锚点。没有源位点时不会发送 heartbeat。可选的 `heartbeat.action.query` 在每个周期先通过复用的普通 SQL 连接执行。查询产生的 WAL 只有在 `pgoutput` 实际返回后才算进度，查询失败会携带数据库错误停止 Source。heartbeat 表可以加入 publication 但被选表规则排除；其事务 commit 仍可推进安全 WAL 位点，而不会暴露成业务表事件。
 
 #### 9.4 PostgreSQL 剩余门槛
 
 - 增量快照和信号；
-- 更广类型和故障样例；
+- 扩展类型和更广故障样例；
 - Kafka 端到端恢复测试。
 
 ### 10. MySQL 连接器
@@ -837,7 +841,7 @@ RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo \
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
 ```
 
-这些测试使用隔离的表/publication/slot 名称，验证快照记录、同一事务内有序的 create/update/delete 事件、checkpoint 停止、旧 schema 行、破坏性删列/加列 DDL、新 schema 行、schema version 1 和 2 的历史 `Relation` 重放、重启不重复快照、安全 WAL 位点上的周期 heartbeat、`heartbeat.action.query`、heartbeat 表过滤，以及资源清理。测试已在启用 `wal_level=logical` 的 PostgreSQL 17 上通过。
+这些测试使用隔离的表/publication/slot 名称，验证快照记录、同一事务内有序的 create/update/delete 事件、checkpoint 停止、旧 schema 行、破坏性删列/加列 DDL、新 schema 行、schema version 1 和 2 的历史 `Relation` 重放、重启不重复快照、安全 WAL 位点上的周期 heartbeat、`heartbeat.action.query`、heartbeat 表过滤，以及 PostgreSQL 核心类型矩阵在快照/WAL 路径上的一致转换。测试已在启用 `wal_level=logical` 的 PostgreSQL 17 上通过。
 
 被忽略的 SQL Server 外部测试从环境变量读取连接配置，仓库中不包含测试凭据：
 
@@ -860,7 +864,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. 路线图
 
-1. 补齐 PostgreSQL 增量快照、短暂元数据、类型/故障样例和 Kafka 门槛。
+1. 补齐 PostgreSQL 增量快照、短暂元数据、扩展类型/故障样例和 Kafka 门槛。
 2. 补齐 MySQL 信号、TLS store、更广 DDL/类型和 Kafka 门槛。
 3. 补齐 SQL Server CDC 容器可移植性、retention 故障、并发、更广类型和 Kafka 门槛。
 4. 只有完成前三项后才考虑其他数据库。
