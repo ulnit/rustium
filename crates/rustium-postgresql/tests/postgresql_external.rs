@@ -71,6 +71,7 @@ impl TestSettings {
             incremental_snapshot_chunk_size: 1_024,
             incremental_snapshot_watermarking_strategy: "insert_insert".into(),
             read_only: false,
+            hstore_handling_mode: "json".into(),
         }
     }
 }
@@ -325,12 +326,17 @@ async fn keeps_snapshot_and_streaming_type_conversion_identical() -> TestResult 
     let publication = format!("rustium_types_pub_{}", &suffix[..12]);
     let slot_name = format!("rustium_types_slot_{}", &suffix[..12]);
     let connector_name = format!("postgresql-types-{}", &suffix[..12]);
+    let domain_name = format!("rustium_amount_{}", &suffix[..12]);
+    let enum_name = format!("rustium_state_{}", &suffix[..12]);
     let (client, connection_task) = connect(&settings).await?;
 
     let outcome = async {
         client
             .batch_execute(&format!(
-                "CREATE TABLE public.{table_name} (\
+                "CREATE EXTENSION IF NOT EXISTS hstore; \
+                 CREATE DOMAIN public.{domain_name} AS NUMERIC(12,4); \
+                 CREATE TYPE public.{enum_name} AS ENUM ('ready', 'done'); \
+                 CREATE TABLE public.{table_name} (\
                     id BIGINT PRIMARY KEY, \
                     flag BOOLEAN NOT NULL, \
                     small_value SMALLINT NOT NULL, \
@@ -358,6 +364,12 @@ async fn keeps_snapshot_and_streaming_type_conversion_identical() -> TestResult 
                     bits BIT(4) NOT NULL, \
                     duration INTERVAL NOT NULL, \
                     int_range INT4RANGE NOT NULL, \
+                    attributes HSTORE NOT NULL, \
+                    attribute_values HSTORE[] NOT NULL, \
+                    domain_value public.{domain_name} NOT NULL, \
+                    domain_values public.{domain_name}[] NOT NULL, \
+                    state public.{enum_name} NOT NULL, \
+                    search_vector TSVECTOR NOT NULL, \
                     nullable_value TEXT\
                  ); \
                  CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
@@ -441,7 +453,17 @@ async fn keeps_snapshot_and_streaming_type_conversion_identical() -> TestResult 
     }
     .await;
 
-    let cleanup_result = cleanup(&client, &publication, &slot_name, &[&table_name]).await;
+    let cleanup_result: TestResult = async {
+        cleanup(&client, &publication, &slot_name, &[&table_name]).await?;
+        client
+            .batch_execute(&format!(
+                "DROP DOMAIN IF EXISTS public.{domain_name}; \
+                 DROP TYPE IF EXISTS public.{enum_name};"
+            ))
+            .await?;
+        Ok(())
+    }
+    .await;
     connection_task.abort();
 
     if let Err(cleanup_error) = cleanup_result {
@@ -1284,7 +1306,9 @@ async fn insert_type_row(client: &Client, table_name: &str, id: i64) -> TestResu
                    payload, token, event_date, event_time, event_time_tz,
                    event_timestamp, event_timestamp_tz, binary_value,
                    text_values, integer_values, uuid_values,
-                   network, network_block, mac, bits, duration, int_range, nullable_value
+                   network, network_block, mac, bits, duration, int_range,
+                   attributes, attribute_values, domain_value, domain_values,
+                   state, search_vector, nullable_value
                ) VALUES (
                    {id}, TRUE, -12, 345678, 9223372036854770000,
                    1.25, -12.5, 'Infinity'::double precision,
@@ -1302,7 +1326,11 @@ async fn insert_type_row(client: &Client, table_name: &str, id: i64) -> TestResu
                          '123e4567-e89b-12d3-a456-426614174000'::uuid],
                    '192.0.2.10/24'::inet, '2001:db8::/48'::cidr,
                    '08:00:2b:01:02:03'::macaddr, B'1010',
-                   '2 days 03:04:05.006'::interval, '[1,10)'::int4range, NULL
+                   '2 days 03:04:05.006'::interval, '[1,10)'::int4range,
+                   '"alpha"=>"one", "nothing"=>NULL'::hstore,
+                   ARRAY[hstore('alpha', 'one'), hstore('nothing', NULL)],
+                   12345678.2300, ARRAY[1.2300, 2.3400],
+                   'ready', to_tsvector('english', 'Rustium captures global changes'), NULL
                )"#
         ))
         .await?;
@@ -1413,6 +1441,41 @@ fn verify_type_row(row: &Row) -> TestResult {
             "string-backed PostgreSQL type conversion failed",
         )?;
     }
+    require(
+        row.get("attributes")
+            == Some(&DataValue::Json(
+                serde_json::json!({"alpha": "one", "nothing": null}),
+            )),
+        "hstore JSON conversion failed",
+    )?;
+    require(
+        row.get("attribute_values")
+            == Some(&DataValue::Array(vec![
+                DataValue::Json(serde_json::json!({"alpha": "one"})),
+                DataValue::Json(serde_json::json!({"nothing": null})),
+            ])),
+        "hstore array conversion failed",
+    )?;
+    require(
+        row.get("domain_value") == Some(&DataValue::Decimal("12345678.2300".into())),
+        "numeric domain conversion failed",
+    )?;
+    require(
+        row.get("domain_values")
+            == Some(&DataValue::Array(vec![
+                DataValue::Decimal("1.2300".into()),
+                DataValue::Decimal("2.3400".into()),
+            ])),
+        "numeric domain array conversion failed",
+    )?;
+    require(
+        row.get("state") == Some(&DataValue::String("ready".into())),
+        "enum conversion failed",
+    )?;
+    require(
+        matches!(row.get("search_vector"), Some(DataValue::String(value)) if value.contains("rustium")),
+        "tsvector conversion failed",
+    )?;
     require(
         row.get("nullable_value") == Some(&DataValue::Null),
         "SQL NULL conversion failed",

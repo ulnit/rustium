@@ -1035,8 +1035,12 @@ impl StreamingState {
             return Ok(None);
         }
 
-        let before = old_data.as_ref().map(|row| convert_row(row, &event_schema));
-        let mut after = new_data.as_ref().map(|row| convert_row(row, &event_schema));
+        let before = old_data
+            .as_ref()
+            .map(|row| convert_row(row, &event_schema, &config.hstore_handling_mode));
+        let mut after = new_data
+            .as_ref()
+            .map(|row| convert_row(row, &event_schema, &config.hstore_handling_mode));
         if let Some(after) = &mut after {
             fill_unavailable(after, before.as_ref(), &event_schema);
         }
@@ -1198,11 +1202,16 @@ fn snapshot_table(
                     let column_index = i32::try_from(column_index).map_err(|_| {
                         Error::Invariant("PostgreSQL snapshot has too many columns".into())
                     })?;
-                    let value = result
-                        .get_value(row_index, column_index)
-                        .map_or(DataValue::Null, |value| {
-                            convert_text(&value, &field.type_name)
-                        });
+                    let value = result.get_value(row_index, column_index).map_or(
+                        DataValue::Null,
+                        |value| {
+                            convert_text_with_hstore_mode(
+                                &value,
+                                &field.type_name,
+                                &config.hstore_handling_mode,
+                            )
+                        },
+                    );
                     Ok((field.name.clone(), value))
                 })
                 .collect::<Result<Row>>()?;
@@ -1361,7 +1370,16 @@ pub(crate) fn query_table_schema(
     let result = connection
         .exec(&format!(
             r#"SELECT a.attname,
-                      format_type(a.atttypid, a.atttypmod),
+                      CASE WHEN t.typtype = 'd'
+                           THEN format_type(
+                                  t.typbasetype,
+                                  CASE WHEN a.atttypmod >= 0 THEN a.atttypmod
+                                       ELSE t.typtypmod END
+                                )
+                           WHEN element_type.typtype = 'd'
+                           THEN format_type(element_type.typbasetype, element_type.typtypmod) || '[]'
+                           ELSE format_type(a.atttypid, a.atttypmod)
+                      END,
                       NOT a.attnotnull,
                       EXISTS (
                         SELECT 1
@@ -1375,6 +1393,8 @@ pub(crate) fn query_table_schema(
                FROM pg_attribute a
                JOIN pg_class c ON c.oid = a.attrelid
                JOIN pg_namespace n ON n.oid = c.relnamespace
+               JOIN pg_type t ON t.oid = a.atttypid
+               LEFT JOIN pg_type element_type ON element_type.oid = t.typelem
                WHERE n.nspname = {schema_literal}
                  AND c.relname = {table_literal}
                  AND a.attnum > 0
@@ -1420,7 +1440,7 @@ pub(crate) fn query_table_schema(
     }))
 }
 
-fn convert_row(row: &RowData, schema: &EventSchema) -> Row {
+fn convert_row(row: &RowData, schema: &EventSchema, hstore_handling_mode: &str) -> Row {
     row.iter()
         .map(|(name, value)| {
             let type_name = schema
@@ -1428,12 +1448,15 @@ fn convert_row(row: &RowData, schema: &EventSchema) -> Row {
                 .iter()
                 .find(|field| field.name == name.as_ref())
                 .map_or("text", |field| field.type_name.as_str());
-            (name.to_string(), convert_value(value, type_name))
+            (
+                name.to_string(),
+                convert_value(value, type_name, hstore_handling_mode),
+            )
         })
         .collect()
 }
 
-fn convert_value(value: &ColumnValue, type_name: &str) -> DataValue {
+fn convert_value(value: &ColumnValue, type_name: &str, hstore_handling_mode: &str) -> DataValue {
     match value {
         ColumnValue::Null => DataValue::Null,
         ColumnValue::Binary(value) => DataValue::Bytes(value.to_vec()),
@@ -1441,17 +1464,26 @@ fn convert_value(value: &ColumnValue, type_name: &str) -> DataValue {
             let Ok(value) = std::str::from_utf8(value) else {
                 return DataValue::Bytes(value.to_vec());
             };
-            convert_text(value, type_name)
+            convert_text_with_hstore_mode(value, type_name, hstore_handling_mode)
         }
     }
 }
 
+#[cfg(test)]
 pub(crate) fn convert_text(value: &str, type_name: &str) -> DataValue {
+    convert_text_with_hstore_mode(value, type_name, "json")
+}
+
+pub(crate) fn convert_text_with_hstore_mode(
+    value: &str,
+    type_name: &str,
+    hstore_handling_mode: &str,
+) -> DataValue {
     if let Some(element_type) = type_name.trim().strip_suffix("[]") {
-        return parse_postgres_array(value, element_type)
+        return parse_postgres_array(value, element_type, hstore_handling_mode)
             .unwrap_or_else(|| DataValue::String(value.into()));
     }
-    let base_type = type_name.split('(').next().unwrap_or(type_name).trim();
+    let base_type = unqualified_base_type(type_name);
     match base_type {
         "boolean" => DataValue::Boolean(matches!(value, "t" | "true" | "1")),
         "smallint" | "integer" => value
@@ -1481,11 +1513,196 @@ pub(crate) fn convert_text(value: &str, type_name: &str) -> DataValue {
         }
         "bytea" if value.starts_with("\\x") => hex_decode(&value[2..])
             .map_or_else(|| DataValue::String(value.into()), DataValue::Bytes),
+        "hstore" => parse_hstore(value).map_or_else(
+            || DataValue::String(value.into()),
+            |values| hstore_value(values, hstore_handling_mode),
+        ),
+        "vector" | "halfvec" => parse_dense_vector(value)
+            .map_or_else(|| DataValue::String(value.into()), DataValue::Array),
+        "sparsevec" => parse_sparse_vector(value)
+            .map_or_else(|| DataValue::String(value.into()), DataValue::Map),
+        "geometry" | "geography" => hex_decode(value.strip_prefix("\\x").unwrap_or(value))
+            .map_or_else(|| DataValue::String(value.into()), DataValue::Bytes),
         _ => DataValue::String(value.into()),
     }
 }
 
-fn parse_postgres_array(value: &str, element_type: &str) -> Option<DataValue> {
+fn unqualified_base_type(type_name: &str) -> &str {
+    type_name
+        .split('(')
+        .next()
+        .unwrap_or(type_name)
+        .trim()
+        .rsplit('.')
+        .next()
+        .unwrap_or(type_name)
+        .trim()
+        .trim_matches('"')
+}
+
+fn hstore_value(values: BTreeMap<String, Option<String>>, hstore_handling_mode: &str) -> DataValue {
+    if hstore_handling_mode == "map" {
+        return DataValue::Map(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, value.map_or(DataValue::Null, DataValue::String)))
+                .collect(),
+        );
+    }
+    DataValue::Json(
+        values
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key,
+                    value.map_or(serde_json::Value::Null, serde_json::Value::String),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into(),
+    )
+}
+
+fn parse_hstore(value: &str) -> Option<BTreeMap<String, Option<String>>> {
+    let mut parser = HstoreParser {
+        input: value,
+        index: 0,
+    };
+    let mut values = BTreeMap::new();
+    parser.skip_whitespace();
+    if parser.peek().is_none() {
+        return Some(values);
+    }
+    loop {
+        let key = parser.parse_string()?;
+        parser.skip_whitespace();
+        parser.consume('=')?;
+        parser.consume('>')?;
+        parser.skip_whitespace();
+        let entry_value = if parser.remaining_starts_with_null() {
+            parser.index += 4;
+            None
+        } else {
+            Some(parser.parse_string()?)
+        };
+        values.insert(key, entry_value);
+        parser.skip_whitespace();
+        match parser.peek() {
+            None => return Some(values),
+            Some(',') => {
+                parser.consume(',')?;
+                parser.skip_whitespace();
+            }
+            Some(_) => return None,
+        }
+    }
+}
+
+struct HstoreParser<'a> {
+    input: &'a str,
+    index: usize,
+}
+
+impl HstoreParser<'_> {
+    fn parse_string(&mut self) -> Option<String> {
+        if self.peek()? == '"' {
+            self.consume('"')?;
+            let mut output = String::new();
+            loop {
+                match self.peek()? {
+                    '"' => {
+                        self.consume('"')?;
+                        return Some(output);
+                    }
+                    '\\' => {
+                        self.consume('\\')?;
+                        output.push(self.take()?);
+                    }
+                    _ => output.push(self.take()?),
+                }
+            }
+        }
+        let start = self.index;
+        while self
+            .peek()
+            .is_some_and(|character| !character.is_whitespace() && !matches!(character, '=' | ','))
+        {
+            self.take()?;
+        }
+        (self.index > start).then(|| self.input[start..self.index].to_string())
+    }
+
+    fn remaining_starts_with_null(&self) -> bool {
+        self.input[self.index..]
+            .strip_prefix("NULL")
+            .is_some_and(|remaining| {
+                remaining
+                    .chars()
+                    .next()
+                    .is_none_or(|character| character.is_whitespace() || character == ',')
+            })
+    }
+
+    fn consume(&mut self, expected: char) -> Option<()> {
+        (self.take()? == expected).then_some(())
+    }
+
+    fn take(&mut self) -> Option<char> {
+        let character = self.peek()?;
+        self.index += character.len_utf8();
+        Some(character)
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.input[self.index..].chars().next()
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.peek().is_some_and(char::is_whitespace) {
+            self.take();
+        }
+    }
+}
+
+fn parse_dense_vector(value: &str) -> Option<Vec<DataValue>> {
+    let values = value.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
+    if values.is_empty() {
+        return Some(Vec::new());
+    }
+    values
+        .split(',')
+        .map(|value| value.trim().parse::<f64>().ok().map(DataValue::Float64))
+        .collect()
+}
+
+fn parse_sparse_vector(value: &str) -> Option<BTreeMap<String, DataValue>> {
+    let (entries, dimensions) = value.trim().split_once('/')?;
+    let dimensions = dimensions.trim().parse::<i32>().ok()?;
+    let entries = entries.trim().strip_prefix('{')?.strip_suffix('}')?.trim();
+    let vector = if entries.is_empty() {
+        BTreeMap::new()
+    } else {
+        entries
+            .split(',')
+            .map(|entry| {
+                let (index, value) = entry.trim().split_once(':')?;
+                let index = index.trim().parse::<i16>().ok()?.to_string();
+                let value = value.trim().parse::<f64>().ok()?;
+                Some((index, DataValue::Float64(value)))
+            })
+            .collect::<Option<BTreeMap<_, _>>>()?
+    };
+    Some(BTreeMap::from([
+        ("dimensions".into(), DataValue::Int32(dimensions)),
+        ("vector".into(), DataValue::Map(vector)),
+    ]))
+}
+
+fn parse_postgres_array(
+    value: &str,
+    element_type: &str,
+    hstore_handling_mode: &str,
+) -> Option<DataValue> {
     let start = value.find('{')?;
     let dimensions = &value[..start];
     if !(dimensions.is_empty() || dimensions.starts_with('[') && dimensions.ends_with("]=")) {
@@ -1505,6 +1722,7 @@ fn parse_postgres_array(value: &str, element_type: &str) -> Option<DataValue> {
         index: start,
         delimiter,
         element_type,
+        hstore_handling_mode,
     };
     let parsed = parser.parse_array()?;
     parser.skip_whitespace();
@@ -1516,6 +1734,7 @@ struct PostgresArrayParser<'a> {
     index: usize,
     delimiter: u8,
     element_type: &'a str,
+    hstore_handling_mode: &'a str,
 }
 
 impl PostgresArrayParser<'_> {
@@ -1556,7 +1775,11 @@ impl PostgresArrayParser<'_> {
                     b'"' => {
                         self.index += 1;
                         let value = std::str::from_utf8(&value).ok()?;
-                        return Some(convert_text(value, self.element_type));
+                        return Some(convert_text_with_hstore_mode(
+                            value,
+                            self.element_type,
+                            self.hstore_handling_mode,
+                        ));
                     }
                     b'\\' => {
                         self.index += 1;
@@ -1592,7 +1815,11 @@ impl PostgresArrayParser<'_> {
         if value == "NULL" {
             Some(DataValue::Null)
         } else {
-            Some(convert_text(value, self.element_type))
+            Some(convert_text_with_hstore_mode(
+                value,
+                self.element_type,
+                self.hstore_handling_mode,
+            ))
         }
     }
 
@@ -1768,6 +1995,67 @@ mod tests {
     }
 
     #[test]
+    fn converts_hstore_json_map_and_arrays() {
+        let value = r#""alpha"=>"one", "escaped\"key"=>"slash\\value", "nothing"=>NULL"#;
+        assert_eq!(
+            convert_text(value, "\"extensions\".\"hstore\""),
+            DataValue::Json(serde_json::json!({
+                "alpha": "one",
+                "escaped\"key": "slash\\value",
+                "nothing": null
+            }))
+        );
+        assert_eq!(
+            convert_text_with_hstore_mode(value, "hstore", "map"),
+            DataValue::Map(BTreeMap::from([
+                ("alpha".into(), DataValue::String("one".into())),
+                (
+                    "escaped\"key".into(),
+                    DataValue::String("slash\\value".into())
+                ),
+                ("nothing".into(), DataValue::Null),
+            ]))
+        );
+        assert!(matches!(
+            convert_text(r#"{"\"alpha\"=>\"one\"",NULL}"#, "hstore[]"),
+            DataValue::Array(values)
+                if matches!(values.as_slice(), [DataValue::Json(_), DataValue::Null])
+        ));
+    }
+
+    #[test]
+    fn converts_postgres_vectors_and_spatial_binary() {
+        assert_eq!(
+            convert_text("[1, 2.5, -3]", "pgvector.vector(3)"),
+            DataValue::Array(vec![
+                DataValue::Float64(1.0),
+                DataValue::Float64(2.5),
+                DataValue::Float64(-3.0),
+            ])
+        );
+        assert_eq!(
+            convert_text("{1:1.5, 9:-2}/12", "sparsevec(12)"),
+            DataValue::Map(BTreeMap::from([
+                ("dimensions".into(), DataValue::Int32(12)),
+                (
+                    "vector".into(),
+                    DataValue::Map(BTreeMap::from([
+                        ("1".into(), DataValue::Float64(1.5)),
+                        ("9".into(), DataValue::Float64(-2.0)),
+                    ])),
+                ),
+            ]))
+        );
+        assert_eq!(
+            convert_text(
+                "0101000000000000000000F03F0000000000000040",
+                "postgis.geometry(Point,4326)",
+            ),
+            DataValue::Bytes(hex_decode("0101000000000000000000F03F0000000000000040").unwrap())
+        );
+    }
+
+    #[test]
     fn fills_missing_toast_columns() {
         let schema = EventSchema {
             name: "test".into(),
@@ -1863,6 +2151,7 @@ mod tests {
             incremental_snapshot_chunk_size: 1_024,
             incremental_snapshot_watermarking_strategy: "insert_insert".into(),
             read_only: false,
+            hstore_handling_mode: "json".into(),
         };
         let mut source = PostgresSource::new(
             "inventory-postgresql",

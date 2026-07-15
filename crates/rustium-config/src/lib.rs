@@ -198,6 +198,13 @@ impl SourceConfig {
                         );
                 }
                 semantic
+                    .as_object_mut()
+                    .expect("source semantic is an object")
+                    .insert(
+                        "hstore_handling_mode".into(),
+                        config.hstore_handling_mode.clone().into(),
+                    );
+                semantic
             }
             Self::Mysql(config) => serde_json::json!({
                 "type": "mysql",
@@ -259,6 +266,8 @@ pub struct PostgresSourceConfig {
     pub incremental_snapshot_watermarking_strategy: String,
     #[serde(default)]
     pub read_only: bool,
+    #[serde(default = "default_hstore_handling_mode")]
+    pub hstore_handling_mode: String,
 }
 
 impl PostgresSourceConfig {
@@ -296,6 +305,11 @@ impl PostgresSourceConfig {
             return Err(Error::Configuration(
                 "source.incremental_snapshot_watermarking_strategy currently supports only insert_insert"
                     .into(),
+            ));
+        }
+        if !matches!(self.hstore_handling_mode.as_str(), "json" | "map") {
+            return Err(Error::Configuration(
+                "source.hstore_handling_mode must be json or map".into(),
             ));
         }
         if let Some(collection) = &self.signal_data_collection {
@@ -924,6 +938,9 @@ const fn default_incremental_snapshot_chunk_size() -> usize {
 fn default_incremental_snapshot_watermarking_strategy() -> String {
     "insert_insert".into()
 }
+fn default_hstore_handling_mode() -> String {
+    "json".into()
+}
 fn default_unavailable_value() -> String {
     "__rustium_unavailable_value".into()
 }
@@ -1004,6 +1021,10 @@ sink:
                 .connection_url(true)
                 .unwrap()
                 .contains("replication=database")
+        );
+        assert_eq!(
+            config.source.as_postgresql().unwrap().hstore_handling_mode,
+            "json"
         );
     }
 

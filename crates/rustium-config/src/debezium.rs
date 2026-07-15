@@ -129,6 +129,10 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 .cloned()
                 .unwrap_or_else(default_incremental_snapshot_watermarking_strategy),
             read_only: bool_value(&properties, "read.only", false)?,
+            hstore_handling_mode: properties
+                .get("hstore.handling.mode")
+                .map(|mode| mode.to_ascii_lowercase())
+                .unwrap_or_else(default_hstore_handling_mode),
         }),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -667,6 +671,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "incremental.snapshot.allow.schema.changes",
         "incremental.snapshot.watermarking.strategy",
         "read.only",
+        "hstore.handling.mode",
         "offset.storage.file.filename",
         "bootstrap.servers",
         "rustium.sink.type",
@@ -724,6 +729,7 @@ incremental.snapshot.chunk.size=128
 incremental.snapshot.allow.schema.changes=false
 incremental.snapshot.watermarking.strategy=insert_insert
 read.only=true
+hstore.handling.mode=map
 max.queue.size=4096
 max.batch.size=1000
 "#,
@@ -754,6 +760,7 @@ max.batch.size=1000
             "insert_insert"
         );
         assert!(source.read_only);
+        assert_eq!(source.hstore_handling_mode, "map");
         assert!(!config.format.tombstones_on_delete);
         assert!(
             config

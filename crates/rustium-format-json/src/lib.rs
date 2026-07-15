@@ -326,6 +326,10 @@ mod tests {
             after: Some(indexmap! {
                 "id".into() => DataValue::Int64(1),
                 "name".into() => DataValue::String("Alice".into()),
+                "attributes".into() => DataValue::Map(BTreeMap::from([
+                    ("region".into(), DataValue::String("global".into())),
+                    ("optional".into(), DataValue::Null),
+                ])),
             }),
             schema: EventSchema {
                 name: "orders.app.public.customers.Envelope".into(),
@@ -358,6 +362,8 @@ mod tests {
         assert_eq!(encoded.destination, "app.app.public.customers");
         assert_eq!(value["op"], "c");
         assert_eq!(value["after"]["name"], "Alice");
+        assert_eq!(value["after"]["attributes"]["region"], "global");
+        assert!(value["after"]["attributes"]["optional"].is_null());
         assert!(encoded.key.is_some());
     }
 

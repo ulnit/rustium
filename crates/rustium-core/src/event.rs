@@ -45,6 +45,7 @@ pub enum DataValue {
     Uuid(Uuid),
     Json(serde_json::Value),
     Array(Vec<DataValue>),
+    Map(BTreeMap<String, DataValue>),
     Unavailable,
 }
 
@@ -71,6 +72,11 @@ impl DataValue {
                 .iter()
                 .map(|value| value.to_json(unavailable_value))
                 .collect::<Vec<_>>()
+                .into(),
+            Self::Map(values) => values
+                .iter()
+                .map(|(key, value)| (key.clone(), value.to_json(unavailable_value)))
+                .collect::<serde_json::Map<_, _>>()
                 .into(),
             Self::Unavailable => unavailable_value.into(),
         }

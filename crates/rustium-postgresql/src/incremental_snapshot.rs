@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use crate::{
     schema_history::{IncrementalSnapshotProgress, TableSchema},
-    source::{convert_text, query_table_schema},
+    source::{convert_text_with_hstore_mode, query_table_schema},
 };
 
 const EXECUTE_SNAPSHOT: &str = "execute-snapshot";
@@ -734,11 +734,16 @@ fn prepare_chunk(
                 let column_index = i32::try_from(column_index).map_err(|_| {
                     Error::Invariant("incremental snapshot has too many columns".into())
                 })?;
-                let value = result
-                    .get_value(row_index, column_index)
-                    .map_or(DataValue::Null, |value| {
-                        convert_text(&value, &field.type_name)
-                    });
+                let value =
+                    result
+                        .get_value(row_index, column_index)
+                        .map_or(DataValue::Null, |value| {
+                            convert_text_with_hstore_mode(
+                                &value,
+                                &field.type_name,
+                                &input.catalog_config.hstore_handling_mode,
+                            )
+                        });
                 Ok((field.name.clone(), value))
             })
             .collect::<Result<Row>>()?;
@@ -1001,6 +1006,7 @@ fn data_value_text(value: &DataValue) -> Option<String> {
         | DataValue::Bytes(_)
         | DataValue::Json(_)
         | DataValue::Array(_)
+        | DataValue::Map(_)
         | DataValue::Unavailable => None,
     }
 }
