@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pg_walstream::{
     ChangeEvent as WalEvent, ColumnValue, EventType, LogicalReplicationStream,
-    PgReplicationConnection, ReplicationSlotOptions, ReplicationStreamConfig, RetryConfig, RowData,
-    StreamingMode, parse_lsn,
+    PgReplicationConnection, RelationColumn, ReplicationSlotOptions, ReplicationStreamConfig,
+    RetryConfig, RowData, StreamingMode, parse_lsn,
     sql_builder::{quote_ident, quote_literal},
 };
 use rustium_config::{PostgresSourceConfig, SlotOwnership, SnapshotConfig, SnapshotMode};
@@ -21,20 +21,12 @@ use rustium_core::{
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
+use crate::schema_history::{
+    PostgresColumnType, TableSchema, decode_schema_history, encode_schema_history,
+    schema_from_relation,
+};
+
 const CONNECTOR_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Debug, Clone)]
-struct TableSchema {
-    schema: String,
-    table: String,
-    event_schema: EventSchema,
-}
-
-impl TableSchema {
-    fn key(&self) -> (String, String) {
-        (self.schema.clone(), self.table.clone())
-    }
-}
 
 #[derive(Debug, Clone)]
 struct ActiveTransaction {
@@ -173,15 +165,45 @@ impl PostgresSource {
         .map_err(|error| Error::Source(format!("slot preparation task failed: {error}")))?
     }
 
-    async fn refresh_table_schema(&self, schema: String, table: String) -> Result<TableSchema> {
+    async fn relation_table_schema(
+        &self,
+        schema: String,
+        table: String,
+        columns: Vec<RelationColumn>,
+        previous: Option<TableSchema>,
+    ) -> Result<TableSchema> {
         let connection_url = self.config.connection_url(false)?;
         let config = self.config.clone();
         tokio::task::spawn_blocking(move || {
             let mut connection = connect(&connection_url)?;
-            discover_table_schema(&mut connection, &config, &schema, &table)
+            let catalog = query_table_schema(&mut connection, &config, &schema, &table)?;
+            let resolved_type_names = columns
+                .iter()
+                .map(|column| {
+                    scalar(
+                        &mut connection,
+                        &format!(
+                            "SELECT format_type({}::oid, {})",
+                            column.type_id, column.type_modifier
+                        ),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            schema_from_relation(
+                &schema,
+                &table,
+                format!(
+                    "{}.{}.{}.{}.Envelope",
+                    config.slot_name, config.database, schema, table
+                ),
+                &columns,
+                &resolved_type_names,
+                previous.as_ref(),
+                catalog.as_ref(),
+            )
         })
         .await
-        .map_err(|error| Error::Source(format!("schema refresh task failed: {error}")))?
+        .map_err(|error| Error::Source(format!("relation schema task failed: {error}")))?
     }
 
     async fn run_snapshot(
@@ -242,7 +264,7 @@ impl PostgresSource {
                         snapshot: true,
                     }),
                     boundary: RecordBoundary::SnapshotComplete,
-                    connector_state: None,
+                    connector_state: Some(encode_schema_history(&schemas)?),
                 }))
                 .map_err(|_| Error::Cancelled)?;
             Ok(SnapshotOutcome {
@@ -273,6 +295,20 @@ impl SourceConnector for PostgresSource {
                 .as_ref()
                 .is_none_or(|checkpoint| !checkpoint.snapshot_completed),
         };
+
+        if !snapshot_needed {
+            if let Some(connector_state) = checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.connector_state.as_ref())
+            {
+                self.schemas = decode_schema_history(connector_state)?;
+            } else if checkpoint.is_some() {
+                return Err(Error::State(
+                    "PostgreSQL checkpoint predates persistent schema history and cannot safely replay relation changes; reset the checkpoint and run a new initial snapshot"
+                        .into(),
+                ));
+            }
+        }
 
         if snapshot_needed {
             self.prepare_snapshot_slot().await?;
@@ -310,7 +346,9 @@ impl SourceConnector for PostgresSource {
             },
             None => None,
         };
-        let mut resume_position = checkpoint.map(|checkpoint| checkpoint.source_position);
+        let mut resume_position = checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.source_position.clone());
 
         if snapshot_needed {
             stream.ensure_replication_slot().await.map_err(pg_error)?;
@@ -337,7 +375,11 @@ impl SourceConnector for PostgresSource {
             feedback.update_applied_lsn(position.commit_lsn.unwrap_or(position.lsn));
         }
 
-        let mut state = StreamingState::new(self.schemas.clone(), resume_position);
+        let mut state = StreamingState::new(
+            self.schemas.clone(),
+            resume_position,
+            !snapshot_needed && checkpoint.is_none(),
+        );
         info!(
             connector = %self.connector_name,
             slot = %self.config.slot_name,
@@ -373,15 +415,29 @@ impl SourceConnector for PostgresSource {
                         EventType::Relation {
                             namespace,
                             relation_name,
+                            columns,
                             ..
                         } if self.config.tables.includes(namespace, relation_name) => {
-                            Some((namespace.to_string(), relation_name.to_string()))
+                            Some((
+                                namespace.to_string(),
+                                relation_name.to_string(),
+                                columns.clone(),
+                            ))
                         }
                         _ => None,
                     };
-                    if let Some((schema_name, table_name)) = relation {
+                    if let Some((schema_name, table_name, columns)) = relation {
+                        let previous = state
+                            .schemas
+                            .get(&(schema_name.clone(), table_name.clone()))
+                            .cloned();
                         let refreshed = self
-                            .refresh_table_schema(schema_name.clone(), table_name.clone())
+                            .relation_table_schema(
+                                schema_name.clone(),
+                                table_name.clone(),
+                                columns,
+                                previous,
+                            )
                             .await?;
                         if let Some(version) = state.refresh_schema(refreshed) {
                             info!(
@@ -392,11 +448,15 @@ impl SourceConnector for PostgresSource {
                             );
                         }
                     }
-                    if let Some(record) = state.convert(
+                    if let Some(mut record) = state.convert(
                         event,
                         &self.connector_name,
                         &self.config,
                     )? {
+                        if state.schema_dirty {
+                            record.connector_state = Some(encode_schema_history(&state.schemas)?);
+                            state.schema_dirty = false;
+                        }
                         context.output.send(Ok(record)).await.map_err(|_| Error::Cancelled)?;
                     }
                 }
@@ -407,6 +467,7 @@ impl SourceConnector for PostgresSource {
 
 struct StreamingState {
     schemas: HashMap<(String, String), TableSchema>,
+    schema_dirty: bool,
     transaction: Option<ActiveTransaction>,
     previous_lsn: Option<u64>,
     event_serial: u64,
@@ -417,9 +478,11 @@ impl StreamingState {
     fn new(
         schemas: HashMap<(String, String), TableSchema>,
         resume_position: Option<SourcePosition>,
+        schema_dirty: bool,
     ) -> Self {
         Self {
             schemas,
+            schema_dirty,
             transaction: None,
             previous_lsn: None,
             event_serial: 0,
@@ -576,7 +639,10 @@ impl StreamingState {
     fn refresh_schema(&mut self, mut refreshed: TableSchema) -> Option<u32> {
         let key = refreshed.key();
         let changed = match self.schemas.get(&key) {
-            Some(current) if current.event_schema.fields == refreshed.event_schema.fields => {
+            Some(current)
+                if current.event_schema.fields == refreshed.event_schema.fields
+                    && current.column_types == refreshed.column_types =>
+            {
                 refreshed.event_schema.version = current.event_schema.version;
                 false
             }
@@ -588,6 +654,7 @@ impl StreamingState {
         };
         let version = refreshed.event_schema.version;
         self.schemas.insert(key, refreshed);
+        self.schema_dirty |= changed;
         changed.then_some(version)
     }
 
@@ -849,6 +916,16 @@ fn discover_table_schema(
     schema: &str,
     table: &str,
 ) -> Result<TableSchema> {
+    query_table_schema(connection, config, schema, table)?
+        .ok_or_else(|| Error::Source(format!("could not discover columns for {schema}.{table}")))
+}
+
+fn query_table_schema(
+    connection: &mut PgReplicationConnection,
+    config: &PostgresSourceConfig,
+    schema: &str,
+    table: &str,
+) -> Result<Option<TableSchema>> {
     let schema_literal = quote_literal(schema).map_err(pg_error)?;
     let table_literal = quote_literal(table).map_err(pg_error)?;
     let result = connection
@@ -862,7 +939,9 @@ fn discover_table_schema(
                         WHERE i.indrelid = c.oid
                           AND i.indisprimary
                           AND a.attnum = ANY(i.indkey)
-                      )::text
+                      )::text,
+                      a.atttypid::oid::text,
+                      a.atttypmod::text
                FROM pg_attribute a
                JOIN pg_class c ON c.oid = a.attrelid
                JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -874,20 +953,29 @@ fn discover_table_schema(
         ))
         .map_err(pg_error)?;
     let mut fields = Vec::with_capacity(result.ntuples() as usize);
+    let mut column_types = Vec::with_capacity(result.ntuples() as usize);
     for index in 0..result.ntuples() {
+        let name = required_value(&result, index, 0, "column name")?;
         fields.push(FieldSchema {
-            name: required_value(&result, index, 0, "column name")?,
+            name: name.clone(),
             type_name: required_value(&result, index, 1, "column type")?,
             optional: required_value(&result, index, 2, "column optionality")? == "t",
             primary_key: required_value(&result, index, 3, "column key state")? == "t",
         });
+        column_types.push(PostgresColumnType {
+            name,
+            type_oid: required_value(&result, index, 4, "column type OID")?
+                .parse()
+                .map_err(|error| Error::Source(format!("invalid column type OID: {error}")))?,
+            type_modifier: required_value(&result, index, 5, "column type modifier")?
+                .parse()
+                .map_err(|error| Error::Source(format!("invalid column type modifier: {error}")))?,
+        });
     }
     if fields.is_empty() {
-        return Err(Error::Source(format!(
-            "could not discover columns for {schema}.{table}"
-        )));
+        return Ok(None);
     }
-    Ok(TableSchema {
+    Ok(Some(TableSchema {
         schema: schema.into(),
         table: table.into(),
         event_schema: EventSchema {
@@ -898,7 +986,8 @@ fn discover_table_schema(
             version: 1,
             fields,
         },
-    })
+        column_types,
+    }))
 }
 
 fn convert_row(row: &RowData, schema: &EventSchema) -> Row {
@@ -1066,7 +1155,13 @@ fn hex_decode(value: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use indexmap::IndexMap;
+    use rustium_config::TableSelection;
+    use rustium_core::{Checkpoint, ConnectorIdentity};
+    use tokio::sync::{mpsc, watch};
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
 
@@ -1120,9 +1215,17 @@ mod tests {
                     primary_key: true,
                 }],
             },
+            column_types: vec![PostgresColumnType {
+                name: "id".into(),
+                type_oid: 20,
+                type_modifier: -1,
+            }],
         };
-        let mut state =
-            StreamingState::new(HashMap::from([(original.key(), original.clone())]), None);
+        let mut state = StreamingState::new(
+            HashMap::from([(original.key(), original.clone())]),
+            None,
+            false,
+        );
 
         assert_eq!(state.refresh_schema(original.clone()), None);
         let mut changed = original;
@@ -1132,12 +1235,75 @@ mod tests {
             optional: false,
             primary_key: false,
         });
+        changed.column_types.push(PostgresColumnType {
+            name: "status".into(),
+            type_oid: 25,
+            type_modifier: -1,
+        });
         assert_eq!(state.refresh_schema(changed), Some(2));
         assert_eq!(
             state.schemas[&("public".into(), "orders".into())]
                 .event_schema
                 .version,
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_legacy_postgres_checkpoint_without_schema_history() {
+        let config = PostgresSourceConfig {
+            hostname: "localhost".into(),
+            port: 5432,
+            database: "inventory".into(),
+            username: "rustium".into(),
+            password: "secret".into(),
+            publication: "orders_publication".into(),
+            slot_name: "orders_slot".into(),
+            slot_ownership: SlotOwnership::Managed,
+            tables: TableSelection::default(),
+            ssl_mode: "disable".into(),
+            connect_timeout: Duration::from_secs(1),
+        };
+        let mut source = PostgresSource::new(
+            "inventory-postgresql",
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+            },
+        );
+        let position = SourcePosition::Postgres(PostgresPosition {
+            lsn: 128,
+            commit_lsn: Some(128),
+            transaction_id: None,
+            event_serial: 1,
+            snapshot: false,
+        });
+        let checkpoint = Checkpoint {
+            schema_version: 1,
+            connector_name: "inventory-postgresql".into(),
+            generation: ConnectorIdentity::new("inventory-postgresql").generation,
+            source_position: position.clone(),
+            snapshot_completed: true,
+            config_fingerprint: "legacy".into(),
+            updated_at: SystemTime::now(),
+            connector_state: None,
+        };
+        let (output, _records) = mpsc::channel(1);
+        let (_acknowledged, acknowledgements) = watch::channel(Some(position));
+
+        let error = source
+            .run(SourceContext {
+                output,
+                acknowledged: acknowledgements,
+                initial_checkpoint: Some(checkpoint),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, Error::State(message) if message.contains("predates persistent schema history"))
         );
     }
 }

@@ -1997,6 +1997,7 @@ dependencies = [
  "pg_walstream",
  "rustium-config",
  "rustium-core",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

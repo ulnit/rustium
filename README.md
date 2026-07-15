@@ -41,7 +41,7 @@ The repository contains a runnable alpha implementation.
 | Native JSON and Debezium-compatible JSON | Implemented |
 | stdout sink | Implemented |
 | Kafka sink with idempotent producer settings | Implemented; end-to-end Kafka test pending |
-| PostgreSQL 14+ snapshot and `pgoutput` streaming | Implemented; external integration test passes with PostgreSQL 17 |
+| PostgreSQL 14+ snapshot, `pgoutput`, and persistent schema history | Implemented; destructive-DDL restart gate passes with PostgreSQL 17 |
 | MySQL 8+ snapshot, row-binlog streaming, and persistent schema history | Implemented; Docker and external destructive-DDL restart gates pass with MySQL 8.4 |
 | SQL Server CDC | Implemented; external integration test passes with SQL Server 2022 Developer CU25 |
 | CLI, health, status, stop, and Prometheus endpoints | Implemented |
@@ -126,7 +126,7 @@ export RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
 ```
 
-The test creates uniquely named tables, publications, and managed replication slots. It covers snapshot handoff, transaction ordering and boundaries, relation-driven schema refresh after adding a column, checkpoint restart without a repeated snapshot, and resource cleanup.
+The test creates uniquely named tables, publications, and managed replication slots. It covers snapshot handoff, transaction ordering, checkpoint stop, an old-schema row, destructive drop/add-column DDL, a new-schema row, historical `Relation` replay with schema versions 1 and 2, restart without a repeated snapshot, and cleanup.
 
 Run the external SQL Server 2017+ CDC integration test without storing credentials in the repository:
 
@@ -172,11 +172,14 @@ Implemented behavior:
 - restart recovery from SQLite checkpoints
 - replication feedback only after sink acknowledgement and checkpoint persistence
 - schema discovery and table include/exclude regular expressions
-- relation-driven schema refresh with version increments after table DDL
+- checkpointed PostgreSQL schema history restored before WAL replay
+- relation-driven historical column layout, type OID/typmod, key metadata, and schema version increments after table DDL
 
 The source requires `wal_level=logical`, an existing publication, and a user with the required replication and table-read permissions. See [examples/postgresql.yaml](examples/postgresql.yaml).
 
-Known PostgreSQL gaps include incremental snapshots/signaling, tombstones, durable schema history across restarts, broader type and failure fixtures, and Kafka end-to-end recovery coverage.
+Checkpoint v1 JSON remains readable, but a completed PostgreSQL v1 checkpoint has no historical Relation baseline and is rejected for resume. Reset it and run one new initial snapshot to establish checkpoint v2 schema history.
+
+Known PostgreSQL gaps include incremental snapshots/signaling, tombstones, transient-column optionality/default reconstruction beyond what `Relation` carries, broader type and failure fixtures, and Kafka end-to-end recovery coverage.
 
 ### MySQL
 
@@ -341,7 +344,7 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 | 原生 JSON 与 Debezium 兼容 JSON | 已实现 |
 | stdout Sink | 已实现 |
 | 带幂等 Producer 设置的 Kafka Sink | 已实现；Kafka 端到端测试待补 |
-| PostgreSQL 14+ 快照与 `pgoutput` 流式捕获 | 已实现；PostgreSQL 17 外部集成测试通过 |
+| PostgreSQL 14+ 快照、`pgoutput` 与持久 schema history | 已实现；PostgreSQL 17 破坏性 DDL 重启门槛通过 |
 | MySQL 8+ 快照、行级 binlog 与持久 schema history | 已实现；MySQL 8.4 Docker 和外部破坏性 DDL 重启门槛通过 |
 | SQL Server CDC | 已实现；SQL Server 2022 Developer CU25 外部集成测试通过 |
 | CLI、健康、状态、停止和 Prometheus 端点 | 已实现 |
@@ -426,7 +429,7 @@ export RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
 ```
 
-测试会创建唯一命名的表、publication 和托管 replication slot，覆盖快照切换、事务顺序与边界、新增列后的 Relation 驱动 schema 刷新、从 checkpoint 重启且不重复快照，以及资源清理。
+测试会创建唯一命名的表、publication 和托管 replication slot，覆盖快照切换、事务顺序、checkpoint 停止、旧 schema 行、破坏性删列/加列 DDL、新 schema 行、schema version 1 和 2 的历史 `Relation` 重放、重启不重复快照，以及资源清理。
 
 运行外部 SQL Server 2017+ CDC 集成测试，凭据无需存入仓库：
 
@@ -472,11 +475,14 @@ PostgreSQL 连接器使用逻辑复制和 `pgoutput` 协议版本 2。
 - 从 SQLite checkpoint 重启恢复
 - 仅在 Sink 确认和 checkpoint 持久化后发送复制反馈
 - schema 发现与表 include/exclude 正则过滤
-- 表 DDL 后由 Relation 消息驱动 schema 刷新并递增版本
+- 持久化 PostgreSQL schema history，并在 WAL 重放前恢复
+- 表 DDL 后由 Relation 消息驱动历史列布局、类型 OID/typmod、key 元数据和 schema 版本递增
 
 Source 需要 `wal_level=logical`、已存在的 publication，以及具备复制和表读取权限的用户。配置示例见 [examples/postgresql.yaml](examples/postgresql.yaml)。
 
-PostgreSQL 已知缺口包括增量快照/信号、tombstone、跨重启持久 schema history、更广的类型与故障样例，以及 Kafka 端到端恢复覆盖。
+Checkpoint v1 JSON 仍可读取，但已完成的 PostgreSQL v1 checkpoint 不含历史 Relation 基线，因此会拒绝恢复。升级后需要重置该 checkpoint 并执行一次新的 initial snapshot，以建立 checkpoint v2 schema history。
+
+PostgreSQL 已知缺口包括增量快照/信号、tombstone、超出 `Relation` 信息范围的短暂历史列可空性/default 重建、更广的类型与故障样例，以及 Kafka 端到端恢复覆盖。
 
 ### MySQL
 

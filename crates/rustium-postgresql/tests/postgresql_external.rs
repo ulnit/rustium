@@ -8,8 +8,8 @@ use rustium_config::{
     PostgresSourceConfig, SlotOwnership, SnapshotConfig, SnapshotMode, TableSelection,
 };
 use rustium_core::{
-    Checkpoint, DataValue, Operation, RecordBoundary, SourceConnector, SourceContext,
-    SourcePosition, SourceRecord,
+    CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
+    RecordBoundary, SourceConnector, SourceContext, SourcePosition, SourceRecord,
 };
 use rustium_postgresql::PostgresSource;
 use tokio::{
@@ -94,7 +94,7 @@ async fn snapshots_streams_and_resumes_from_checkpoint() -> TestResult {
             .await?;
 
         let config = settings.source_config(&publication, &slot_name, &table_name);
-        let commit_position = run_initial_capture(
+        let (commit_position, schema_history) = run_initial_capture(
             &client,
             &connector_name,
             &table_name,
@@ -104,24 +104,41 @@ async fn snapshots_streams_and_resumes_from_checkpoint() -> TestResult {
         .await?;
 
         let checkpoint = Checkpoint {
-            schema_version: 1,
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
             connector_name: connector_name.clone(),
             generation: uuid::Uuid::new_v4(),
             source_position: commit_position,
             snapshot_completed: true,
             config_fingerprint: "postgresql-external-test".into(),
             updated_at: SystemTime::now(),
-            connector_state: None,
+            connector_state: Some(schema_history),
         };
-        run_resumed_capture(
-            &client,
-            &connector_name,
-            &table_name,
-            &slot_name,
-            config,
-            checkpoint,
-        )
-        .await
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO public.{table_name} (id, customer, amount) \
+                     VALUES (4, 'Dora', 67.80)"
+                ),
+                &[],
+            )
+            .await?;
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE public.{table_name} \
+                 DROP COLUMN customer, \
+                 ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
+            ))
+            .await?;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO public.{table_name} (id, amount, status) \
+                     VALUES (5, 89.10, 'ready')"
+                ),
+                &[],
+            )
+            .await?;
+        run_resumed_capture(&connector_name, config, checkpoint).await
     }
     .await;
 
@@ -143,7 +160,7 @@ async fn run_initial_capture(
     table_name: &str,
     slot_name: &str,
     config: PostgresSourceConfig,
-) -> TestResult<SourcePosition> {
+) -> TestResult<(SourcePosition, ConnectorStateEnvelope)> {
     let mut source = PostgresSource::new(
         connector_name,
         config,
@@ -155,12 +172,14 @@ async fn run_initial_capture(
     source.validate().await?;
 
     let (mut output, cancellation, source_task) = start_source(source, None);
-    let capture_result: TestResult<SourcePosition> = async {
+    let capture_result: TestResult<(SourcePosition, ConnectorStateEnvelope)> = async {
         let mut snapshot_rows = 0;
-        loop {
+        let schema_history = loop {
             let record = receive(&mut output).await?;
             if record.boundary == RecordBoundary::SnapshotComplete {
-                break;
+                break record.connector_state.ok_or_else(|| {
+                    test_error("snapshot completion has no PostgreSQL schema history")
+                })?;
             }
             require(
                 record.boundary == RecordBoundary::Data,
@@ -174,7 +193,7 @@ async fn run_initial_capture(
                 "snapshot event is not a read",
             )?;
             snapshot_rows += 1;
-        }
+        };
         require(snapshot_rows == 2, "snapshot did not emit exactly two rows")?;
 
         wait_for_active_slot(client, slot_name).await?;
@@ -201,10 +220,10 @@ async fn run_initial_capture(
 
         let mut operations = Vec::new();
         let mut transaction_orders = Vec::new();
-        loop {
+        let commit_position = loop {
             let record = receive(&mut output).await?;
             if record.boundary == RecordBoundary::TransactionCommit {
-                break;
+                break record.position;
             }
             require(
                 record.boundary == RecordBoundary::Data,
@@ -221,7 +240,7 @@ async fn run_initial_capture(
                     .total_order
                     .ok_or_else(|| test_error("streaming event has no transaction order"))?,
             );
-        }
+        };
         require(
             operations == [Operation::Create, Operation::Update, Operation::Delete],
             "transaction operations are incomplete or out of order",
@@ -231,63 +250,7 @@ async fn run_initial_capture(
             "transaction total_order values are incorrect",
         )?;
 
-        client
-            .batch_execute(&format!(
-                "ALTER TABLE public.{table_name} \
-                 ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
-            ))
-            .await?;
-        client
-            .execute(
-                &format!(
-                    "INSERT INTO public.{table_name} (id, customer, amount, status) \
-                     VALUES (4, 'Dora', 67.80, 'ready')"
-                ),
-                &[],
-            )
-            .await?;
-
-        let mut refreshed_event = None;
-        let commit_position = loop {
-            let record = receive(&mut output).await?;
-            if record.boundary == RecordBoundary::TransactionCommit {
-                break record.position;
-            }
-            require(
-                record.boundary == RecordBoundary::Data,
-                "unexpected DDL boundary",
-            )?;
-            let event = record
-                .event
-                .ok_or_else(|| test_error("DDL data record has no event"))?;
-            require(
-                event.operation == Operation::Create,
-                "DDL follow-up event is not a create",
-            )?;
-            refreshed_event = Some(event);
-        };
-        let event = refreshed_event
-            .ok_or_else(|| test_error("DDL follow-up transaction emitted no data event"))?;
-        require(
-            event.schema.version == 2,
-            "relation-driven schema version did not advance",
-        )?;
-        let status_field = event
-            .schema
-            .fields
-            .iter()
-            .find(|field| field.name == "status")
-            .ok_or_else(|| test_error("refreshed schema does not contain status"))?;
-        require(
-            status_field.type_name == "text" && !status_field.optional,
-            "refreshed status field metadata is incorrect",
-        )?;
-        require(
-            event.after.as_ref().and_then(|row| row.get("status"))
-                == Some(&DataValue::String("ready".into())),
-            "DDL follow-up event does not contain the new status value",
-        )?;
-        Ok(commit_position)
+        Ok((commit_position, schema_history))
     }
     .await;
 
@@ -296,10 +259,7 @@ async fn run_initial_capture(
 }
 
 async fn run_resumed_capture(
-    client: &Client,
     connector_name: &str,
-    table_name: &str,
-    slot_name: &str,
     config: PostgresSourceConfig,
     checkpoint: Checkpoint,
 ) -> TestResult {
@@ -315,19 +275,9 @@ async fn run_resumed_capture(
 
     let (mut output, cancellation, source_task) = start_source(source, Some(checkpoint));
     let capture_result: TestResult = async {
-        wait_for_active_slot(client, slot_name).await?;
-        client
-            .execute(
-                &format!(
-                    "INSERT INTO public.{table_name} (id, customer, amount, status) \
-                     VALUES (5, 'Erin', 89.10, 'resumed')"
-                ),
-                &[],
-            )
-            .await?;
-
-        let mut operations = Vec::new();
-        let mut transaction_orders = Vec::new();
+        let mut old_event = None;
+        let mut new_event = None;
+        let mut saw_new_schema_state = false;
         loop {
             let record = receive(&mut output).await?;
             require(
@@ -335,7 +285,10 @@ async fn run_resumed_capture(
                 "snapshot repeated after a completed checkpoint",
             )?;
             if record.boundary == RecordBoundary::TransactionCommit {
-                break;
+                if new_event.is_some() {
+                    break;
+                }
+                continue;
             }
             require(
                 record.boundary == RecordBoundary::Data,
@@ -348,22 +301,56 @@ async fn run_resumed_capture(
                 event.operation != Operation::Read,
                 "snapshot row repeated after a completed checkpoint",
             )?;
-            operations.push(event.operation);
-            transaction_orders.push(
-                event
-                    .transaction
-                    .ok_or_else(|| test_error("resumed event has no transaction metadata"))?
-                    .total_order
-                    .ok_or_else(|| test_error("resumed event has no transaction order"))?,
-            );
+            require(
+                event.operation == Operation::Create,
+                "unexpected resumed operation",
+            )?;
+            if old_event.is_none() {
+                old_event = Some(event);
+            } else {
+                saw_new_schema_state = record.connector_state.is_some();
+                new_event = Some(event);
+            }
         }
+
+        let old_event = old_event.ok_or_else(|| test_error("old-schema event was not emitted"))?;
         require(
-            operations == [Operation::Create],
-            "resume did not emit only the new create event",
+            old_event.schema.version == 1,
+            "old row did not use schema version 1",
         )?;
         require(
-            transaction_orders == [1],
-            "resumed transaction order is incorrect",
+            old_event.after.as_ref().and_then(|row| row.get("customer"))
+                == Some(&DataValue::String("Dora".into())),
+            "old row was not decoded with the historical customer column",
+        )?;
+        require(
+            old_event
+                .after
+                .as_ref()
+                .is_some_and(|row| !row.contains_key("status")),
+            "old row contains the future status column",
+        )?;
+
+        let new_event = new_event.ok_or_else(|| test_error("new-schema event was not emitted"))?;
+        require(
+            saw_new_schema_state,
+            "new relation schema was not attached to a checkpointable record",
+        )?;
+        require(
+            new_event.schema.version == 2,
+            "new row did not use schema version 2",
+        )?;
+        require(
+            new_event.after.as_ref().and_then(|row| row.get("status"))
+                == Some(&DataValue::String("ready".into())),
+            "new row was not decoded with the status column",
+        )?;
+        require(
+            new_event
+                .after
+                .as_ref()
+                .is_some_and(|row| !row.contains_key("customer")),
+            "new row still contains the dropped customer column",
         )?;
         Ok(())
     }
@@ -382,7 +369,10 @@ fn start_source(
     JoinHandle<rustium_core::Result<()>>,
 ) {
     let (output_tx, output_rx) = mpsc::channel(64);
-    let (ack_tx, ack_rx) = watch::channel(None);
+    let acknowledged_position = initial_checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.source_position.clone());
+    let (ack_tx, ack_rx) = watch::channel(acknowledged_position);
     let cancellation = CancellationToken::new();
     let source_cancel = cancellation.clone();
     let source_task = tokio::spawn(async move {
