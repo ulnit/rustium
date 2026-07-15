@@ -566,8 +566,8 @@ async fn resumes_signal_incremental_snapshot_from_chunk_checkpoint() -> TestResu
                         test_error("completed incremental snapshot has no connector state")
                     })?;
                     require(
-                        state.version == 3,
-                        "PostgreSQL connector state did not upgrade to version 3",
+                        state.version == 4,
+                        "PostgreSQL connector state did not upgrade to version 4",
                     )?;
                     require(
                         state.payload.get("incremental_snapshot").is_none(),
@@ -757,7 +757,7 @@ async fn controls_and_deduplicates_filtered_incremental_snapshot() -> TestResult
                 }
                 if record.boundary == RecordBoundary::TransactionCommit
                     && record.connector_state.as_ref().is_some_and(|state| {
-                        state.version == 3
+                        state.version == 4
                             && state.payload.get("incremental_snapshot").is_none()
                     })
                 {
@@ -911,7 +911,7 @@ async fn runs_incremental_snapshot_with_read_only_table_permissions() -> TestRes
                 }
                 if record.boundary == RecordBoundary::TransactionCommit
                     && record.connector_state.as_ref().is_some_and(|state| {
-                        state.version == 3 && state.payload.get("incremental_snapshot").is_none()
+                        state.version == 4 && state.payload.get("incremental_snapshot").is_none()
                     })
                 {
                     break;
@@ -981,6 +981,116 @@ async fn runs_incremental_snapshot_with_read_only_table_permissions() -> TestRes
     outcome
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn orders_incremental_chunks_by_unique_surrogate_key() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_surrogate_{}", &suffix[..12]);
+    let signal_table = format!("rustium_pg_surrogate_signal_{}", &suffix[..12]);
+    let publication = format!("rustium_surrogate_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_surrogate_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-surrogate-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (\
+                    id UUID PRIMARY KEY, \
+                    snapshot_order BIGINT NOT NULL UNIQUE, \
+                    value TEXT NOT NULL\
+                 ); \
+                 INSERT INTO public.{table_name} VALUES \
+                    ('f0000000-0000-0000-0000-000000000001', 1, 'value-1'), \
+                    ('e0000000-0000-0000-0000-000000000002', 2, 'value-2'), \
+                    ('d0000000-0000-0000-0000-000000000003', 3, 'value-3'), \
+                    ('c0000000-0000-0000-0000-000000000004', 4, 'value-4'), \
+                    ('b0000000-0000-0000-0000-000000000005', 5, 'value-5'); \
+                 CREATE TABLE public.{signal_table} (\
+                    id VARCHAR(128), type VARCHAR(32), data VARCHAR(4096)\
+                 ); \
+                 CREATE PUBLICATION {publication} FOR TABLE \
+                    public.{table_name}, public.{signal_table};"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        config.signal_data_collection = Some(format!("public.{signal_table}"));
+        config.incremental_snapshot_chunk_size = 2;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+
+        wait_for_active_slot(&client, &slot_name).await?;
+        let signal_data = serde_json::json!({
+            "type": "incremental",
+            "data-collections": [format!(r"public\.{table_name}")],
+            "surrogate-key": "snapshot_order"
+        })
+        .to_string();
+        insert_signal(
+            &client,
+            &signal_table,
+            "surrogate-snapshot",
+            "execute-snapshot",
+            &signal_data,
+        )
+        .await?;
+
+        let capture_result: TestResult = async {
+            let mut ordering = Vec::new();
+            loop {
+                let record = receive(&mut output).await?;
+                if let Some(event) = record.event {
+                    require_incremental_event(&event, &table_name)?;
+                    ordering.push(row_int64(event.after.as_ref(), "snapshot_order")?);
+                }
+                if record.boundary == RecordBoundary::TransactionCommit
+                    && record.connector_state.as_ref().is_some_and(|state| {
+                        state.version == 4 && state.payload.get("incremental_snapshot").is_none()
+                    })
+                {
+                    break;
+                }
+            }
+            require(
+                ordering == [1, 2, 3, 4, 5],
+                "PostgreSQL incremental snapshot did not use surrogate-key ordering",
+            )
+        }
+        .await;
+
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)
+    }
+    .await;
+
+    let cleanup_result = cleanup(
+        &client,
+        &publication,
+        &slot_name,
+        &[&table_name, &signal_table],
+    )
+    .await;
+    connection_task.abort();
+
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL surrogate-key cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
 async fn insert_execute_snapshot_signal(
     client: &Client,
     signal_table: &str,
@@ -1046,9 +1156,15 @@ fn require_incremental_event(event: &rustium_core::ChangeEvent, table_name: &str
 }
 
 fn row_id(row: Option<&Row>) -> TestResult<i64> {
-    match row.and_then(|row| row.get("id")) {
+    row_int64(row, "id")
+}
+
+fn row_int64(row: Option<&Row>, field: &str) -> TestResult<i64> {
+    match row.and_then(|row| row.get(field)) {
         Some(DataValue::Int64(id)) => Ok(*id),
-        _ => Err(test_error("incremental snapshot row has no bigint id")),
+        _ => Err(test_error(&format!(
+            "incremental snapshot row has no bigint {field}"
+        ))),
     }
 }
 

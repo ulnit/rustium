@@ -27,6 +27,7 @@ pub(crate) enum Signal {
         id: String,
         data_collections: Vec<String>,
         additional_conditions: Vec<AdditionalCondition>,
+        surrogate_key: Option<String>,
     },
     Stop {
         id: String,
@@ -133,15 +134,7 @@ impl IncrementalSnapshotController {
                         "PostgreSQL execute-snapshot signal {id:?} has no data-collections"
                     )));
                 }
-                if request
-                    .surrogate_key
-                    .as_deref()
-                    .is_some_and(|key| !key.trim().is_empty())
-                {
-                    return Err(Error::Source(format!(
-                        "PostgreSQL execute-snapshot signal {id:?} does not yet support surrogate-key"
-                    )));
-                }
+                let surrogate_key = request.surrogate_key.filter(|key| !key.trim().is_empty());
                 for condition in &request.additional_conditions {
                     if condition.data_collection.trim().is_empty()
                         || condition.filter.trim().is_empty()
@@ -155,6 +148,7 @@ impl IncrementalSnapshotController {
                     id,
                     data_collections: request.data_collections,
                     additional_conditions: request.additional_conditions,
+                    surrogate_key,
                 })
             }
             STOP_SNAPSHOT => {
@@ -189,6 +183,7 @@ impl IncrementalSnapshotController {
                 id,
                 data_collections,
                 additional_conditions,
+                surrogate_key,
             } => {
                 if self.progress.is_some() {
                     return Err(Error::Source(format!(
@@ -201,6 +196,7 @@ impl IncrementalSnapshotController {
                     signal_id: id,
                     data_collections: expanded,
                     additional_conditions,
+                    surrogate_key,
                     current_collection: 0,
                     last_key: None,
                     maximum_key: None,
@@ -395,6 +391,7 @@ impl IncrementalSnapshotController {
             last_key: progress.last_key.clone(),
             maximum_key: progress.maximum_key.clone(),
             additional_condition: progress.additional_conditions.get(collection).cloned(),
+            surrogate_key: progress.surrogate_key.clone(),
             chunk_size: config.incremental_snapshot_chunk_size,
             chunk_id: chunk_id.clone(),
             read_only: config.read_only,
@@ -572,6 +569,7 @@ struct PrepareChunkInput {
     last_key: Option<Vec<String>>,
     maximum_key: Option<Vec<String>>,
     additional_condition: Option<String>,
+    surrogate_key: Option<String>,
     chunk_size: usize,
     chunk_id: String,
     read_only: bool,
@@ -613,13 +611,37 @@ fn prepare_chunk(
         (Some(signal_table), None)
     };
 
-    let key_fields = input
+    let primary_key_fields = input
         .schema
         .event_schema
         .fields
         .iter()
         .filter(|field| field.primary_key)
         .collect::<Vec<_>>();
+    let key_fields = if let Some(surrogate_key) = input.surrogate_key.as_deref() {
+        let field = input
+            .schema
+            .event_schema
+            .fields
+            .iter()
+            .find(|field| field.name == surrogate_key)
+            .ok_or_else(|| {
+                Error::Source(format!(
+                    "incremental snapshot surrogate-key {surrogate_key:?} does not exist in {}.{}",
+                    input.schema.schema, input.schema.table
+                ))
+            })?;
+        if field.optional {
+            return Err(Error::Source(format!(
+                "incremental snapshot surrogate-key {surrogate_key:?} on {}.{} must be NOT NULL",
+                input.schema.schema, input.schema.table
+            )));
+        }
+        validate_surrogate_key(&mut connection, &input.schema, surrogate_key)?;
+        vec![field]
+    } else {
+        primary_key_fields
+    };
     let key_columns = key_fields
         .iter()
         .map(|field| quote_ident(&field.name).map_err(pg_error))
@@ -688,7 +710,7 @@ fn prepare_chunk(
     }
     let chunk_end = rows
         .last()
-        .map(|row| key_text_values(row, &input.schema))
+        .map(|row| key_text_values(row, &key_fields))
         .transpose()?;
     let complete = chunk_end.is_none() || chunk_end == maximum_key || rows.len() < input.chunk_size;
 
@@ -728,6 +750,45 @@ fn query_current_snapshot(connection: &mut PgReplicationConnection) -> Result<Pg
         .get_value(0, 0)
         .ok_or_else(|| Error::Source("pg_current_snapshot() returned no value".into()))?;
     parse_pg_snapshot(&value)
+}
+
+fn validate_surrogate_key(
+    connection: &mut PgReplicationConnection,
+    schema: &TableSchema,
+    surrogate_key: &str,
+) -> Result<()> {
+    let schema_name = quote_literal(&schema.schema).map_err(pg_error)?;
+    let table_name = quote_literal(&schema.table).map_err(pg_error)?;
+    let column_name = quote_literal(surrogate_key).map_err(pg_error)?;
+    let result = connection
+        .exec(&format!(
+            "SELECT EXISTS (\
+                SELECT 1 \
+                FROM pg_catalog.pg_index i \
+                JOIN pg_catalog.pg_class c ON c.oid = i.indrelid \
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                JOIN pg_catalog.pg_attribute a \
+                  ON a.attrelid = c.oid AND a.attname = {column_name} \
+                WHERE n.nspname = {schema_name} \
+                  AND c.relname = {table_name} \
+                  AND i.indisunique AND i.indisvalid \
+                  AND i.indpred IS NULL AND i.indexprs IS NULL \
+                  AND i.indnkeyatts = 1 \
+                  AND EXISTS (\
+                    SELECT 1 \
+                    FROM unnest(i.indkey::smallint[]) WITH ORDINALITY AS key(attnum, ordinal) \
+                    WHERE key.ordinal = 1 AND key.attnum = a.attnum\
+                  )\
+             )"
+        ))
+        .map_err(pg_error)?;
+    if result.get_value(0, 0).as_deref() != Some("t") {
+        return Err(Error::Source(format!(
+            "incremental snapshot surrogate-key {surrogate_key:?} on {}.{} must have a valid single-column unique index",
+            schema.schema, schema.table
+        )));
+    }
+    Ok(())
 }
 
 fn parse_pg_snapshot(value: &str) -> Result<PgSnapshot> {
@@ -867,12 +928,9 @@ fn row_key(row: &Row, schema: &TableSchema) -> Option<String> {
     serde_json::to_string(&key).ok()
 }
 
-fn key_text_values(row: &Row, schema: &TableSchema) -> Result<Vec<String>> {
-    schema
-        .event_schema
-        .fields
+fn key_text_values(row: &Row, fields: &[&rustium_core::FieldSchema]) -> Result<Vec<String>> {
+    fields
         .iter()
-        .filter(|field| field.primary_key)
         .map(|field| {
             let value = row.get(&field.name).ok_or_else(|| {
                 Error::Invariant(format!(
@@ -1021,6 +1079,7 @@ mod tests {
                 id,
                 data_collections,
                 additional_conditions,
+                ..
             }
                 if id == "snapshot-1"
                     && data_collections == ["public\\.orders"]
@@ -1030,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_snapshot_control_signals_and_rejects_surrogate_keys() {
+    fn parses_snapshot_control_signals_and_surrogate_keys() {
         assert!(matches!(
             IncrementalSnapshotController::parse_signal(&signal_row(
                 "pause-1",
@@ -1050,13 +1109,16 @@ mod tests {
             Signal::Stop { data_collections, .. }
                 if data_collections == ["public\\.orders"]
         ));
-        let error = IncrementalSnapshotController::parse_signal(&signal_row(
-            "snapshot-2",
-            EXECUTE_SNAPSHOT,
-            r#"{"data-collections":["public\\.orders"],"surrogate-key":"created_at"}"#,
-        ))
-        .unwrap_err();
-        assert!(error.to_string().contains("surrogate-key"));
+        assert!(matches!(
+            IncrementalSnapshotController::parse_signal(&signal_row(
+                "snapshot-2",
+                EXECUTE_SNAPSHOT,
+                r#"{"data-collections":["public\\.orders"],"surrogate-key":"created_at"}"#,
+            ))
+            .unwrap(),
+            Signal::Execute { surrogate_key, .. }
+                if surrogate_key.as_deref() == Some("created_at")
+        ));
     }
 
     #[test]
@@ -1068,6 +1130,7 @@ mod tests {
                 ("public.orders".into(), "status = 'open'".into()),
                 ("public.customers".into(), "active".into()),
             ]),
+            surrogate_key: None,
             current_collection: 0,
             last_key: Some(vec!["42".into()]),
             maximum_key: Some(vec!["100".into()]),

@@ -5,7 +5,7 @@ use rustium_core::{ConnectorStateEnvelope, Error, EventSchema, FieldSchema, Resu
 use serde::{Deserialize, Serialize};
 
 pub(crate) const POSTGRES_SCHEMA_HISTORY_FORMAT: &str = "rustium.postgresql.schema-history";
-const POSTGRES_SCHEMA_HISTORY_VERSION: u32 = 3;
+const POSTGRES_SCHEMA_HISTORY_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PostgresColumnType {
@@ -34,6 +34,8 @@ pub(crate) struct IncrementalSnapshotProgress {
     pub(crate) data_collections: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) additional_conditions: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) surrogate_key: Option<String>,
     pub(crate) current_collection: usize,
     pub(crate) last_key: Option<Vec<String>>,
     pub(crate) maximum_key: Option<Vec<String>>,
@@ -235,7 +237,7 @@ mod tests {
         let envelope = encode_schema_history(&schemas).unwrap();
 
         assert_eq!(envelope.format, POSTGRES_SCHEMA_HISTORY_FORMAT);
-        assert_eq!(envelope.version, 3);
+        assert_eq!(envelope.version, 4);
         assert!(envelope.payload.get("incremental_snapshot").is_none());
         assert_eq!(decode_schema_history(&envelope).unwrap(), schemas);
     }
@@ -256,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_version_three_incremental_snapshot_progress() {
+    fn round_trips_version_four_incremental_snapshot_progress() {
         let table = baseline();
         let schemas = HashMap::from([(table.key(), table)]);
         let progress = IncrementalSnapshotProgress {
@@ -266,6 +268,7 @@ mod tests {
                 "public.orders".into(),
                 "status = 'open'".into(),
             )]),
+            surrogate_key: Some("sequence_id".into()),
             current_collection: 1,
             last_key: Some(vec!["acme".into(), "42".into()]),
             maximum_key: Some(vec!["zenith".into(), "9000".into()]),
@@ -276,7 +279,7 @@ mod tests {
         let envelope = encode_connector_state(&schemas, Some(&progress)).unwrap();
         let decoded = decode_connector_state(&envelope).unwrap();
 
-        assert_eq!(envelope.version, 3);
+        assert_eq!(envelope.version, 4);
         assert_eq!(decoded.schemas, schemas);
         assert_eq!(decoded.incremental_snapshot, Some(progress));
     }
@@ -305,6 +308,7 @@ mod tests {
             .incremental_snapshot
             .unwrap();
         assert!(progress.additional_conditions.is_empty());
+        assert_eq!(progress.surrogate_key, None);
         assert!(!progress.paused);
     }
 

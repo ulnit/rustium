@@ -126,7 +126,7 @@ export RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
 ```
 
-The tests create uniquely named tables, signal tables, publications, replication roles, and managed slots. They cover snapshot handoff, transaction ordering, checkpoint stop, destructive DDL with historical `Relation` replay, restart without a repeated snapshot, periodic heartbeat records, `heartbeat.action.query`, heartbeat-table filtering, resumable source-signaled incremental snapshots, additional conditions, concurrent-update deduplication, pause/resume/scoped-stop controls, read-only transaction-snapshot watermarking with no signal-table writes, and identical snapshot/WAL conversion for high-precision numeric, special values, JSONB, UUID, bytea, temporal, network, range, bit, and array types. These gates pass against PostgreSQL 17 with `wal_level=logical`.
+The tests create uniquely named tables, signal tables, publications, replication roles, and managed slots. They cover snapshot handoff, transaction ordering, checkpoint stop, destructive DDL with historical `Relation` replay, restart without a repeated snapshot, periodic heartbeat records, `heartbeat.action.query`, heartbeat-table filtering, resumable source-signaled incremental snapshots, additional conditions, concurrent-update deduplication, pause/resume/scoped-stop controls, read-only transaction-snapshot watermarking with no signal-table writes, validated surrogate-key ordering, and identical snapshot/WAL conversion for high-precision numeric, special values, JSONB, UUID, bytea, temporal, network, range, bit, and array types. These gates pass against PostgreSQL 17 with `wal_level=logical`.
 
 Run the external SQL Server 2017+ CDC integration test without storing credentials in the repository:
 
@@ -296,13 +296,13 @@ VALUES (
 );
 ```
 
-The execute payload also accepts Debezium `additional-conditions`, each containing a `data-collection` regular expression and a SQL `filter`. The filter constrains both the captured maximum key and every chunk query. `pause-snapshot` pauses after the current bounded chunk, `resume-snapshot` continues from its checkpointed key, and `stop-snapshot` stops all work or only collections matched by its optional `data-collections` list.
+The execute payload also accepts Debezium `additional-conditions`, each containing a `data-collection` regular expression and a SQL `filter`. The filter constrains both the captured maximum key and every chunk query. Optional `surrogate-key` replaces primary-key chunk ordering when that column is `NOT NULL` and backed by a valid single-column unique index; the table still needs a primary key for WAL deduplication. `pause-snapshot` pauses after the current bounded chunk, `resume-snapshot` continues from its checkpointed key, and `stop-snapshot` stops all work or only collections matched by its optional `data-collections` list.
 
 The signal table must contain exactly `id`, `type`, and `data` in that order and must be part of the publication. Selected snapshot tables must have primary keys. Rustium writes `snapshot-window-open` and `snapshot-window-close` watermarks, removes rows superseded by WAL events while the window is open, emits remaining rows as Debezium `op=r` events with `source.snapshot=incremental`, and checkpoints the next key, conditions, and pause state with the close transaction. Restart can repeat an uncommitted chunk but cannot skip it. Native YAML uses `source.signal_data_collection`, `source.incremental_snapshot_chunk_size`, and `source.incremental_snapshot_watermarking_strategy`.
 
 Set Debezium `read.only=true` or native `source.read_only: true` to replace inserted watermarks with `pg_current_snapshot()` low/high transaction watermarks. Rustium compares WAL transaction IDs against those snapshots, keeps the window open until every transaction visible across the chunk has passed, and applies the same primary-key deduplication. The connector requires only `SELECT` on captured/signal tables plus logical-replication access and writes no watermark records. Rustium currently still needs the source signal table to receive the initial request because Kafka/JMX/file signal input channels are not implemented.
 
-Current PostgreSQL signaling is intentionally limited to the source table channel, one signal table, and incremental snapshots. Writable mode supports `insert_insert`; read-only mode uses transaction snapshots. Surrogate keys and online schema changes during an incremental snapshot remain pending. Other PostgreSQL gaps include transient-column optionality/default reconstruction beyond what `Relation` carries, extension types such as PostGIS/hstore/vector, broader failure fixtures, and Kafka end-to-end recovery coverage.
+Current PostgreSQL signaling is intentionally limited to the source table channel, one signal table, and incremental snapshots. Writable mode supports `insert_insert`; read-only mode uses transaction snapshots. Online schema changes during an incremental snapshot remain pending. Other PostgreSQL gaps include transient-column optionality/default reconstruction beyond what `Relation` carries, extension types such as PostGIS/hstore/vector, broader failure fixtures, and Kafka end-to-end recovery coverage.
 
 ### MySQL
 
@@ -562,7 +562,7 @@ export RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
 ```
 
-测试会创建唯一命名的业务表、信号表、publication、复制角色和托管 slot，覆盖快照切换、事务顺序、checkpoint 停止、跨破坏性 DDL 的历史 `Relation` 重放、重启不重复快照、周期 heartbeat record、`heartbeat.action.query`、heartbeat 表过滤、可恢复的 source 信号增量快照、additional condition、并发更新去重、pause/resume/scoped-stop 控制、不写信号表的只读事务快照 watermark，以及高精度 numeric、特殊值、JSONB、UUID、bytea、时间、网络、range、bit 和数组类型在快照/WAL 路径上的一致转换。这些门槛已在启用 `wal_level=logical` 的 PostgreSQL 17 上通过。
+测试会创建唯一命名的业务表、信号表、publication、复制角色和托管 slot，覆盖快照切换、事务顺序、checkpoint 停止、跨破坏性 DDL 的历史 `Relation` 重放、重启不重复快照、周期 heartbeat record、`heartbeat.action.query`、heartbeat 表过滤、可恢复的 source 信号增量快照、additional condition、并发更新去重、pause/resume/scoped-stop 控制、不写信号表的只读事务快照 watermark、经验证的 surrogate-key 排序，以及高精度 numeric、特殊值、JSONB、UUID、bytea、时间、网络、range、bit 和数组类型在快照/WAL 路径上的一致转换。这些门槛已在启用 `wal_level=logical` 的 PostgreSQL 17 上通过。
 
 运行外部 SQL Server 2017+ CDC 集成测试，凭据无需存入仓库：
 
@@ -732,13 +732,13 @@ VALUES (
 );
 ```
 
-Execute payload 还接受 Debezium `additional-conditions`；每项包含一个 `data-collection` 正则和一个 SQL `filter`。该 filter 同时约束最大捕获主键与每次 chunk 查询。`pause-snapshot` 在当前有界 chunk 后暂停，`resume-snapshot` 从已 checkpoint 的主键继续，`stop-snapshot` 可停止全部工作，或只停止可选 `data-collections` 列表匹配的集合。
+Execute payload 还接受 Debezium `additional-conditions`；每项包含一个 `data-collection` 正则和一个 SQL `filter`。该 filter 同时约束最大捕获主键与每次 chunk 查询。可选 `surrogate-key` 在该列为 `NOT NULL` 且具有有效单列唯一索引时替代主键进行 chunk 排序；目标表仍需主键用于 WAL 去重。`pause-snapshot` 在当前有界 chunk 后暂停，`resume-snapshot` 从已 checkpoint 的主键继续，`stop-snapshot` 可停止全部工作，或只停止可选 `data-collections` 列表匹配的集合。
 
 信号表必须按顺序且仅包含 `id`、`type`、`data`，并加入 publication。被选中的快照表必须有主键。Rustium 写入 `snapshot-window-open` 和 `snapshot-window-close` watermark，在窗口打开期间移除已被 WAL 事件覆盖的行，以 Debezium `op=r`、`source.snapshot=incremental` 发出剩余行，并在 close 事务中 checkpoint 下一主键、condition 和 pause 状态。重启可能重复尚未提交的 chunk，但不会跳过。原生 YAML 使用 `source.signal_data_collection`、`source.incremental_snapshot_chunk_size` 和 `source.incremental_snapshot_watermarking_strategy`。
 
 设置 Debezium `read.only=true` 或原生 `source.read_only: true`，即可用 `pg_current_snapshot()` 低/高事务水位替代插入 watermark。Rustium 将 WAL transaction ID 与这些快照比较，直到跨 chunk 可见的事务全部通过后才关闭窗口，并执行相同的主键去重。连接器只需要捕获表/信号表 `SELECT` 和逻辑复制权限，不写入 watermark 记录。由于 Kafka/JMX/file 信号输入 channel 尚未实现，Rustium 当前仍需要 source 信号表接收初始请求。
 
-当前 PostgreSQL 信号能力有意限定为 source table channel、单一信号表和 incremental snapshot。可写模式支持 `insert_insert`，只读模式使用事务快照。surrogate key 和增量快照期间的在线 schema 变更仍待实现。其他 PostgreSQL 缺口包括超出 `Relation` 信息范围的短暂历史列可空性/default 重建、PostGIS/hstore/vector 等扩展类型、更广故障样例，以及 Kafka 端到端恢复覆盖。
+当前 PostgreSQL 信号能力有意限定为 source table channel、单一信号表和 incremental snapshot。可写模式支持 `insert_insert`，只读模式使用事务快照。增量快照期间的在线 schema 变更仍待实现。其他 PostgreSQL 缺口包括超出 `Relation` 信息范围的短暂历史列可空性/default 重建、PostGIS/hstore/vector 等扩展类型、更广故障样例，以及 Kafka 端到端恢复覆盖。
 
 ### MySQL
 
