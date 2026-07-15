@@ -54,24 +54,36 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
     } else {
         signal_channels
     };
-    let signal_enabled_channels = requested_signal_channels
-        .iter()
-        .filter(|channel| matches!(channel.as_str(), "source" | "file" | "in-process" | "kafka"))
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut signal_enabled_channels = Vec::new();
+    for channel in &requested_signal_channels {
+        let mapped = match channel.as_str() {
+            "source" | "file" | "in-process" | "kafka" => Some(channel.clone()),
+            "jmx" => Some("in-process".into()),
+            _ => None,
+        };
+        if let Some(mapped) = mapped
+            && !signal_enabled_channels.contains(&mapped)
+        {
+            signal_enabled_channels.push(mapped);
+        }
+    }
     if signal_enabled_channels.is_empty() {
         return Err(Error::Configuration(
             "PostgreSQL signal.enabled.channels enables no implemented channel".into(),
         ));
     }
     let mut warnings = Vec::new();
-    for channel in requested_signal_channels
-        .iter()
-        .filter(|channel| !matches!(channel.as_str(), "source" | "file" | "in-process" | "kafka"))
-    {
-        warnings.push(format!(
-            "signal.enabled.channels={channel} is not implemented and was ignored"
-        ));
+    for channel in &requested_signal_channels {
+        match channel.as_str() {
+            "jmx" => warnings.push(
+                "signal.enabled.channels=jmx is JVM-specific; Rustium maps it to the bounded in-process channel and its SignalSender/HTTP management API"
+                    .into(),
+            ),
+            "source" | "file" | "in-process" | "kafka" => {}
+            _ => warnings.push(format!(
+                "signal.enabled.channels={channel} is not implemented and was ignored"
+            )),
+        }
     }
     if bool_value(
         &properties,
@@ -899,6 +911,30 @@ read.only=true
         assert_eq!(source.signal_enabled_channels, ["file"]);
         assert!(source.signal_data_collection.is_none());
         assert!(source.read_only);
+    }
+
+    #[test]
+    fn maps_postgres_jmx_signaling_to_the_management_channel() {
+        let config = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+signal.enabled.channels=jmx,in-process
+read.only=true
+"#,
+        )
+        .unwrap();
+        let source = config.source.as_postgresql().unwrap();
+        assert_eq!(source.signal_enabled_channels, ["in-process"]);
+        assert!(config.compatibility_warnings.iter().any(|warning| {
+            warning.contains("signal.enabled.channels=jmx")
+                && warning.contains("SignalSender/HTTP management API")
+        }));
     }
 
     #[test]
