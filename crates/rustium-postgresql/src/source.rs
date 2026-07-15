@@ -375,11 +375,22 @@ impl SourceConnector for PostgresSource {
             feedback.update_applied_lsn(position.commit_lsn.unwrap_or(position.lsn));
         }
 
+        let mut last_safe_position = resume_position
+            .as_ref()
+            .map(|position| match position {
+                SourcePosition::Postgres(position) if position.snapshot => {
+                    postgres_streaming_position(position.lsn)
+                }
+                _ => position.clone(),
+            })
+            .or_else(|| start_lsn.map(postgres_streaming_position));
         let mut state = StreamingState::new(
             self.schemas.clone(),
             resume_position,
             !snapshot_needed && checkpoint.is_none(),
         );
+        let mut heartbeat = heartbeat_timer(self.config.heartbeat_interval);
+        let mut heartbeat_connection = open_heartbeat_connection(&self.config).await?;
         info!(
             connector = %self.connector_name,
             slot = %self.config.slot_name,
@@ -398,6 +409,29 @@ impl SourceConnector for PostgresSource {
                     }
                     if let Some(SourcePosition::Postgres(position)) = context.acknowledged.borrow().clone() {
                         feedback.update_applied_lsn(position.commit_lsn.unwrap_or(position.lsn));
+                    }
+                }
+                () = next_heartbeat(&mut heartbeat) => {
+                    if let Some(query) = self.config.heartbeat_action_query.clone() {
+                        let connection = heartbeat_connection.take().ok_or_else(|| {
+                            Error::Source(
+                                "PostgreSQL heartbeat action connection is unavailable".into(),
+                            )
+                        })?;
+                        heartbeat_connection = Some(
+                            execute_heartbeat_action(connection, query).await?,
+                        );
+                    }
+                    if let Some(position) = last_safe_position.clone() {
+                        context
+                            .output
+                            .send(Ok(heartbeat_record(
+                                &self.connector_name,
+                                &self.config.database,
+                                position,
+                            )))
+                            .await
+                            .map_err(|_| Error::Cancelled)?;
                     }
                 }
                 event = stream.next_event_with_retry(&context.cancellation) => {
@@ -457,11 +491,127 @@ impl SourceConnector for PostgresSource {
                             record.connector_state = Some(encode_schema_history(&state.schemas)?);
                             state.schema_dirty = false;
                         }
+                        let position = record.position.clone();
                         context.output.send(Ok(record)).await.map_err(|_| Error::Cancelled)?;
+                        last_safe_position = Some(position);
                     }
                 }
             }
         }
+    }
+}
+
+fn heartbeat_timer(interval: Duration) -> Option<tokio::time::Interval> {
+    if interval.is_zero() {
+        return None;
+    }
+    let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    Some(timer)
+}
+
+async fn next_heartbeat(timer: &mut Option<tokio::time::Interval>) {
+    match timer {
+        Some(timer) => {
+            timer.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn open_heartbeat_connection(
+    config: &PostgresSourceConfig,
+) -> Result<Option<PgReplicationConnection>> {
+    if config.heartbeat_interval.is_zero() || config.heartbeat_action_query.is_none() {
+        return Ok(None);
+    }
+    let connection_url = config.connection_url(false)?;
+    let connection = tokio::task::spawn_blocking(move || connect(&connection_url))
+        .await
+        .map_err(|error| {
+            Error::Source(format!(
+                "PostgreSQL heartbeat connection task failed: {error}"
+            ))
+        })??;
+    Ok(Some(connection))
+}
+
+async fn execute_heartbeat_action(
+    mut connection: PgReplicationConnection,
+    query: String,
+) -> Result<PgReplicationConnection> {
+    tokio::task::spawn_blocking(move || {
+        connection.exec(&query).map_err(|error| {
+            Error::Source(format!("PostgreSQL heartbeat.action.query failed: {error}"))
+        })?;
+        Ok(connection)
+    })
+    .await
+    .map_err(|error| Error::Source(format!("PostgreSQL heartbeat action task failed: {error}")))?
+}
+
+fn postgres_streaming_position(lsn: u64) -> SourcePosition {
+    SourcePosition::Postgres(PostgresPosition {
+        lsn,
+        commit_lsn: Some(lsn),
+        transaction_id: None,
+        event_serial: 0,
+        snapshot: false,
+    })
+}
+
+fn heartbeat_record(
+    connector_name: &str,
+    database: &str,
+    position: SourcePosition,
+) -> SourceRecord {
+    let observed_time = Utc::now();
+    let timestamp = observed_time.timestamp_millis();
+    let mut attributes = BTreeMap::new();
+    attributes.insert("rustium.heartbeat".into(), true.into());
+    let mut after = Row::new();
+    after.insert("ts_ms".into(), DataValue::Int64(timestamp));
+    let event = ChangeEvent {
+        id: EventId::deterministic(
+            connector_name,
+            database,
+            &position,
+            "__heartbeat",
+            u64::try_from(observed_time.timestamp_micros()).unwrap_or_default(),
+        ),
+        source: SourceMetadata {
+            connector: "postgresql".into(),
+            connector_name: connector_name.into(),
+            database: database.into(),
+            schema: None,
+            table: None,
+            snapshot: false,
+            version: CONNECTOR_VERSION.into(),
+            attributes,
+        },
+        position: position.clone(),
+        transaction: None,
+        operation: Operation::Message,
+        before: None,
+        after: Some(after),
+        schema: EventSchema {
+            name: format!("{connector_name}.Heartbeat"),
+            version: 1,
+            fields: vec![FieldSchema {
+                name: "ts_ms".into(),
+                type_name: "int64".into(),
+                optional: false,
+                primary_key: false,
+            }],
+        },
+        source_time: None,
+        observed_time,
+    };
+    SourceRecord {
+        event: Some(event),
+        position,
+        boundary: RecordBoundary::Heartbeat,
+        connector_state: None,
     }
 }
 
@@ -1166,6 +1316,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn builds_heartbeat_at_the_safe_postgresql_position() {
+        let position = postgres_streaming_position(512);
+        let record = heartbeat_record("inventory-postgresql", "inventory", position.clone());
+        let event = record.event.unwrap();
+
+        assert_eq!(record.boundary, RecordBoundary::Heartbeat);
+        assert_eq!(record.position, position);
+        assert_eq!(event.operation, Operation::Message);
+        assert_eq!(event.source.table, None);
+        assert_eq!(event.source.schema, None);
+        assert_eq!(
+            event.source.attributes.get("rustium.heartbeat"),
+            Some(&true.into())
+        );
+        assert!(matches!(
+            event.after.unwrap().get("ts_ms"),
+            Some(DataValue::Int64(_))
+        ));
+    }
+
+    #[test]
     fn converts_postgres_scalar_types() {
         assert_eq!(convert_text("42", "integer"), DataValue::Int32(42));
         assert_eq!(convert_text("t", "boolean"), DataValue::Boolean(true));
@@ -1263,6 +1434,10 @@ mod tests {
             tables: TableSelection::default(),
             ssl_mode: "disable".into(),
             connect_timeout: Duration::from_secs(1),
+            heartbeat_interval: Duration::ZERO,
+            heartbeat_action_query: None,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
         };
         let mut source = PostgresSource::new(
             "inventory-postgresql",

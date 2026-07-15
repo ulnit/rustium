@@ -168,15 +168,17 @@ fn build_source(config: &Config) -> Result<Box<dyn SourceConnector>> {
 }
 
 fn build_encoder(config: &Config) -> Arc<dyn EventEncoder> {
-    let (heartbeat_topics_prefix, heartbeat_topic_name) = config.source.as_mysql().map_or_else(
-        || ("__debezium-heartbeat".into(), None),
-        |source| {
-            (
-                source.heartbeat_topics_prefix.clone(),
-                source.heartbeat_topic_name.clone(),
-            )
-        },
-    );
+    let (heartbeat_topics_prefix, heartbeat_topic_name) = match &config.source {
+        SourceConfig::Postgresql(source) => (
+            source.heartbeat_topics_prefix.clone(),
+            source.heartbeat_topic_name.clone(),
+        ),
+        SourceConfig::Mysql(source) => (
+            source.heartbeat_topics_prefix.clone(),
+            source.heartbeat_topic_name.clone(),
+        ),
+        SourceConfig::Sqlserver(_) => ("__debezium-heartbeat".into(), None),
+    };
     let encoder_config = JsonEncoderConfig {
         topic_prefix: config.sink.topic_prefix().into(),
         unavailable_value: config.format.unavailable_value.clone(),

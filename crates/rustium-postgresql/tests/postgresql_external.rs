@@ -63,6 +63,10 @@ impl TestSettings {
             },
             ssl_mode: "disable".into(),
             connect_timeout: Duration::from_secs(10),
+            heartbeat_interval: Duration::ZERO,
+            heartbeat_action_query: None,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
         }
     }
 }
@@ -142,7 +146,7 @@ async fn snapshots_streams_and_resumes_from_checkpoint() -> TestResult {
     }
     .await;
 
-    let cleanup_result = cleanup(&client, &publication, &slot_name, &table_name).await;
+    let cleanup_result = cleanup(&client, &publication, &slot_name, &[&table_name]).await;
     connection_task.abort();
 
     if let Err(cleanup_error) = cleanup_result {
@@ -150,6 +154,160 @@ async fn snapshots_streams_and_resumes_from_checkpoint() -> TestResult {
             return Err(cleanup_error);
         }
         eprintln!("PostgreSQL test cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn emits_heartbeat_and_executes_action_query() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_heartbeat_{}", &suffix[..12]);
+    let action_table = format!("rustium_pg_heartbeat_action_{}", &suffix[..12]);
+    let publication = format!("rustium_hb_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_hb_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-heartbeat-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (\
+                    id BIGINT PRIMARY KEY, value TEXT NOT NULL\
+                 ); \
+                 INSERT INTO public.{table_name} VALUES (1, 'initial'); \
+                 CREATE TABLE public.{action_table} (\
+                    id INTEGER PRIMARY KEY, beats BIGINT NOT NULL\
+                 ); \
+                 INSERT INTO public.{action_table} VALUES (1, 0); \
+                 CREATE PUBLICATION {publication} FOR TABLE \
+                    public.{table_name}, public.{action_table};"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        config.heartbeat_interval = Duration::from_millis(100);
+        config.heartbeat_action_query = Some(format!(
+            "UPDATE public.{action_table} SET beats = beats + 1 WHERE id = 1"
+        ));
+        config.heartbeat_topics_prefix = "__rustium-test-heartbeat".into();
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let capture_result: TestResult = async {
+            let mut snapshot_rows = 0;
+            let mut first_heartbeat_position = None;
+            let mut saw_action_commit = false;
+            loop {
+                let record = receive(&mut output).await?;
+                match record.boundary {
+                    RecordBoundary::Data => {
+                        let event = record.event.ok_or_else(|| {
+                            test_error("PostgreSQL snapshot data record has no event")
+                        })?;
+                        require(
+                            event.operation == Operation::Read,
+                            "unexpected data event before PostgreSQL heartbeat",
+                        )?;
+                        snapshot_rows += 1;
+                    }
+                    RecordBoundary::SnapshotComplete => {
+                        require(
+                            snapshot_rows == 1,
+                            "PostgreSQL heartbeat snapshot row count is incorrect",
+                        )?;
+                        wait_for_active_slot(&client, &slot_name).await?;
+                    }
+                    RecordBoundary::Heartbeat => {
+                        let event = record.event.ok_or_else(|| {
+                            test_error("PostgreSQL heartbeat record has no event")
+                        })?;
+                        require(
+                            event.operation == Operation::Message,
+                            "PostgreSQL heartbeat is not a message event",
+                        )?;
+                        require(
+                            event.source.schema.is_none() && event.source.table.is_none(),
+                            "PostgreSQL heartbeat was exposed as a table event",
+                        )?;
+                        require(
+                            event.source.attributes.get("rustium.heartbeat") == Some(&true.into()),
+                            "PostgreSQL heartbeat marker is missing",
+                        )?;
+                        require(
+                            matches!(
+                                &record.position,
+                                SourcePosition::Postgres(position) if !position.snapshot
+                            ),
+                            "PostgreSQL heartbeat does not carry a streaming WAL position",
+                        )?;
+                        require(
+                            matches!(
+                                event.after.as_ref().and_then(|row| row.get("ts_ms")),
+                                Some(DataValue::Int64(_))
+                            ),
+                            "PostgreSQL heartbeat timestamp is missing",
+                        )?;
+                        if let Some(first_position) = &first_heartbeat_position {
+                            require(
+                                saw_action_commit,
+                                "heartbeat.action.query transaction commit was not observed",
+                            )?;
+                            require(
+                                record.position.is_after(first_position),
+                                "PostgreSQL heartbeat did not advance after heartbeat.action.query",
+                            )?;
+                            break;
+                        }
+                        first_heartbeat_position = Some(record.position);
+                    }
+                    RecordBoundary::TransactionCommit => {
+                        saw_action_commit |= first_heartbeat_position.is_some();
+                    }
+                }
+            }
+
+            let row = client
+                .query_one(
+                    &format!("SELECT beats FROM public.{action_table} WHERE id = 1"),
+                    &[],
+                )
+                .await?;
+            require(
+                row.get::<_, i64>(0) > 0,
+                "heartbeat.action.query did not update the PostgreSQL heartbeat table",
+            )
+        }
+        .await;
+
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)
+    }
+    .await;
+
+    let cleanup_result = cleanup(
+        &client,
+        &publication,
+        &slot_name,
+        &[&table_name, &action_table],
+    )
+    .await;
+    connection_task.abort();
+
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL heartbeat cleanup also failed: {cleanup_error}");
     }
     outcome
 }
@@ -454,7 +612,7 @@ async fn cleanup(
     client: &Client,
     publication: &str,
     slot_name: &str,
-    table_name: &str,
+    table_names: &[&str],
 ) -> TestResult {
     let mut first_error = None;
     if let Err(error) = client
@@ -477,12 +635,14 @@ async fn cleanup(
     {
         first_error = Some(error);
     }
-    if let Err(error) = client
-        .batch_execute(&format!("DROP TABLE IF EXISTS public.{table_name}"))
-        .await
-        && first_error.is_none()
-    {
-        first_error = Some(error);
+    for table_name in table_names {
+        if let Err(error) = client
+            .batch_execute(&format!("DROP TABLE IF EXISTS public.{table_name}"))
+            .await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
     }
     match first_error {
         Some(error) => Err(error.into()),

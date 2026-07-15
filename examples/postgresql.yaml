@@ -18,6 +18,8 @@ source:
     include:
       - public\.(orders|customers)
   ssl_mode: prefer
+  heartbeat_interval: 0s
+  heartbeat_topics_prefix: __debezium-heartbeat
 
 snapshot:
   mode: initial

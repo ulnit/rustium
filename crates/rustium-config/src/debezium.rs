@@ -72,6 +72,17 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 "connection.validation.timeout.ms",
                 default_connect_timeout(),
             )?,
+            heartbeat_interval: duration_ms(&properties, "heartbeat.interval.ms", Duration::ZERO)?,
+            heartbeat_action_query: properties
+                .get("heartbeat.action.query")
+                .filter(|query| !query.trim().is_empty())
+                .cloned(),
+            heartbeat_topics_prefix: properties
+                .get("topic.heartbeat.prefix")
+                .or_else(|| properties.get("heartbeat.topics.prefix"))
+                .cloned()
+                .unwrap_or_else(default_heartbeat_topics_prefix),
+            heartbeat_topic_name: properties.get("topic.heartbeat.name").cloned(),
         }),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -103,6 +114,15 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
     if properties.contains_key("database.server.id.offset") {
         warnings.push(
             "database.server.id.offset is accepted but ignored because Rustium runs one source task per connector"
+                .into(),
+        );
+    }
+    if properties
+        .get("heartbeat.action.query")
+        .is_some_and(|query| !query.trim().is_empty())
+    {
+        warnings.push(
+            "heartbeat.action.query is not implemented by the Rustium MySQL source and was ignored"
                 .into(),
         );
     }
@@ -188,6 +208,16 @@ fn parse_sqlserver(properties: &BTreeMap<String, String>) -> Result<Config> {
         ));
     }
     let poll_interval = duration_ms(properties, "poll.interval.ms", default_poll_interval())?;
+    let mut warnings = Vec::new();
+    if properties
+        .get("heartbeat.action.query")
+        .is_some_and(|query| !query.trim().is_empty())
+    {
+        warnings.push(
+            "heartbeat.action.query is not implemented by the Rustium SQL Server source and was ignored"
+                .into(),
+        );
+    }
     assemble_config(
         properties,
         SourceConfig::Sqlserver(SqlServerSourceConfig {
@@ -237,7 +267,7 @@ fn parse_sqlserver(properties: &BTreeMap<String, String>) -> Result<Config> {
                 default_snapshot_fetch_size(),
             )?,
         },
-        Vec::new(),
+        warnings,
     )
 }
 
@@ -581,6 +611,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "unavailable.value.placeholder",
         "tombstones.on.delete",
         "heartbeat.interval.ms",
+        "heartbeat.action.query",
         "heartbeat.topics.prefix",
         "topic.heartbeat.prefix",
         "topic.heartbeat.name",
@@ -631,6 +662,10 @@ publication.name=orders_pub
 table.include.list=public\\.(orders|customers)
 snapshot.mode=initial
 tombstones.on.delete=false
+heartbeat.interval.ms=2500
+heartbeat.action.query=INSERT INTO public.rustium_heartbeat (id) VALUES (1)
+topic.heartbeat.prefix=__pg-heartbeat
+topic.heartbeat.name=shared-pg-heartbeat
 max.queue.size=4096
 max.batch.size=1000
 "#,
@@ -641,6 +676,16 @@ max.batch.size=1000
         let source = config.source.as_postgresql().unwrap();
         assert!(source.tables.includes("public", "orders"));
         assert!(!source.tables.includes("public", "products"));
+        assert_eq!(source.heartbeat_interval, Duration::from_millis(2500));
+        assert_eq!(
+            source.heartbeat_action_query.as_deref(),
+            Some("INSERT INTO public.rustium_heartbeat (id) VALUES (1)")
+        );
+        assert_eq!(source.heartbeat_topics_prefix, "__pg-heartbeat");
+        assert_eq!(
+            source.heartbeat_topic_name.as_deref(),
+            Some("shared-pg-heartbeat")
+        );
         assert!(!config.format.tombstones_on_delete);
         assert!(
             config

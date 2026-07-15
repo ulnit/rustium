@@ -161,15 +161,25 @@ impl SourceConfig {
 
     fn semantic_config(&self) -> serde_json::Value {
         match self {
-            Self::Postgresql(config) => serde_json::json!({
-                "type": "postgresql",
-                "hostname": config.hostname,
-                "port": config.port,
-                "database": config.database,
-                "publication": config.publication,
-                "slot_name": config.slot_name,
-                "tables": config.tables,
-            }),
+            Self::Postgresql(config) => {
+                let mut semantic = serde_json::json!({
+                    "type": "postgresql",
+                    "hostname": config.hostname,
+                    "port": config.port,
+                    "database": config.database,
+                    "publication": config.publication,
+                    "slot_name": config.slot_name,
+                    "tables": config.tables,
+                });
+                add_heartbeat_semantics(
+                    &mut semantic,
+                    config.heartbeat_interval,
+                    config.heartbeat_action_query.as_deref(),
+                    &config.heartbeat_topics_prefix,
+                    config.heartbeat_topic_name.as_deref(),
+                );
+                semantic
+            }
             Self::Mysql(config) => serde_json::json!({
                 "type": "mysql",
                 "hostname": config.hostname,
@@ -213,6 +223,15 @@ pub struct PostgresSourceConfig {
     #[serde(default = "default_connect_timeout")]
     #[serde(with = "humantime_serde")]
     pub connect_timeout: Duration,
+    #[serde(default)]
+    #[serde(with = "humantime_serde")]
+    pub heartbeat_interval: Duration,
+    #[serde(default)]
+    pub heartbeat_action_query: Option<String>,
+    #[serde(default = "default_heartbeat_topics_prefix")]
+    pub heartbeat_topics_prefix: String,
+    #[serde(default)]
+    pub heartbeat_topic_name: Option<String>,
 }
 
 impl PostgresSourceConfig {
@@ -236,6 +255,11 @@ impl PostgresSourceConfig {
                 )));
             }
         }
+        validate_heartbeat(
+            &self.heartbeat_topics_prefix,
+            self.heartbeat_topic_name.as_deref(),
+            self.heartbeat_action_query.as_deref(),
+        )?;
         Ok(())
     }
 
@@ -327,20 +351,11 @@ impl MySqlSourceConfig {
                     .into(),
             ));
         }
-        if self.heartbeat_topics_prefix.trim().is_empty() {
-            return Err(Error::Configuration(
-                "source.heartbeat_topics_prefix must not be empty".into(),
-            ));
-        }
-        if self
-            .heartbeat_topic_name
-            .as_ref()
-            .is_some_and(|name| name.trim().is_empty())
-        {
-            return Err(Error::Configuration(
-                "source.heartbeat_topic_name must not be empty when set".into(),
-            ));
-        }
+        validate_heartbeat(
+            &self.heartbeat_topics_prefix,
+            self.heartbeat_topic_name.as_deref(),
+            None,
+        )?;
         if !matches!(
             self.ssl_mode.as_str(),
             "disabled" | "preferred" | "required" | "verify_ca" | "verify_identity"
@@ -746,6 +761,57 @@ fn validate_name(value: &str, field: &str) -> Result<()> {
     }
 }
 
+fn validate_heartbeat(
+    topics_prefix: &str,
+    topic_name: Option<&str>,
+    action_query: Option<&str>,
+) -> Result<()> {
+    if topics_prefix.trim().is_empty() {
+        return Err(Error::Configuration(
+            "source.heartbeat_topics_prefix must not be empty".into(),
+        ));
+    }
+    if topic_name.is_some_and(|name| name.trim().is_empty()) {
+        return Err(Error::Configuration(
+            "source.heartbeat_topic_name must not be empty when set".into(),
+        ));
+    }
+    if action_query.is_some_and(|query| query.trim().is_empty()) {
+        return Err(Error::Configuration(
+            "source.heartbeat_action_query must not be empty when set".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn add_heartbeat_semantics(
+    semantic: &mut serde_json::Value,
+    interval: Duration,
+    action_query: Option<&str>,
+    topics_prefix: &str,
+    topic_name: Option<&str>,
+) {
+    if interval.is_zero()
+        && action_query.is_none()
+        && topics_prefix == "__debezium-heartbeat"
+        && topic_name.is_none()
+    {
+        return;
+    }
+    semantic
+        .as_object_mut()
+        .expect("source semantic is an object")
+        .insert(
+            "heartbeat".into(),
+            serde_json::json!({
+                "interval": interval,
+                "action_query": action_query,
+                "topics_prefix": topics_prefix,
+                "topic_name": topic_name,
+            }),
+        );
+}
+
 fn hex_digest(input: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input);
@@ -935,5 +1001,30 @@ sink:
             source.heartbeat_topic_name.as_deref(),
             Some("shared-heartbeat")
         );
+    }
+
+    #[test]
+    fn parses_native_postgresql_heartbeat_settings() {
+        let default = Config::from_yaml(CONFIG).unwrap();
+        let config = Config::from_yaml(
+            &CONFIG.replace(
+                "  password: secret\n",
+                "  password: secret\n  heartbeat_interval: 5s\n  heartbeat_action_query: UPDATE public.heartbeat SET touched_at = now()\n  heartbeat_topics_prefix: __heartbeat\n  heartbeat_topic_name: shared-heartbeat\n",
+            ),
+        )
+        .unwrap();
+        let source = config.source.as_postgresql().unwrap();
+        assert_eq!(source.heartbeat_interval, Duration::from_secs(5));
+        assert_eq!(
+            source.heartbeat_action_query.as_deref(),
+            Some("UPDATE public.heartbeat SET touched_at = now()")
+        );
+        assert_eq!(source.heartbeat_topics_prefix, "__heartbeat");
+        assert_eq!(
+            source.heartbeat_topic_name.as_deref(),
+            Some("shared-heartbeat")
+        );
+        assert!(default.source.semantic_config().get("heartbeat").is_none());
+        assert_ne!(default.fingerprint(), config.fingerprint());
     }
 }

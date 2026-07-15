@@ -17,6 +17,8 @@ async fn main() -> Result<()> {
     let source_config = config.source.as_postgresql().cloned().ok_or_else(|| {
         Error::Configuration("this application expects a PostgreSQL source".into())
     })?;
+    let heartbeat_topics_prefix = source_config.heartbeat_topics_prefix.clone();
+    let heartbeat_topic_name = source_config.heartbeat_topic_name.clone();
 
     let source = Box::new(PostgresSource::new(
         &config.metadata.name,
@@ -27,8 +29,8 @@ async fn main() -> Result<()> {
         topic_prefix: config.sink.topic_prefix().into(),
         unavailable_value: config.format.unavailable_value.clone(),
         tombstones_on_delete: config.format.tombstones_on_delete,
-        heartbeat_topics_prefix: "__debezium-heartbeat".into(),
-        heartbeat_topic_name: None,
+        heartbeat_topics_prefix,
+        heartbeat_topic_name,
     }));
     let checkpoints: Arc<dyn CheckpointStore> =
         Arc::new(SqliteCheckpointStore::open(&config.state.path).await?);

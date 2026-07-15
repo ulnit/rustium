@@ -62,7 +62,7 @@ The workspace contains a runnable alpha service.
 | SQLite checkpoint v2 and connector state | Implemented; version 1 JSON remains readable |
 | Native and Debezium JSON | Implemented |
 | stdout and Kafka sinks | Implemented |
-| PostgreSQL source | Implemented; destructive-DDL restart gate passes with PostgreSQL 17 |
+| PostgreSQL source | Implemented; destructive-DDL restart and heartbeat/action-query gates pass with PostgreSQL 17 |
 | MySQL source | Implemented; Docker and external destructive-DDL restart gates pass with MySQL 8.4 |
 | SQL Server source | Implemented and externally integration-tested with SQL Server 2022 Developer CU25 |
 | CLI and HTTP management | Implemented |
@@ -229,6 +229,8 @@ The PostgreSQL connector-state payload persists the snapshot table layout plus e
 
 PostgreSQL does not put original DDL or column nullability/default metadata into `Relation`. If a transient historical column no longer exists in the current catalog and was not present in the checkpoint baseline, Rustium resolves its type from OID/typmod and conservatively marks it optional. This preserves row decoding and ordering without claiming unavailable metadata.
 
+`heartbeat.interval.ms` defaults to zero. A positive interval emits a visible heartbeat at the latest SourceRecord position already admitted to the bounded queue, or at the completed snapshot anchor before the first streaming event. No heartbeat is emitted when no source position exists. `heartbeat.action.query` optionally executes first on a reused ordinary SQL connection at each interval. Its WAL is not treated as progress until `pgoutput` returns it, and query failures stop the source with the database error. Heartbeat-table changes can be included in the publication but excluded by the table selector; their transaction commit still advances the safe WAL position without exposing a business-table event.
+
 #### 9.4 Remaining PostgreSQL gates
 
 - incremental snapshots and signaling;
@@ -294,7 +296,7 @@ The MySQL 8.4 Docker gate covers:
 - checkpoint stop before an old-schema row, destructive drop/add-column DDL, and a new-schema row;
 - restart after the database already exposes the final schema, with correct old-schema decoding, DDL state checkpointing, and new-schema decoding.
 
-Unit gates cover checkpoint/state atomicity, version 1 checkpoint compatibility, schema-history serialization, replay-state rewind, scalar conversions, heartbeat encoding, selected-table isolation, and create/alter/drop/rename DDL application. The external MySQL 8.4 gate also verifies periodic heartbeat emission during an idle stream alongside destructive-DDL recovery.
+Unit gates cover checkpoint/state atomicity, version 1 checkpoint compatibility, schema-history serialization, replay-state rewind, scalar conversions, heartbeat encoding, selected-table isolation, and create/alter/drop/rename DDL application. The external PostgreSQL 17 gate verifies periodic heartbeat emission, successful `heartbeat.action.query`, and heartbeat-table filtering. The external MySQL 8.4 gate verifies periodic heartbeat emission during an idle stream alongside destructive-DDL recovery.
 
 #### 10.6 Remaining MySQL gates
 
@@ -407,7 +409,7 @@ RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo \
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
 ```
 
-This gate creates isolated table/publication/slot names and verifies snapshot rows, ordered transactional create/update/delete events, checkpoint stop, an old-schema row, destructive drop/add-column DDL, a new-schema row, historical `Relation` replay with schema versions 1 and 2, restart without snapshot replay, and cleanup. It has passed against PostgreSQL 17 with `wal_level=logical`.
+These tests create isolated table/publication/slot names and verify snapshot rows, ordered transactional create/update/delete events, checkpoint stop, an old-schema row, destructive drop/add-column DDL, a new-schema row, historical `Relation` replay with schema versions 1 and 2, restart without snapshot replay, periodic heartbeat records at a safe WAL position, `heartbeat.action.query`, heartbeat-table filtering, and cleanup. They pass against PostgreSQL 17 with `wal_level=logical`.
 
 The ignored external SQL Server test reads connection settings from the environment and does not contain repository credentials:
 
@@ -488,7 +490,7 @@ Workspace 已包含可运行的 alpha 服务。
 | SQLite checkpoint v2 与连接器状态 | 已实现；仍可读取 version 1 JSON |
 | 原生和 Debezium JSON | 已实现 |
 | stdout 和 Kafka Sink | 已实现 |
-| PostgreSQL Source | 已实现；PostgreSQL 17 破坏性 DDL 重启门槛通过 |
+| PostgreSQL Source | 已实现；PostgreSQL 17 破坏性 DDL 重启及 heartbeat/action-query 门槛通过 |
 | MySQL Source | 已实现；MySQL 8.4 Docker 和外部破坏性 DDL 重启门槛通过 |
 | SQL Server Source | 已实现并通过 SQL Server 2022 Developer CU25 外部集成测试 |
 | CLI 和 HTTP 管理 | 已实现 |
@@ -655,6 +657,8 @@ PostgreSQL connector-state payload 持久化快照表布局，以及每列的类
 
 PostgreSQL 不会在 `Relation` 中记录原始 DDL、列可空性或 default。如果短暂历史列已经从当前 catalog 消失，且 checkpoint 基线中也不存在，Rustium 会通过 OID/typmod 解析类型，并保守地标记为 optional。这样可保持行解码和顺序正确，同时不伪造 WAL 未提供的元数据。
 
+`heartbeat.interval.ms` 默认为零。设置为正数后，会在最新已进入有界队列的 SourceRecord 位点发送可见 heartbeat；首条 streaming event 之前则使用已完成快照的锚点。没有源位点时不会发送 heartbeat。可选的 `heartbeat.action.query` 在每个周期先通过复用的普通 SQL 连接执行。查询产生的 WAL 只有在 `pgoutput` 实际返回后才算进度，查询失败会携带数据库错误停止 Source。heartbeat 表可以加入 publication 但被选表规则排除；其事务 commit 仍可推进安全 WAL 位点，而不会暴露成业务表事件。
+
 #### 9.4 PostgreSQL 剩余门槛
 
 - 增量快照和信号；
@@ -720,7 +724,7 @@ MySQL 8.4 Docker 门槛覆盖：
 - 在旧 schema 行之前停止并建立 checkpoint，随后执行破坏性删列/加列 DDL，再写入新 schema 行；
 - 当数据库已经暴露最终 schema 后重启，正确解码旧 schema 行、checkpoint DDL 状态，并解码新 schema 行。
 
-单元门槛覆盖 checkpoint/state 原子性、version 1 checkpoint 兼容、schema-history 序列化、重放状态回卷、标量转换、heartbeat 编码、选表隔离，以及 create/alter/drop/rename DDL 应用。外部 MySQL 8.4 门槛还会在破坏性 DDL 恢复之外验证空闲 stream 的周期 heartbeat。
+单元门槛覆盖 checkpoint/state 原子性、version 1 checkpoint 兼容、schema-history 序列化、重放状态回卷、标量转换、heartbeat 编码、选表隔离，以及 create/alter/drop/rename DDL 应用。外部 PostgreSQL 17 门槛验证周期 heartbeat、成功执行 `heartbeat.action.query` 和 heartbeat 表过滤。外部 MySQL 8.4 门槛还会在破坏性 DDL 恢复之外验证空闲 stream 的周期 heartbeat。
 
 #### 10.6 MySQL 剩余门槛
 
@@ -833,7 +837,7 @@ RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo \
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
 ```
 
-该门槛使用隔离的表/publication/slot 名称，验证快照记录、同一事务内有序的 create/update/delete 事件、checkpoint 停止、旧 schema 行、破坏性删列/加列 DDL、新 schema 行、schema version 1 和 2 的历史 `Relation` 重放、重启不重复快照，以及资源清理。测试已在启用 `wal_level=logical` 的 PostgreSQL 17 上通过。
+这些测试使用隔离的表/publication/slot 名称，验证快照记录、同一事务内有序的 create/update/delete 事件、checkpoint 停止、旧 schema 行、破坏性删列/加列 DDL、新 schema 行、schema version 1 和 2 的历史 `Relation` 重放、重启不重复快照、安全 WAL 位点上的周期 heartbeat、`heartbeat.action.query`、heartbeat 表过滤，以及资源清理。测试已在启用 `wal_level=logical` 的 PostgreSQL 17 上通过。
 
 被忽略的 SQL Server 外部测试从环境变量读取连接配置，仓库中不包含测试凭据：
 
