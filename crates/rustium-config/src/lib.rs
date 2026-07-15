@@ -295,6 +295,13 @@ pub struct MySqlSourceConfig {
     pub reconnect_max_attempts: u32,
     #[serde(default)]
     pub schema_history_skip_unparseable_ddl: bool,
+    #[serde(default)]
+    #[serde(with = "humantime_serde")]
+    pub heartbeat_interval: Duration,
+    #[serde(default = "default_heartbeat_topics_prefix")]
+    pub heartbeat_topics_prefix: String,
+    #[serde(default)]
+    pub heartbeat_topic_name: Option<String>,
 }
 
 impl MySqlSourceConfig {
@@ -318,6 +325,20 @@ impl MySqlSourceConfig {
             return Err(Error::Configuration(
                 "source.reconnect_max_attempts must be greater than zero when connect_keep_alive is enabled"
                     .into(),
+            ));
+        }
+        if self.heartbeat_topics_prefix.trim().is_empty() {
+            return Err(Error::Configuration(
+                "source.heartbeat_topics_prefix must not be empty".into(),
+            ));
+        }
+        if self
+            .heartbeat_topic_name
+            .as_ref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err(Error::Configuration(
+                "source.heartbeat_topic_name must not be empty when set".into(),
             ));
         }
         if !matches!(
@@ -783,6 +804,9 @@ const fn default_snapshot_fetch_size() -> usize {
 fn default_unavailable_value() -> String {
     "__rustium_unavailable_value".into()
 }
+fn default_heartbeat_topics_prefix() -> String {
+    "__debezium-heartbeat".into()
+}
 fn default_topic_prefix() -> String {
     "rustium".into()
 }
@@ -880,5 +904,36 @@ sink:
         )
         .unwrap();
         assert!(!config.format.tombstones_on_delete);
+    }
+
+    #[test]
+    fn parses_native_mysql_heartbeat_settings() {
+        let config = Config::from_yaml(
+            r#"
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: inventory-mysql
+source:
+  type: mysql
+  username: rustium
+  password: secret
+  databases: [inventory]
+  heartbeat_interval: 5s
+  heartbeat_topics_prefix: __heartbeat
+  heartbeat_topic_name: shared-heartbeat
+sink:
+  type: stdout
+  topic_prefix: inventory
+"#,
+        )
+        .unwrap();
+        let source = config.source.as_mysql().unwrap();
+        assert_eq!(source.heartbeat_interval, Duration::from_secs(5));
+        assert_eq!(source.heartbeat_topics_prefix, "__heartbeat");
+        assert_eq!(
+            source.heartbeat_topic_name.as_deref(),
+            Some("shared-heartbeat")
+        );
     }
 }

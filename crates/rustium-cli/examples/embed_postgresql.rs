@@ -27,6 +27,8 @@ async fn main() -> Result<()> {
         topic_prefix: config.sink.topic_prefix().into(),
         unavailable_value: config.format.unavailable_value.clone(),
         tombstones_on_delete: config.format.tombstones_on_delete,
+        heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+        heartbeat_topic_name: None,
     }));
     let checkpoints: Arc<dyn CheckpointStore> =
         Arc::new(SqliteCheckpointStore::open(&config.state.path).await?);

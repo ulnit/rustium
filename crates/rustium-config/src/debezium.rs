@@ -148,6 +148,13 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
                 "schema.history.internal.skip.unparseable.ddl",
                 false,
             )?,
+            heartbeat_interval: duration_ms(properties, "heartbeat.interval.ms", Duration::ZERO)?,
+            heartbeat_topics_prefix: properties
+                .get("topic.heartbeat.prefix")
+                .or_else(|| properties.get("heartbeat.topics.prefix"))
+                .cloned()
+                .unwrap_or_else(default_heartbeat_topics_prefix),
+            heartbeat_topic_name: properties.get("topic.heartbeat.name").cloned(),
         }),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -573,6 +580,10 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "connection.validation.timeout.ms",
         "unavailable.value.placeholder",
         "tombstones.on.delete",
+        "heartbeat.interval.ms",
+        "heartbeat.topics.prefix",
+        "topic.heartbeat.prefix",
+        "topic.heartbeat.name",
         "offset.storage.file.filename",
         "bootstrap.servers",
         "rustium.sink.type",
@@ -656,6 +667,10 @@ connect.keep.alive=false
 connect.keep.alive.interval.ms=250
 rustium.source.reconnect.max.attempts=3
 schema.history.internal.skip.unparseable.ddl=true
+heartbeat.interval.ms=1000
+heartbeat.topics.prefix=__legacy-heartbeat
+topic.heartbeat.prefix=__custom-heartbeat
+topic.heartbeat.name=shared-heartbeat
 "#,
         )
         .unwrap();
@@ -669,6 +684,12 @@ schema.history.internal.skip.unparseable.ddl=true
         );
         assert_eq!(source.reconnect_max_attempts, 3);
         assert!(source.schema_history_skip_unparseable_ddl);
+        assert_eq!(source.heartbeat_interval, Duration::from_secs(1));
+        assert_eq!(source.heartbeat_topics_prefix, "__custom-heartbeat");
+        assert_eq!(
+            source.heartbeat_topic_name.as_deref(),
+            Some("shared-heartbeat")
+        );
         assert!(source.tables.includes("inventory", "orders"));
         assert!(!source.tables.includes("inventory", "products"));
     }

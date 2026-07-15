@@ -119,6 +119,9 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
         connect_keep_alive_interval: Duration::from_millis(100),
         reconnect_max_attempts: 5,
         schema_history_skip_unparseable_ddl: false,
+        heartbeat_interval: Duration::ZERO,
+        heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+        heartbeat_topic_name: None,
     };
     let mut source = MySqlSource::new(
         "inventory-mysql",

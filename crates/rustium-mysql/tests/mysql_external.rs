@@ -51,7 +51,11 @@ impl TestSettings {
             username: self.cdc_user.clone(),
             password: self.cdc_password.clone(),
             databases: vec![self.database.clone()],
-            server_id: 50_000 + std::process::id() % 10_000,
+            server_id: 50_000
+                + table_name
+                    .bytes()
+                    .fold(0_u32, |hash, byte| hash.wrapping_mul(31) + u32::from(byte))
+                    % 10_000,
             tables: TableSelection {
                 include: vec![format!(r"{}\.{table_name}", self.database)],
                 exclude: Vec::new(),
@@ -62,7 +66,98 @@ impl TestSettings {
             connect_keep_alive_interval: Duration::from_millis(250),
             reconnect_max_attempts: 5,
             schema_history_skip_unparseable_ddl: false,
+            heartbeat_interval: Duration::ZERO,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external MySQL 8.0+ server with row binlog and GTID enabled"]
+async fn emits_periodic_heartbeat_from_safe_binlog_position() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_heartbeat_{}", &suffix[..12]);
+    let connector_name = format!("mysql-heartbeat-{}", &suffix[..12]);
+    let qualified_table = format!(
+        "{}.{}",
+        quote_identifier(&settings.database),
+        quote_identifier(&table_name)
+    );
+    let mut admin = connect_admin(&settings).await?;
+
+    let outcome: TestResult = async {
+        admin
+            .query_drop(format!(
+                "CREATE TABLE {qualified_table} (id BIGINT NOT NULL PRIMARY KEY)"
+            ))
+            .await?;
+        let mut config = settings.source_config(&table_name);
+        config.heartbeat_interval = Duration::from_millis(100);
+        config.heartbeat_topics_prefix = "__rustium-test-heartbeat".into();
+        let mut source = MySqlSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None, None);
+
+        let capture_result: TestResult = async {
+            loop {
+                let record = receive(&mut output).await?;
+                let Some(event) = record.event else {
+                    continue;
+                };
+                if event.operation != Operation::Message {
+                    continue;
+                }
+                require(
+                    record.boundary == RecordBoundary::Heartbeat,
+                    "MySQL heartbeat has the wrong record boundary",
+                )?;
+                require(
+                    event.source.table.is_none() && event.source.schema.is_none(),
+                    "MySQL heartbeat was exposed as a table event",
+                )?;
+                require(
+                    event.source.attributes.get("rustium.heartbeat") == Some(&true.into()),
+                    "MySQL heartbeat marker is missing",
+                )?;
+                require(
+                    matches!(record.position, SourcePosition::MySql(ref position) if !position.snapshot),
+                    "MySQL heartbeat does not carry a streaming binlog position",
+                )?;
+                break Ok(());
+            }
+        }
+        .await;
+
+        finish_source(cancellation, source_task, capture_result).await
+    }
+    .await;
+
+    let cleanup_result = admin
+        .query_drop(format!("DROP TABLE IF EXISTS {qualified_table}"))
+        .await
+        .map_err(boxed_error);
+    let close_result = admin.disconnect().await.map_err(boxed_error);
+    match (outcome, cleanup_result, close_result) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), cleanup, close) => {
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("MySQL heartbeat test cleanup also failed: {cleanup_error}");
+            }
+            if let Err(close_error) = close {
+                eprintln!("MySQL heartbeat test connection close also failed: {close_error}");
+            }
+            Err(error)
+        }
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
     }
 }
 

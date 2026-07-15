@@ -263,11 +263,13 @@ The read lock is held only for transaction establishment and coordinate capture,
 
 Row events produce typed before/after images. FULL, MINIMAL, and NOBLOB images are accepted; omitted values are explicit `Unavailable` values. GTID transactions carry total order and collection order.
 
-MySQL schema history is a versioned connector-state payload containing the ordered field model for tables in captured databases. Snapshot completion establishes the baseline. On restart, Rustium restores that baseline from the checkpoint before opening the binlog, then parses and applies DDL query events in source order. The updated schema state is attached to the DDL transaction boundary, so sink acknowledgement, source position, and schema state advance together.
+MySQL schema history is a versioned connector-state payload containing the ordered field model for selected tables in captured databases. Snapshot completion establishes the baseline. On restart, Rustium restores that baseline from the checkpoint before opening the binlog, then parses and applies selected-table DDL query events in source order. The updated schema state is attached to the DDL transaction boundary, so sink acknowledgement, source position, and schema state advance together. Discovery and DDL application ignore unselected tables so independent connectors sharing one database cannot mutate each other's history.
 
 The current `sqlparser`-based MySQL DDL path handles `CREATE TABLE`, `ALTER TABLE` add/drop/rename/modify/change column operations, primary-key changes, `DROP TABLE`, `RENAME TABLE`, and schema-neutral `TRUNCATE TABLE`. Parsing or state-application failures stop the connector by default. `schema.history.internal.skip.unparseable.ddl=true` matches Debezium's opt-in skip behavior and logs the metadata-risk warning.
 
 When `connect.keep.alive=true`, an ended or failed binlog stream is reopened from the last SourceRecord successfully sent into the bounded runtime queue. The rewind restores the binlog filename, table-map anchor, GTID transaction counters, row ordinal, and replay filter so completed records are skipped deterministically. `connect.keep.alive.interval.ms` controls the delay between attempts; `rustium.source.reconnect.max.attempts` is Rustium's finite extension and defaults to 10. The attempt number and last error are logged, and the budget resets after new source progress.
+
+`heartbeat.interval.ms` defaults to zero and disables visible heartbeats. A positive interval emits a heartbeat from the latest safe streaming position, so its sink acknowledgement and checkpoint follow the normal at-least-once sequence without inventing binlog progress. Debezium JSON uses the `serverName` key and `ts_ms` value. Topic resolution prefers `topic.heartbeat.name`; otherwise it joins `topic.heartbeat.prefix` (or legacy `heartbeat.topics.prefix`) with `topic.prefix`.
 
 #### 10.4 TLS modes
 
@@ -292,12 +294,12 @@ The MySQL 8.4 Docker gate covers:
 - checkpoint stop before an old-schema row, destructive drop/add-column DDL, and a new-schema row;
 - restart after the database already exposes the final schema, with correct old-schema decoding, DDL state checkpointing, and new-schema decoding.
 
-Unit gates cover checkpoint/state atomicity, version 1 checkpoint compatibility, schema-history serialization, replay-state rewind, scalar conversions, and create/alter/drop/rename DDL application.
+Unit gates cover checkpoint/state atomicity, version 1 checkpoint compatibility, schema-history serialization, replay-state rewind, scalar conversions, heartbeat encoding, selected-table isolation, and create/alter/drop/rename DDL application. The external MySQL 8.4 gate also verifies periodic heartbeat emission during an idle stream alongside destructive-DDL recovery.
 
 #### 10.6 Remaining MySQL gates
 
 - GTID source include/exclude filters;
-- heartbeat and signaling records;
+- signaling records;
 - incremental snapshots;
 - custom trust/key stores and wider type fixtures;
 - exact reconstruction of server-side partial JSON diffs.
@@ -392,7 +394,7 @@ RUSTIUM_MYSQL_TEST_DATABASE=cdc_demo \
 cargo test -p rustium-mysql --test mysql_external -- --ignored --nocapture
 ```
 
-This gate creates an isolated table with the admin account, runs snapshot and replication with the CDC account, checkpoints the baseline schema, stops the source, writes old/new rows around destructive DDL, resumes from the checkpoint, verifies schema versions 1 and 2, and cleans up. It has passed against MySQL 8.4 with row binlog and GTID enabled.
+This gate creates isolated selected tables with the admin account and runs concurrent CDC sources. It verifies snapshot/replication, checkpointed schema versions 1 and 2 across destructive DDL, selected-table history isolation, periodic idle-stream heartbeats from a safe binlog position, and cleanup. It has passed against MySQL 8.4 with row binlog and GTID enabled.
 
 The ignored external PostgreSQL test reads connection settings from the environment and does not contain repository credentials:
 
@@ -687,11 +689,13 @@ PostgreSQL 不会在 `Relation` 中记录原始 DDL、列可空性或 default。
 
 行事件生成强类型 before/after。FULL、MINIMAL 和 NOBLOB image 均可接受；省略值使用显式 `Unavailable`。GTID 事务包含全局顺序和集合内顺序。
 
-MySQL schema history 是版本化 connector-state payload，保存已捕获数据库中各表的有序字段模型。快照完成时建立基线。重启时，Rustium 在打开 binlog 前从 checkpoint 恢复该基线，然后按源顺序解析并应用 DDL query 事件。更新后的 schema 状态附着在对应 DDL 事务边界上，使 Sink 确认、源位点和 schema 状态一起推进。
+MySQL schema history 是版本化 connector-state payload，保存已捕获数据库中选中表的有序字段模型。快照完成时建立基线。重启时，Rustium 在打开 binlog 前从 checkpoint 恢复该基线，然后按源顺序解析并应用选中表的 DDL query 事件。更新后的 schema 状态附着在对应 DDL 事务边界上，使 Sink 确认、源位点和 schema 状态一起推进。发现和 DDL 应用会忽略未选表，因此共享同一数据库的独立连接器不会相互修改历史状态。
 
 当前基于 `sqlparser` 的 MySQL DDL 路径支持 `CREATE TABLE`、`ALTER TABLE` 增删/重命名/修改/变更列、主键变更、`DROP TABLE`、`RENAME TABLE`，以及 schema 不变的 `TRUNCATE TABLE`。默认情况下，解析或状态应用失败会停止连接器。`schema.history.internal.skip.unparseable.ddl=true` 与 Debezium 的显式跳过行为一致，并记录元数据风险警告。
 
 当 `connect.keep.alive=true` 时，结束或失败的 binlog stream 会从最后一个成功送入有界运行时队列的 SourceRecord 重新打开。回卷过程恢复 binlog 文件名、table-map 锚点、GTID 事务计数、行序号和重放过滤器，从而确定性跳过已完成记录。`connect.keep.alive.interval.ms` 控制尝试间隔；`rustium.source.reconnect.max.attempts` 是 Rustium 的有限扩展，默认 10。日志会记录尝试次数和最后错误，产生新的源端进度后预算重置。
+
+`heartbeat.interval.ms` 默认为零，即不发送可见 heartbeat。设置为正数后，从最新安全 streaming 位点发送 heartbeat，使其 Sink 确认和 checkpoint 遵循正常 at-least-once 顺序，同时不虚构 binlog 进度。Debezium JSON 使用 `serverName` key 和 `ts_ms` value。topic 优先使用 `topic.heartbeat.name`，否则将 `topic.heartbeat.prefix`（或旧参数 `heartbeat.topics.prefix`）与 `topic.prefix` 连接。
 
 #### 10.4 TLS 模式
 
@@ -716,12 +720,12 @@ MySQL 8.4 Docker 门槛覆盖：
 - 在旧 schema 行之前停止并建立 checkpoint，随后执行破坏性删列/加列 DDL，再写入新 schema 行；
 - 当数据库已经暴露最终 schema 后重启，正确解码旧 schema 行、checkpoint DDL 状态，并解码新 schema 行。
 
-单元门槛覆盖 checkpoint/state 原子性、version 1 checkpoint 兼容、schema-history 序列化、重放状态回卷、标量转换，以及 create/alter/drop/rename DDL 应用。
+单元门槛覆盖 checkpoint/state 原子性、version 1 checkpoint 兼容、schema-history 序列化、重放状态回卷、标量转换、heartbeat 编码、选表隔离，以及 create/alter/drop/rename DDL 应用。外部 MySQL 8.4 门槛还会在破坏性 DDL 恢复之外验证空闲 stream 的周期 heartbeat。
 
 #### 10.6 MySQL 剩余门槛
 
 - GTID source include/exclude 过滤；
-- heartbeat 和信号记录；
+- 信号记录；
 - 增量快照；
 - 自定义 trust/key store 和更广类型样例；
 - 服务端 partial JSON diff 的精确重建。
@@ -816,7 +820,7 @@ RUSTIUM_MYSQL_TEST_DATABASE=cdc_demo \
 cargo test -p rustium-mysql --test mysql_external -- --ignored --nocapture
 ```
 
-该门槛使用管理账号创建隔离测试表，使用 CDC 账号执行快照和复制，checkpoint 基线 schema，停止 Source，在破坏性 DDL 前后写入旧/新行，从 checkpoint 恢复，验证 schema version 1 和 2，并清理资源。测试已在启用行级 binlog 和 GTID 的 MySQL 8.4 上通过。
+该门槛使用管理账号创建隔离的选中表，并并发运行 CDC Source。测试验证快照/复制、破坏性 DDL 前后 checkpoint 的 schema version 1 和 2、选表历史隔离、从安全 binlog 位点发送的空闲周期 heartbeat，以及资源清理。测试已在启用行级 binlog 和 GTID 的 MySQL 8.4 上通过。
 
 被忽略的 PostgreSQL 外部测试从环境变量读取连接配置，仓库中不包含测试凭据：
 

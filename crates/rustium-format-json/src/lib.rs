@@ -12,6 +12,8 @@ pub struct JsonEncoderConfig {
     pub topic_prefix: String,
     pub unavailable_value: String,
     pub tombstones_on_delete: bool,
+    pub heartbeat_topics_prefix: String,
+    pub heartbeat_topic_name: Option<String>,
 }
 
 pub struct RustiumJsonEncoder {
@@ -65,6 +67,13 @@ impl EventEncoder for DebeziumJsonEncoder {
     }
 
     fn encode(&self, event: &ChangeEvent) -> Result<EncodedEvent> {
+        if is_heartbeat(event) {
+            return build_encoded(
+                event,
+                &self.config,
+                serde_json::json!({"ts_ms": event.observed_time.timestamp_millis()}),
+            );
+        }
         let source_ts = event.source_time.map(|time| time.timestamp_millis());
         let source = debezium_source(event, source_ts)?;
         let payload = serde_json::json!({
@@ -111,36 +120,52 @@ fn build_encoded(
     config: &JsonEncoderConfig,
     payload: serde_json::Value,
 ) -> Result<EncodedEvent> {
-    let table = event
-        .source
-        .table
-        .as_deref()
-        .ok_or_else(|| Error::Encoding("event has no source table".into()))?;
-    let destination = if event.source.connector == "mysql" {
-        format!(
-            "{}.{}.{}",
-            config.topic_prefix, event.source.database, table
-        )
+    let heartbeat = is_heartbeat(event);
+    let destination = if heartbeat {
+        config.heartbeat_topic_name.clone().unwrap_or_else(|| {
+            format!("{}.{}", config.heartbeat_topics_prefix, config.topic_prefix)
+        })
     } else {
-        let schema = event
+        let table = event
             .source
-            .schema
+            .table
             .as_deref()
-            .ok_or_else(|| Error::Encoding("event has no source schema".into()))?;
-        format!(
-            "{}.{}.{}.{}",
-            config.topic_prefix, event.source.database, schema, table
-        )
+            .ok_or_else(|| Error::Encoding("event has no source table".into()))?;
+        if event.source.connector == "mysql" {
+            format!(
+                "{}.{}.{}",
+                config.topic_prefix, event.source.database, table
+            )
+        } else {
+            let schema = event
+                .source
+                .schema
+                .as_deref()
+                .ok_or_else(|| Error::Encoding("event has no source schema".into()))?;
+            format!(
+                "{}.{}.{}.{}",
+                config.topic_prefix, event.source.database, schema, table
+            )
+        }
     };
-    let key = event
-        .after
-        .as_ref()
-        .or(event.before.as_ref())
-        .and_then(|row| event_key(row, event, &config.unavailable_value))
-        .map(|value| Bytes::from(serde_json::to_vec(&value).expect("JSON key cannot fail")));
+    let key = if heartbeat {
+        Some(Bytes::from(serde_json::to_vec(&serde_json::json!({
+            "serverName": event.source.connector_name,
+        }))?))
+    } else {
+        event
+            .after
+            .as_ref()
+            .or(event.before.as_ref())
+            .and_then(|row| event_key(row, event, &config.unavailable_value))
+            .map(|value| Bytes::from(serde_json::to_vec(&value).expect("JSON key cannot fail")))
+    };
     let mut headers = BTreeMap::new();
     headers.insert("rustium.event.id".into(), event.id.0.clone());
     headers.insert("rustium.content.type".into(), "application/json".into());
+    if heartbeat {
+        headers.insert("rustium.record.type".into(), "heartbeat".into());
+    }
     Ok(EncodedEvent {
         id: event.id.clone(),
         destination,
@@ -148,6 +173,14 @@ fn build_encoded(
         payload: Some(Bytes::from(serde_json::to_vec(&payload)?)),
         headers,
     })
+}
+
+fn is_heartbeat(event: &ChangeEvent) -> bool {
+    event
+        .source
+        .attributes
+        .get("rustium.heartbeat")
+        .is_some_and(|value| value == &serde_json::Value::Bool(true))
 }
 
 fn debezium_source(event: &ChangeEvent, source_ts: Option<i64>) -> Result<serde_json::Value> {
@@ -299,6 +332,8 @@ mod tests {
             topic_prefix: "app".into(),
             unavailable_value: "__unavailable".into(),
             tombstones_on_delete: true,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
         })
         .encode(&event())
         .unwrap();
@@ -320,6 +355,8 @@ mod tests {
             topic_prefix: "app".into(),
             unavailable_value: "__unavailable".into(),
             tombstones_on_delete: true,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
         })
         .encode_batch(&event)
         .unwrap();
@@ -346,11 +383,62 @@ mod tests {
             topic_prefix: "app".into(),
             unavailable_value: "__unavailable".into(),
             tombstones_on_delete: false,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
         })
         .encode_batch(&event)
         .unwrap();
 
         assert_eq!(encoded.len(), 1);
         assert!(encoded[0].payload.is_some());
+    }
+
+    #[test]
+    fn emits_debezium_heartbeat_key_topic_and_value() {
+        let mut event = event();
+        event.operation = Operation::Message;
+        event.before = None;
+        event.after = None;
+        event.source.table = None;
+        event.source.schema = None;
+        event
+            .source
+            .attributes
+            .insert("rustium.heartbeat".into(), true.into());
+
+        let encoded = DebeziumJsonEncoder::new(JsonEncoderConfig {
+            topic_prefix: "inventory".into(),
+            unavailable_value: "__unavailable".into(),
+            tombstones_on_delete: true,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
+        })
+        .encode(&event)
+        .unwrap();
+
+        let key: serde_json::Value = serde_json::from_slice(encoded.key.as_ref().unwrap()).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(encoded.payload.as_ref().unwrap()).unwrap();
+        assert_eq!(encoded.destination, "__debezium-heartbeat.inventory");
+        assert_eq!(key, serde_json::json!({"serverName": "orders"}));
+        assert_eq!(payload["ts_ms"], event.observed_time.timestamp_millis());
+        assert_eq!(
+            encoded
+                .headers
+                .get("rustium.record.type")
+                .map(String::as_str),
+            Some("heartbeat")
+        );
+
+        let overridden = DebeziumJsonEncoder::new(JsonEncoderConfig {
+            topic_prefix: "inventory".into(),
+            unavailable_value: "__unavailable".into(),
+            tombstones_on_delete: true,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: Some("shared-heartbeat".into()),
+        })
+        .encode(&event)
+        .unwrap();
+        assert_eq!(overridden.destination, "shared-heartbeat");
     }
 }

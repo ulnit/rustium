@@ -351,6 +351,7 @@ impl MySqlSource {
         last_safe_position: &mut Option<SourcePosition>,
         reconnect_attempts: &mut u32,
     ) -> Result<Option<Error>> {
+        let mut heartbeat = heartbeat_timer(self.config.heartbeat_interval);
         loop {
             tokio::select! {
                 _ = context.cancellation.cancelled() => return Ok(None),
@@ -375,6 +376,20 @@ impl MySqlSource {
                     {
                         *last_safe_position = Some(position);
                         *reconnect_attempts = 0;
+                    }
+                }
+                () = next_heartbeat(&mut heartbeat) => {
+                    if let Some(position) = last_safe_position.clone() {
+                        let database = self.config.databases.first().map_or("", String::as_str);
+                        context
+                            .output
+                            .send(Ok(heartbeat_record(
+                                &self.connector_name,
+                                database,
+                                position,
+                            )))
+                            .await
+                            .map_err(|_| Error::Cancelled)?;
                     }
                 }
             }
@@ -476,7 +491,24 @@ impl SourceConnector for MySqlSource {
             resume_position.clone(),
         );
         let mut stream_coordinates = coordinates.clone();
-        let mut last_safe_position = resume_position;
+        let mut last_safe_position = Some(
+            resume_position
+                .as_ref()
+                .filter(|position| {
+                    matches!(position, SourcePosition::MySql(position) if !position.snapshot)
+                })
+                .cloned()
+                .unwrap_or_else(|| {
+                    mysql_position(
+                        &coordinates.filename,
+                        coordinates.position,
+                        coordinates.gtid_set.clone(),
+                        coordinates.source_server_id,
+                        0,
+                        false,
+                    )
+                }),
+        );
         let mut reconnect_attempts = 0_u32;
 
         loop {
@@ -543,6 +575,79 @@ impl SourceConnector for MySqlSource {
                 .unwrap_or_else(|| coordinates.clone());
             state.rewind(&stream_coordinates, last_safe_position.clone());
         }
+    }
+}
+
+fn heartbeat_timer(interval: std::time::Duration) -> Option<tokio::time::Interval> {
+    if interval.is_zero() {
+        return None;
+    }
+    let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    Some(timer)
+}
+
+async fn next_heartbeat(timer: &mut Option<tokio::time::Interval>) {
+    match timer {
+        Some(timer) => {
+            timer.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn heartbeat_record(
+    connector_name: &str,
+    database: &str,
+    position: SourcePosition,
+) -> SourceRecord {
+    let observed_time = Utc::now();
+    let timestamp = observed_time.timestamp_millis();
+    let mut attributes = BTreeMap::new();
+    attributes.insert("rustium.heartbeat".into(), true.into());
+    let mut after = Row::new();
+    after.insert("ts_ms".into(), DataValue::Int64(timestamp));
+    let event = ChangeEvent {
+        id: EventId::deterministic(
+            connector_name,
+            database,
+            &position,
+            "__heartbeat",
+            u64::try_from(observed_time.timestamp_micros()).unwrap_or_default(),
+        ),
+        source: SourceMetadata {
+            connector: "mysql".into(),
+            connector_name: connector_name.into(),
+            database: database.into(),
+            schema: None,
+            table: None,
+            snapshot: false,
+            version: CONNECTOR_VERSION.into(),
+            attributes,
+        },
+        position: position.clone(),
+        transaction: None,
+        operation: Operation::Message,
+        before: None,
+        after: Some(after),
+        schema: EventSchema {
+            name: format!("{connector_name}.Heartbeat"),
+            version: 1,
+            fields: vec![FieldSchema {
+                name: "ts_ms".into(),
+                type_name: "int64".into(),
+                optional: false,
+                primary_key: false,
+            }],
+        },
+        source_time: None,
+        observed_time,
+    };
+    SourceRecord {
+        event: Some(event),
+        position,
+        boundary: RecordBoundary::Heartbeat,
+        connector_state: None,
     }
 }
 
@@ -976,7 +1081,9 @@ async fn discover_tables(
         .map_err(mysql_error)?;
     let mut schemas = HashMap::new();
     for (database, table) in tables {
-        if !config.databases.is_empty() && !config.databases.contains(&database) {
+        if (!config.databases.is_empty() && !config.databases.contains(&database))
+            || !config.tables.includes(&database, &table)
+        {
             continue;
         }
         let schema = discover_table_schema(connection, connector_name, &database, &table).await?;
@@ -1425,6 +1532,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn builds_heartbeat_at_the_safe_mysql_position() {
+        let position = mysql_position(
+            "mysql-bin.000004",
+            512,
+            Some("8f5f4a9a-6b2d-4dd5-915e-1df9d53d2850:42".into()),
+            184,
+            0,
+            false,
+        );
+        let record = heartbeat_record("inventory-mysql", "inventory", position.clone());
+        let event = record.event.unwrap();
+
+        assert_eq!(record.boundary, RecordBoundary::Heartbeat);
+        assert_eq!(record.position, position);
+        assert_eq!(event.operation, Operation::Message);
+        assert_eq!(event.source.table, None);
+        assert_eq!(event.source.schema, None);
+        assert_eq!(
+            event.source.attributes.get("rustium.heartbeat"),
+            Some(&true.into())
+        );
+        assert!(matches!(
+            event.after.unwrap().get("ts_ms"),
+            Some(DataValue::Int64(_))
+        ));
+    }
+
+    #[test]
     fn converts_mysql_scalar_types() {
         assert_eq!(
             convert_bytes(b"12.30", "decimal(10,2)"),
@@ -1500,6 +1635,9 @@ mod tests {
             connect_keep_alive_interval: std::time::Duration::from_secs(1),
             reconnect_max_attempts: 1,
             schema_history_skip_unparseable_ddl: false,
+            heartbeat_interval: std::time::Duration::ZERO,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
         };
         let mut source = MySqlSource::new(
             "inventory-mysql",

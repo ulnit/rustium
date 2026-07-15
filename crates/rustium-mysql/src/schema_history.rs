@@ -128,7 +128,7 @@ fn apply_statement(
             let mut changed = false;
             for name in names {
                 let key = table_key(&name, current_database)?;
-                if !tracks_database(config, &key.0) {
+                if !tracks_table(config, &key) {
                     continue;
                 }
                 let removed = schemas.remove(&key).is_some();
@@ -167,7 +167,7 @@ fn apply_create_table(
     connector_name: &str,
 ) -> Result<bool> {
     let key = table_key(&create.name, current_database)?;
-    if !tracks_database(config, &key.0) {
+    if !tracks_table(config, &key) {
         return Ok(false);
     }
     if create.if_not_exists && schemas.contains_key(&key) {
@@ -232,7 +232,7 @@ fn apply_alter_table(
     connector_name: &str,
 ) -> Result<bool> {
     let original_key = table_key(&name, current_database)?;
-    if !tracks_database(config, &original_key.0) {
+    if !tracks_table(config, &original_key) {
         return Ok(false);
     }
     let mut table = schemas
@@ -374,7 +374,7 @@ fn apply_alter_table(
     if table.event_schema != original_schema {
         table.event_schema.version = original_schema.version.saturating_add(1);
     }
-    if tracks_database(config, &target_key.0) {
+    if tracks_table(config, &target_key) {
         if target_key != original_key && schemas.contains_key(&target_key) {
             return Err(Error::Source(format!(
                 "MySQL schema history cannot rename {}.{} over existing table {}.{}",
@@ -393,13 +393,13 @@ fn rename_table(
     config: &MySqlSourceConfig,
     connector_name: &str,
 ) -> Result<bool> {
-    if !tracks_database(config, &old_key.0) {
+    if !tracks_table(config, &old_key) {
         return Ok(false);
     }
     let mut table = schemas
         .remove(&old_key)
         .ok_or_else(|| unknown_table(&old_key))?;
-    if tracks_database(config, &new_key.0) && schemas.contains_key(&new_key) {
+    if tracks_table(config, &new_key) && schemas.contains_key(&new_key) {
         return Err(Error::Source(format!(
             "MySQL schema history cannot rename {}.{} over existing table {}.{}",
             old_key.0, old_key.1, new_key.0, new_key.1
@@ -409,7 +409,7 @@ fn rename_table(
     table.table.clone_from(&new_key.1);
     table.event_schema.name = event_schema_name(connector_name, &new_key);
     table.event_schema.version = table.event_schema.version.saturating_add(1);
-    if tracks_database(config, &new_key.0) {
+    if tracks_table(config, &new_key) {
         schemas.insert(new_key, table);
     }
     Ok(true)
@@ -601,6 +601,10 @@ fn tracks_database(config: &MySqlSourceConfig, database: &str) -> bool {
     ) && (config.databases.is_empty() || config.databases.iter().any(|name| name == database))
 }
 
+fn tracks_table(config: &MySqlSourceConfig, key: &(String, String)) -> bool {
+    tracks_database(config, &key.0) && config.tables.includes(&key.0, &key.1)
+}
+
 fn unknown_table(key: &(String, String)) -> Error {
     Error::Source(format!(
         "MySQL schema history has no table {}.{}",
@@ -638,7 +642,29 @@ mod tests {
             connect_keep_alive_interval: Duration::from_secs(1),
             reconnect_max_attempts: 3,
             schema_history_skip_unparseable_ddl: false,
+            heartbeat_interval: Duration::ZERO,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
         }
+    }
+
+    #[test]
+    fn ignores_ddl_for_unselected_tables() {
+        let mut config = config();
+        config.tables.include = vec![r"inventory\.orders".into()];
+        let mut schemas = HashMap::new();
+
+        let changed = apply_ddl(
+            &mut schemas,
+            "CREATE TABLE customers (id BIGINT PRIMARY KEY)",
+            "inventory",
+            &config,
+            "inventory-mysql",
+        )
+        .unwrap();
+
+        assert!(!changed);
+        assert!(schemas.is_empty());
     }
 
     #[test]

@@ -168,10 +168,21 @@ fn build_source(config: &Config) -> Result<Box<dyn SourceConnector>> {
 }
 
 fn build_encoder(config: &Config) -> Arc<dyn EventEncoder> {
+    let (heartbeat_topics_prefix, heartbeat_topic_name) = config.source.as_mysql().map_or_else(
+        || ("__debezium-heartbeat".into(), None),
+        |source| {
+            (
+                source.heartbeat_topics_prefix.clone(),
+                source.heartbeat_topic_name.clone(),
+            )
+        },
+    );
     let encoder_config = JsonEncoderConfig {
         topic_prefix: config.sink.topic_prefix().into(),
         unavailable_value: config.format.unavailable_value.clone(),
         tombstones_on_delete: config.format.tombstones_on_delete,
+        heartbeat_topics_prefix,
+        heartbeat_topic_name,
     };
     match config.format.kind {
         FormatType::RustiumJson => Arc::new(RustiumJsonEncoder::new(encoder_config)),
