@@ -70,6 +70,7 @@ impl TestSettings {
             gtid_source_excludes: Vec::new(),
             gtid_source_filter_dml_events: true,
             heartbeat_interval: Duration::ZERO,
+            heartbeat_action_query: None,
             heartbeat_topics_prefix: "__debezium-heartbeat".into(),
             heartbeat_topic_name: None,
         }
@@ -82,11 +83,17 @@ async fn emits_periodic_heartbeat_from_safe_binlog_position() -> TestResult {
     let settings = TestSettings::from_env()?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let table_name = format!("rustium_heartbeat_{}", &suffix[..12]);
+    let action_table_name = format!("rustium_heartbeat_action_{}", &suffix[..12]);
     let connector_name = format!("mysql-heartbeat-{}", &suffix[..12]);
     let qualified_table = format!(
         "{}.{}",
         quote_identifier(&settings.database),
         quote_identifier(&table_name)
+    );
+    let qualified_action_table = format!(
+        "{}.{}",
+        quote_identifier(&settings.database),
+        quote_identifier(&action_table_name)
     );
     let mut admin = connect_admin(&settings).await?;
 
@@ -96,8 +103,27 @@ async fn emits_periodic_heartbeat_from_safe_binlog_position() -> TestResult {
                 "CREATE TABLE {qualified_table} (id BIGINT NOT NULL PRIMARY KEY)"
             ))
             .await?;
+        admin
+            .query_drop(format!(
+                "CREATE TABLE {qualified_action_table} (id BIGINT NOT NULL PRIMARY KEY, touched_at TIMESTAMP NULL)"
+            ))
+            .await?;
+        admin
+            .query_drop(format!(
+                "INSERT INTO {qualified_action_table} (id) VALUES (1)"
+            ))
+            .await?;
+        let cdc_user = settings.cdc_user.replace('\'', "''");
+        admin
+            .query_drop(format!(
+                "GRANT UPDATE ON {qualified_action_table} TO '{cdc_user}'@'%'"
+            ))
+            .await?;
         let mut config = settings.source_config(&table_name);
         config.heartbeat_interval = Duration::from_millis(100);
+        config.heartbeat_action_query = Some(format!(
+            "UPDATE {qualified_action_table} SET touched_at = CURRENT_TIMESTAMP WHERE id = 1"
+        ));
         config.heartbeat_topics_prefix = "__rustium-test-heartbeat".into();
         let mut source = MySqlSource::new(
             &connector_name,
@@ -140,14 +166,35 @@ async fn emits_periodic_heartbeat_from_safe_binlog_position() -> TestResult {
         }
         .await;
 
-        finish_source(cancellation, source_task, capture_result).await
+        finish_source(cancellation, source_task, capture_result).await?;
+        let touched: Option<bool> = admin
+            .query_first(format!(
+                "SELECT touched_at IS NOT NULL FROM {qualified_action_table} WHERE id = 1"
+            ))
+            .await?;
+        require(
+            touched == Some(true),
+            "MySQL heartbeat.action.query did not update the action table",
+        )
     }
     .await;
 
-    let cleanup_result = admin
-        .query_drop(format!("DROP TABLE IF EXISTS {qualified_table}"))
-        .await
-        .map_err(boxed_error);
+    let cleanup_result: TestResult = async {
+        let cdc_user = settings.cdc_user.replace('\'', "''");
+        admin
+            .query_drop(format!(
+                "REVOKE UPDATE ON {qualified_action_table} FROM '{cdc_user}'@'%'"
+            ))
+            .await?;
+        admin
+            .query_drop(format!("DROP TABLE IF EXISTS {qualified_table}"))
+            .await?;
+        admin
+            .query_drop(format!("DROP TABLE IF EXISTS {qualified_action_table}"))
+            .await?;
+        Ok(())
+    }
+    .await;
     let close_result = admin.disconnect().await.map_err(boxed_error);
     match (outcome, cleanup_result, close_result) {
         (Ok(()), Ok(()), Ok(())) => Ok(()),

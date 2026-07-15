@@ -226,18 +226,28 @@ impl SourceConfig {
                     );
                 semantic
             }
-            Self::Mysql(config) => serde_json::json!({
-                "type": "mysql",
-                "hostname": config.hostname,
-                "port": config.port,
-                "databases": config.databases,
-                "server_id": config.server_id,
-                "tables": config.tables,
-                "schema_history_skip_unparseable_ddl": config.schema_history_skip_unparseable_ddl,
-                "gtid_source_includes": config.gtid_source_includes,
-                "gtid_source_excludes": config.gtid_source_excludes,
-                "gtid_source_filter_dml_events": config.gtid_source_filter_dml_events,
-            }),
+            Self::Mysql(config) => {
+                let mut semantic = serde_json::json!({
+                    "type": "mysql",
+                    "hostname": config.hostname,
+                    "port": config.port,
+                    "databases": config.databases,
+                    "server_id": config.server_id,
+                    "tables": config.tables,
+                    "schema_history_skip_unparseable_ddl": config.schema_history_skip_unparseable_ddl,
+                    "gtid_source_includes": config.gtid_source_includes,
+                    "gtid_source_excludes": config.gtid_source_excludes,
+                    "gtid_source_filter_dml_events": config.gtid_source_filter_dml_events,
+                });
+                add_heartbeat_semantics(
+                    &mut semantic,
+                    config.heartbeat_interval,
+                    config.heartbeat_action_query.as_deref(),
+                    &config.heartbeat_topics_prefix,
+                    config.heartbeat_topic_name.as_deref(),
+                );
+                semantic
+            }
             Self::Sqlserver(config) => serde_json::json!({
                 "type": "sqlserver",
                 "hostname": config.hostname,
@@ -502,6 +512,8 @@ pub struct MySqlSourceConfig {
     #[serde(default)]
     #[serde(with = "humantime_serde")]
     pub heartbeat_interval: Duration,
+    #[serde(default)]
+    pub heartbeat_action_query: Option<String>,
     #[serde(default = "default_heartbeat_topics_prefix")]
     pub heartbeat_topics_prefix: String,
     #[serde(default)]
@@ -534,7 +546,7 @@ impl MySqlSourceConfig {
         validate_heartbeat(
             &self.heartbeat_topics_prefix,
             self.heartbeat_topic_name.as_deref(),
-            None,
+            self.heartbeat_action_query.as_deref(),
         )?;
         if !matches!(
             self.ssl_mode.as_str(),

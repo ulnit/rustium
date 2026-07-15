@@ -446,6 +446,7 @@ impl MySqlSource {
         context: &mut SourceContext,
         last_safe_position: &mut Option<SourcePosition>,
         reconnect_attempts: &mut u32,
+        heartbeat_connection: &mut Option<Conn>,
     ) -> Result<Option<Error>> {
         let mut heartbeat = heartbeat_timer(self.config.heartbeat_interval);
         loop {
@@ -475,6 +476,14 @@ impl MySqlSource {
                     }
                 }
                 () = next_heartbeat(&mut heartbeat) => {
+                    if let Some(query) = self.config.heartbeat_action_query.clone() {
+                        let connection = heartbeat_connection.take().ok_or_else(|| {
+                            Error::Source(
+                                "MySQL heartbeat action connection is unavailable".into(),
+                            )
+                        })?;
+                        *heartbeat_connection = Some(execute_heartbeat_action(connection, query).await?);
+                    }
                     if let Some(position) = last_safe_position.clone() {
                         let database = self.config.databases.first().map_or("", String::as_str);
                         context
@@ -589,6 +598,7 @@ impl SourceConnector for MySqlSource {
             self.schemas.clone(),
             resume_position.clone(),
         );
+        let mut heartbeat_connection = open_heartbeat_connection(&self.config).await?;
         let mut stream_coordinates = coordinates.clone();
         let mut last_safe_position = Some(
             resume_position
@@ -652,6 +662,7 @@ impl SourceConnector for MySqlSource {
                     &mut context,
                     &mut last_safe_position,
                     &mut reconnect_attempts,
+                    &mut heartbeat_connection,
                 )
                 .await?;
 
@@ -1135,6 +1146,21 @@ async fn connect(config: &MySqlSourceConfig) -> Result<Conn> {
         }
     };
     connect_with_options(config, builder).await
+}
+
+async fn open_heartbeat_connection(config: &MySqlSourceConfig) -> Result<Option<Conn>> {
+    if config.heartbeat_interval.is_zero() || config.heartbeat_action_query.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(connect(config).await?))
+}
+
+async fn execute_heartbeat_action(mut connection: Conn, query: String) -> Result<Conn> {
+    connection
+        .query_drop(query)
+        .await
+        .map_err(|error| Error::Source(format!("MySQL heartbeat.action.query failed: {error}")))?;
+    Ok(connection)
 }
 
 async fn connect_with_options(config: &MySqlSourceConfig, builder: OptsBuilder) -> Result<Conn> {
@@ -1670,6 +1696,7 @@ mod tests {
             gtid_source_excludes: Vec::new(),
             gtid_source_filter_dml_events: true,
             heartbeat_interval: std::time::Duration::ZERO,
+            heartbeat_action_query: None,
             heartbeat_topics_prefix: "__debezium-heartbeat".into(),
             heartbeat_topic_name: None,
         }

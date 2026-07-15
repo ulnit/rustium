@@ -646,6 +646,7 @@ mod tests {
             gtid_source_excludes: Vec::new(),
             gtid_source_filter_dml_events: true,
             heartbeat_interval: Duration::ZERO,
+            heartbeat_action_query: None,
             heartbeat_topics_prefix: "__debezium-heartbeat".into(),
             heartbeat_topic_name: None,
         }

@@ -216,15 +216,6 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
                 .into(),
         );
     }
-    if properties
-        .get("heartbeat.action.query")
-        .is_some_and(|query| !query.trim().is_empty())
-    {
-        warnings.push(
-            "heartbeat.action.query is not implemented by the Rustium MySQL source and was ignored"
-                .into(),
-        );
-    }
     let gtid_source_includes = csv_property(properties.get("gtid.source.includes"));
     let gtid_source_excludes = csv_property(properties.get("gtid.source.excludes"));
     if !gtid_source_includes.is_empty() && !gtid_source_excludes.is_empty() {
@@ -282,6 +273,10 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
                 true,
             )?,
             heartbeat_interval: duration_ms(properties, "heartbeat.interval.ms", Duration::ZERO)?,
+            heartbeat_action_query: properties
+                .get("heartbeat.action.query")
+                .filter(|query| !query.trim().is_empty())
+                .cloned(),
             heartbeat_topics_prefix: properties
                 .get("topic.heartbeat.prefix")
                 .or_else(|| properties.get("heartbeat.topics.prefix"))
@@ -974,6 +969,7 @@ schema.history.internal.skip.unparseable.ddl=true
 gtid.source.includes=8f5f4a9a-6b2d-4dd5-915e-1df9d53d2850,2f6f.*
 gtid.source.filter.dml.events=false
 heartbeat.interval.ms=1000
+heartbeat.action.query=UPDATE inventory.heartbeat SET touched_at = CURRENT_TIMESTAMP
 heartbeat.topics.prefix=__legacy-heartbeat
 topic.heartbeat.prefix=__custom-heartbeat
 topic.heartbeat.name=shared-heartbeat
@@ -997,6 +993,10 @@ topic.heartbeat.name=shared-heartbeat
         assert!(source.gtid_source_excludes.is_empty());
         assert!(!source.gtid_source_filter_dml_events);
         assert_eq!(source.heartbeat_interval, Duration::from_secs(1));
+        assert_eq!(
+            source.heartbeat_action_query.as_deref(),
+            Some("UPDATE inventory.heartbeat SET touched_at = CURRENT_TIMESTAMP")
+        );
         assert_eq!(source.heartbeat_topics_prefix, "__custom-heartbeat");
         assert_eq!(
             source.heartbeat_topic_name.as_deref(),
