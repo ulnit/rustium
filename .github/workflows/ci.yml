@@ -105,6 +105,8 @@ jobs:
       - name: Pull SQL Server 2022
         run: docker pull mcr.microsoft.com/mssql/server:2022-latest
       - name: Test SQL Server CDC portability
+        env:
+          RUSTIUM_SQLSERVER_RECONNECT_SOAK_CYCLES: "3"
         run: >-
           cargo test -p rustium-sqlserver --test sqlserver_docker --locked --
           snapshots_and_streams_cdc_changes --ignored --exact --nocapture

@@ -377,7 +377,7 @@ SQL Server supports Debezium-compatible source-table, file, bounded in-process, 
 
 `execute-snapshot` expands fully matched short or database-qualified collection expressions, requires a primary key, captures a fixed maximum key, and advances typed single/composite keysets. Connector state version 1 persists collection progress, additional conditions, current/maximum keys, chunk sequence, pause state, and a bounded history of completed or stopped signal IDs. One chunk runs per event-loop turn and only at a completed CDC commit boundary. Rustium inserts a unique open watermark and waits for its CDC create event before querying the chunk. It then inserts a distinct close watermark, emits ordinary CDC records while removing matching before/after primary keys from the buffered rows, validates the source schema again, and emits remaining reads at the close watermark commit. The synthetic chunk commit atomically advances the keyset state; source-table controls are checkpointed on their CDC commit, while Kafka offsets remain coupled to the runtime acknowledgement. An in-memory opening or open window is not persisted and is recreated after restart. `pause-snapshot`, `resume-snapshot`, and scoped `stop-snapshot` are idempotent across restart.
 
-Multiple database names require explicit partition-aware ordering and checkpoint ownership. Rustium rejects them until that contract is tested. The external gate has verified snapshot handoff, fetch-size-one update pairing, mid-transaction replay with preserved ordinals, forced polling-session termination followed by a different connection identity and lossless CDC recovery, concurrent commit ordering, retention fail-closed behavior, heartbeat/action-query, the core and extended type matrices, in-process keyset restart, source-table signaling with additional conditions, CDC-window concurrent-update deduplication, real-broker replay across the connector-checkpoint/Kafka-offset crash window, and resource cleanup against SQL Server 2022 Developer RTM-CU25. A required GitHub Actions gate starts the current SQL Server 2022 Linux image with SQL Server Agent, enables CDC, kills the active Rustium session, and verifies reconnection, the subsequent CDC transaction, snapshot/CDC transaction order, and XML, hierarchyid, geometry, and geography equality through a dynamically assigned host port.
+Multiple database names require explicit partition-aware ordering and checkpoint ownership. Rustium rejects them until that contract is tested. The external gate has verified snapshot handoff, fetch-size-one update pairing, mid-transaction replay with preserved ordinals, three capacity-one polling-session termination cycles with different connection identities, every expected row, and first-seen source order, concurrent commit ordering, retention fail-closed behavior, heartbeat/action-query, the core and extended type matrices, in-process keyset restart, source-table signaling with additional conditions, CDC-window concurrent-update deduplication, real-broker replay across the connector-checkpoint/Kafka-offset crash window, and resource cleanup against SQL Server 2022 Developer RTM-CU25. A required GitHub Actions gate starts the current SQL Server 2022 Linux image with SQL Server Agent, enables CDC, applies the same three-cycle backpressure/reconnect contract, and verifies snapshot/CDC transaction order plus XML, hierarchyid, geometry, and geography equality through a dynamically assigned host port. `RUSTIUM_SQLSERVER_RECONNECT_SOAK_CYCLES=1..1000` raises the cycle count.
 
 ### 12. Formats and Sinks
 
@@ -497,7 +497,7 @@ RUSTIUM_KAFKA_TEST_BOOTSTRAP_SERVERS=kafka.example.com:9092 \
 cargo test -p rustium-sqlserver --test sqlserver_external -- --ignored --nocapture
 ```
 
-This gate creates isolated table/capture-instance names and Kafka topics, waits for SQL Agent initialization, and verifies snapshot rows, fetch-size-one transaction continuation, mid-transaction checkpoint replay, forced polling-session termination and recovery from the unchanged typed CDC cursor, concurrent commit ordering, retention failure, heartbeat/action-query, core and extended snapshot/CDC type equality, checkpointed in-process keyset restart, source-table signaling with additional conditions, signal-table isolation, durable completed signal IDs, real-broker replay after connector-state persistence but before Kafka offset commit, and cleanup. It has passed against SQL Server 2022 Developer RTM-CU25.
+This gate creates isolated table/capture-instance names and Kafka topics, waits for SQL Agent initialization, and verifies snapshot rows, fetch-size-one transaction continuation, mid-transaction checkpoint replay, repeated capacity-one polling-session termination and recovery from the unchanged typed CDC cursor, connection-identity replacement, every expected row, first-seen source order, concurrent commit ordering, retention failure, heartbeat/action-query, core and extended snapshot/CDC type equality, checkpointed in-process keyset restart, source-table signaling with additional conditions, signal-table isolation, durable completed signal IDs, real-broker replay after connector-state persistence but before Kafka offset commit, and cleanup. It has passed against SQL Server 2022 Developer RTM-CU25.
 
 The separate SQL Server Docker portability gate is required by GitHub Actions and remains runnable where the Microsoft image is available:
 
@@ -507,7 +507,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. Roadmap
 
-1. Extend the backpressure/reconnect soak gate from PostgreSQL and MySQL to SQL Server and the shared runtime.
+1. Add long-running backpressure/retry soak coverage to the shared runtime now that all three prioritized connectors have required recovery soak gates.
 2. Add Schema Registry formats, packaging, security policy, operational runbooks, and stable upgrade migrations before `1.0`.
 3. Consider additional databases only after the current three connectors and shared runtime pass the `1.0` gates.
 
@@ -878,7 +878,7 @@ SQL Server 支持 Debezium 兼容的 source table、file、有界 in-process 和
 
 `execute-snapshot` 会展开完整匹配的短名称或 database-qualified 集合表达式，要求主键、固定最大主键，并推进带类型的单列/复合 keyset。Connector state version 1 持久化集合进度、additional condition、当前/最大 key、chunk 序号、pause 状态，以及有界的已完成或已停止 signal ID 历史。事件循环每轮只在完整 CDC commit 边界执行一个 chunk。Rustium 插入唯一 open watermark，并等待其 CDC create event 后才查询 chunk；随后插入不同 ID 的 close watermark，在正常发出 CDC record 的同时根据 before/after 主键从缓存中移除对应行，再次校验源表 schema，并在 close watermark commit 处发出剩余 read。合成 chunk commit 会原子推进 keyset 状态；source-table 控制在自身 CDC commit 上 checkpoint，Kafka offset 继续与 runtime acknowledgement 绑定。内存中的 opening/open window 不持久化，重启后会重新创建。`pause-snapshot`、`resume-snapshot` 和 scoped `stop-snapshot` 在重启后保持幂等。
 
-多个数据库名称需要显式的分区感知排序和 checkpoint 所有权。在该契约经过测试前，Rustium 会直接拒绝。外部门槛已在 SQL Server 2022 Developer RTM-CU25 上验证快照切换、fetch size 为 1 的 update 配对、保持事务序号的事务中间重放、强制终止 polling session 后出现不同连接 identity 并无损恢复 CDC、并发 commit 排序、retention fail-closed、heartbeat/action-query、核心和扩展类型矩阵、in-process keyset 重启、带 additional condition 的 source-table signaling、CDC window 并发更新去重、connector checkpoint/Kafka offset 崩溃窗口中的真实 broker 重放和资源清理。必须通过的 GitHub Actions 门槛会使用动态分配的主机端口启动当前 SQL Server 2022 Linux 镜像和 SQL Server Agent，启用 CDC、终止活动 Rustium session，并验证重连、后续 CDC 事务、快照/CDC 事务顺序以及 XML、hierarchyid、geometry 和 geography 一致性。
+多个数据库名称需要显式的分区感知排序和 checkpoint 所有权。在该契约经过测试前，Rustium 会直接拒绝。外部门槛已在 SQL Server 2022 Developer RTM-CU25 上验证快照切换、fetch size 为 1 的 update 配对、保持事务序号的事务中间重放、3 轮容量为 1 的 polling-session 终止循环及不同连接 identity、全部预期记录和首次出现的源端顺序、并发 commit 排序、retention fail-closed、heartbeat/action-query、核心和扩展类型矩阵、in-process keyset 重启、带 additional condition 的 source-table signaling、CDC window 并发更新去重、connector checkpoint/Kafka offset 崩溃窗口中的真实 broker 重放和资源清理。必须通过的 GitHub Actions 门槛会使用动态分配的主机端口启动当前 SQL Server 2022 Linux 镜像和 SQL Server Agent，启用 CDC，执行相同的 3 轮背压/重连契约，并验证快照/CDC 事务顺序以及 XML、hierarchyid、geometry 和 geography 一致性。`RUSTIUM_SQLSERVER_RECONNECT_SOAK_CYCLES=1..1000` 可提高循环数。
 
 ### 12. 格式与 Sink
 
@@ -998,7 +998,7 @@ RUSTIUM_KAFKA_TEST_BOOTSTRAP_SERVERS=kafka.example.com:9092 \
 cargo test -p rustium-sqlserver --test sqlserver_external -- --ignored --nocapture
 ```
 
-该门槛使用隔离的表/capture-instance 名称和 Kafka topic，等待 SQL Agent 初始化，并验证快照记录、fetch size 为 1 的事务继续读取、事务中间 checkpoint 重放、强制终止 polling session 后从未变化的带类型 CDC cursor 恢复、并发 commit 排序、retention 失败、heartbeat/action-query、核心和扩展快照/CDC 类型一致性、带 checkpoint 的 in-process keyset 重启、带 additional condition 的 source-table signaling、信号表隔离、已完成 signal ID 持久化、connector state 已持久化但 Kafka offset 尚未提交时的真实 broker 重放和资源清理。测试已在 SQL Server 2022 Developer RTM-CU25 上通过。
+该门槛使用隔离的表/capture-instance 名称和 Kafka topic，等待 SQL Agent 初始化，并验证快照记录、fetch size 为 1 的事务继续读取、事务中间 checkpoint 重放、容量为 1 的背压下重复终止 polling session 并从未变化的带类型 CDC cursor 恢复、连接 identity 替换、全部预期记录、首次出现的源端顺序、并发 commit 排序、retention 失败、heartbeat/action-query、核心和扩展快照/CDC 类型一致性、带 checkpoint 的 in-process keyset 重启、带 additional condition 的 source-table signaling、信号表隔离、已完成 signal ID 持久化、connector state 已持久化但 Kafka offset 尚未提交时的真实 broker 重放和资源清理。测试已在 SQL Server 2022 Developer RTM-CU25 上通过。
 
 独立的 SQL Server Docker 可移植性门槛是 GitHub Actions 必须通过的测试，在可以访问 Microsoft 镜像的环境中仍可手动运行：
 
@@ -1008,6 +1008,6 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. 路线图
 
-1. 将 PostgreSQL 和 MySQL 背压/重连 soak 门槛扩展到 SQL Server 和共享 runtime。
+1. 三个优先连接器都已有必选恢复 soak 门槛，下一步为共享 runtime 增加长时间背压/重试 soak 覆盖。
 2. 在 `1.0` 前补 Schema Registry 格式、打包、安全策略、运维手册和稳定升级迁移。
 3. 只有当当前三个连接器和共享运行时通过 `1.0` 门槛后，才考虑更多数据库。

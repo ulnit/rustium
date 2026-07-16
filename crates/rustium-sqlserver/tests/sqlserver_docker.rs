@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -19,6 +20,7 @@ use tokio_util::{compat::TokioAsyncWriteCompatExt, sync::CancellationToken};
 
 const SA_PASSWORD: &str = "Rustium_Strong_2026!";
 const CONNECTOR_PASSWORD: &str = "Cdc_Connector#2026!";
+type SqlClient = Client<tokio_util::compat::Compat<TcpStream>>;
 
 struct DockerContainer(String);
 
@@ -65,6 +67,75 @@ async fn connect(
     Client::connect(config, tcp.compat_write()).await
 }
 
+fn reconnect_soak_cycles() -> u32 {
+    let cycles = std::env::var("RUSTIUM_SQLSERVER_RECONNECT_SOAK_CYCLES")
+        .unwrap_or_else(|_| "3".into())
+        .parse::<u32>()
+        .expect("RUSTIUM_SQLSERVER_RECONNECT_SOAK_CYCLES is numeric");
+    assert!(
+        (1..=1_000).contains(&cycles),
+        "RUSTIUM_SQLSERVER_RECONNECT_SOAK_CYCLES must be between 1 and 1000"
+    );
+    cycles
+}
+
+async fn wait_for_output_backpressure(
+    output: &mpsc::Receiver<rustium_core::Result<rustium_core::SourceRecord>>,
+) {
+    for _ in 0..100 {
+        if output.capacity() == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("SQL Server source output did not reach bounded backpressure");
+}
+
+fn sqlserver_integer(value: Option<&DataValue>) -> Option<i64> {
+    match value {
+        Some(DataValue::Int32(value)) => Some(i64::from(*value)),
+        Some(DataValue::Int64(value)) => Some(*value),
+        Some(DataValue::UInt64(value)) => i64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+async fn source_connection(
+    admin: &mut SqlClient,
+    excluded_connection_id: Option<&str>,
+) -> (i32, String) {
+    for _ in 0..300 {
+        let row = admin
+            .simple_query(
+                "SELECT TOP (1) CAST(s.session_id AS int) AS session_id, \
+                        CONVERT(nvarchar(36), c.connection_id) AS connection_id \
+                 FROM sys.dm_exec_sessions s \
+                 JOIN sys.dm_exec_connections c ON c.session_id = s.session_id \
+                 WHERE s.program_name = N'rustium' AND s.login_name = N'rustium' \
+                 ORDER BY s.login_time DESC",
+            )
+            .await
+            .unwrap()
+            .into_row()
+            .await
+            .unwrap();
+        if let Some(row) = row {
+            let session_id = row
+                .get::<i32, _>("session_id")
+                .expect("active Rustium SQL Server polling session ID");
+            let connection_id = row
+                .get::<&str, _>("connection_id")
+                .expect("active Rustium SQL Server polling connection ID")
+                .to_owned();
+            if excluded_connection_id.is_none_or(|excluded| excluded != connection_id) {
+                return (session_id, connection_id);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("SQL Server polling connection did not become available");
+}
+
 fn mapped_port(container: &str) -> u16 {
     let output = Command::new("docker")
         .args(["port", container, "1433/tcp"])
@@ -107,6 +178,7 @@ fn require_extended_values(row: &Row) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker and the SQL Server 2022 image"]
 async fn snapshots_and_streams_cdc_changes() {
+    let soak_cycles = reconnect_soak_cycles();
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let name = format!("rustium-sqlserver-{suffix}");
     let output = Command::new("docker")
@@ -270,13 +342,13 @@ async fn snapshots_and_streams_cdc_changes() {
         },
     )
     .with_retry_policy(RetryPolicy {
-        max_retries: 5,
+        max_retries: 20,
         initial_delay: Duration::from_millis(50),
         max_delay: Duration::from_millis(250),
     });
     source.validate().await.unwrap();
 
-    let (output_tx, mut output_rx) = mpsc::channel(64);
+    let (output_tx, mut output_rx) = mpsc::channel(1);
     let (_ack_tx, ack_rx) = watch::channel(None);
     let cancellation = CancellationToken::new();
     let source_cancel = cancellation.clone();
@@ -366,83 +438,82 @@ async fn snapshots_and_streams_cdc_changes() {
             assert_eq!(snapshot_extended.get(field), create_extended.get(field));
         }
 
-        let original_session = admin
-            .simple_query(
-                "SELECT TOP (1) CAST(s.session_id AS int) AS session_id, \
-                        CONVERT(nvarchar(36), c.connection_id) AS connection_id \
-             FROM sys.dm_exec_sessions s \
-             JOIN sys.dm_exec_connections c ON c.session_id = s.session_id \
-             WHERE s.program_name = N'rustium' AND s.login_name = N'rustium' \
-             ORDER BY s.login_time DESC",
-            )
-            .await
-            .unwrap()
-            .into_row()
-            .await
-            .unwrap()
-            .expect("active Rustium SQL Server polling session");
-        let original_session_id = original_session
-            .get::<i32, _>("session_id")
-            .expect("active Rustium SQL Server polling session ID");
-        let original_connection_id = original_session
-            .get::<&str, _>("connection_id")
-            .expect("active Rustium SQL Server polling connection ID")
-            .to_owned();
-        admin
-            .simple_query(format!("KILL {original_session_id}"))
-            .await
-            .unwrap()
-            .into_results()
-            .await
-            .unwrap();
-        admin
-            .simple_query(
-                "INSERT INTO dbo.orders VALUES (\
-                4, N'Dora', 99.75, CONVERT(xml, N'<root><value>Reconnect</value></root>'), \
-                hierarchyid::Parse('/2/'), geometry::STGeomFromText('POINT (3 4)', 4326), \
-                geography::STGeomFromText('POINT (3 4)', 4326)\
-             );",
-            )
-            .await
-            .unwrap()
-            .into_results()
-            .await
-            .unwrap();
-
-        let mut saw_reconnected_row = false;
-        loop {
-            let record = tokio::time::timeout(Duration::from_secs(60), output_rx.recv())
+        for cycle in 0..soak_cycles {
+            let first_id = 4_i64 + i64::from(cycle) * 3;
+            let expected_ids = [first_id, first_id + 1, first_id + 2];
+            let (original_session_id, original_connection_id) =
+                source_connection(&mut admin, None).await;
+            admin
+                .simple_query(format!(
+                    "INSERT INTO dbo.orders VALUES \
+                    ({first_id}, N'Backpressure {cycle} A', 99.75, CONVERT(xml, N'<root><value>Reconnect</value></root>'), \
+                     hierarchyid::Parse('/2/'), geometry::STGeomFromText('POINT (3 4)', 4326), \
+                     geography::STGeomFromText('POINT (3 4)', 4326)), \
+                    ({}, N'Backpressure {cycle} B', 100.75, CONVERT(xml, N'<root><value>Reconnect</value></root>'), \
+                     hierarchyid::Parse('/3/'), geometry::STGeomFromText('POINT (4 5)', 4326), \
+                     geography::STGeomFromText('POINT (4 5)', 4326));",
+                    first_id + 1
+                ))
                 .await
                 .unwrap()
-                .unwrap()
+                .into_results()
+                .await
                 .unwrap();
-            if record.event.as_ref().is_some_and(|event| {
-                event.operation == Operation::Create
-                    && event.after.as_ref().and_then(|row| row.get("id"))
-                        == Some(&DataValue::Int64(4))
-            }) {
-                saw_reconnected_row = true;
+            wait_for_output_backpressure(&output_rx).await;
+            admin
+                .simple_query(format!("KILL {original_session_id}"))
+                .await
+                .unwrap()
+                .into_results()
+                .await
+                .unwrap();
+            admin
+                .simple_query(format!(
+                    "INSERT INTO dbo.orders VALUES (\
+                    {}, N'After reconnect {cycle}', 101.75, CONVERT(xml, N'<root><value>Reconnect</value></root>'), \
+                    hierarchyid::Parse('/4/'), geometry::STGeomFromText('POINT (5 6)', 4326), \
+                    geography::STGeomFromText('POINT (5 6)', 4326)\
+                 );",
+                    first_id + 2
+                ))
+                .await
+                .unwrap()
+                .into_results()
+                .await
+                .unwrap();
+
+            let mut first_seen = Vec::new();
+            let mut seen = BTreeMap::<i64, usize>::new();
+            loop {
+                let record = tokio::time::timeout(Duration::from_secs(60), output_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                if record.boundary == RecordBoundary::Data {
+                    let event = record.event.unwrap();
+                    if event.operation == Operation::Create
+                        && let Some(id) =
+                            sqlserver_integer(event.after.as_ref().and_then(|row| row.get("id")))
+                        && expected_ids.contains(&id)
+                    {
+                        if !seen.contains_key(&id) {
+                            first_seen.push(id);
+                        }
+                        *seen.entry(id).or_default() += 1;
+                    }
+                }
+                if record.boundary == RecordBoundary::TransactionCommit
+                    && expected_ids.iter().all(|id| seen.contains_key(id))
+                {
+                    break;
+                }
             }
-            if saw_reconnected_row && record.boundary == RecordBoundary::TransactionCommit {
-                break;
-            }
+            assert_eq!(first_seen, expected_ids);
+            let (_, reconnected_connection_id) =
+                source_connection(&mut admin, Some(&original_connection_id)).await;
+            assert_ne!(reconnected_connection_id, original_connection_id);
         }
-        let reconnected_connection_id = admin
-            .simple_query(
-                "SELECT TOP (1) CONVERT(nvarchar(36), c.connection_id) AS connection_id \
-             FROM sys.dm_exec_sessions s \
-             JOIN sys.dm_exec_connections c ON c.session_id = s.session_id \
-             WHERE s.program_name = N'rustium' AND s.login_name = N'rustium' \
-             ORDER BY s.login_time DESC",
-            )
-            .await
-            .unwrap()
-            .into_row()
-            .await
-            .unwrap()
-            .and_then(|row| row.get::<&str, _>("connection_id").map(str::to_owned))
-            .expect("reconnected Rustium SQL Server polling connection");
-        assert_ne!(reconnected_connection_id, original_connection_id);
     })
     .catch_unwind()
     .await;
