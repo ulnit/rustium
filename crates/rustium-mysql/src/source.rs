@@ -767,12 +767,21 @@ impl MySqlSource {
 
     async fn checkpoint_binlog_available(&self, position: &MySqlPosition) -> Result<bool> {
         let mut connection = connect(&self.config).await?;
-        let logs: Vec<(String, u64)> = connection
+        let logs: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = connection
             .query("SHOW BINARY LOGS")
             .await
             .map_err(mysql_error)?;
         connection.disconnect().await.map_err(mysql_error)?;
-        Ok(logs.into_iter().any(|(filename, file_size)| {
+        Ok(logs.into_iter().any(|(filename, file_size, _encrypted)| {
+            let Ok(filename) = String::from_utf8(filename) else {
+                return false;
+            };
+            let Some(file_size) = String::from_utf8(file_size)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                return false;
+            };
             filename == position.binlog_filename && position.binlog_position <= file_size
         }))
     }

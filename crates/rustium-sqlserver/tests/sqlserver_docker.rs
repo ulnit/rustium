@@ -8,7 +8,8 @@ use std::{
 use futures::FutureExt;
 use rustium_config::{SnapshotConfig, SnapshotMode, SqlServerSourceConfig, TableSelection};
 use rustium_core::{
-    DataValue, Operation, RecordBoundary, RetryPolicy, Row, SourceConnector, SourceContext,
+    CHECKPOINT_SCHEMA_VERSION, Checkpoint, DataValue, Operation, RecordBoundary, RetryPolicy, Row,
+    SourceConnector, SourceContext, SourcePosition,
 };
 use rustium_sqlserver::SqlServerSource;
 use tiberius::{AuthMethod, Client, Config};
@@ -335,7 +336,7 @@ async fn snapshots_and_streams_cdc_changes() {
     };
     let mut source = SqlServerSource::new(
         "inventory-sqlserver",
-        config,
+        config.clone(),
         SnapshotConfig {
             mode: SnapshotMode::Initial,
             fetch_size: 128,
@@ -350,7 +351,7 @@ async fn snapshots_and_streams_cdc_changes() {
 
     let (output_tx, mut output_rx) = mpsc::channel(1);
     let (_ack_tx, ack_rx) = watch::channel(None);
-    let cancellation = CancellationToken::new();
+    let mut cancellation = CancellationToken::new();
     let source_cancel = cancellation.clone();
     let mut source_task = tokio::spawn(async move {
         source
@@ -367,6 +368,77 @@ async fn snapshots_and_streams_cdc_changes() {
     let capture_result = std::panic::AssertUnwindSafe(async {
         let mut snapshot_rows = 0;
         let mut snapshot_extended = None;
+        let snapshot_position = loop {
+            let record = tokio::time::timeout(Duration::from_secs(30), output_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if record.boundary == RecordBoundary::SnapshotComplete {
+                break record.position;
+            }
+            let event = record.event.unwrap();
+            assert_eq!(event.operation, Operation::Read);
+            if snapshot_extended.is_none() {
+                snapshot_extended = event.after;
+            }
+            snapshot_rows += 1;
+        };
+        assert_eq!(snapshot_rows, 2);
+        let snapshot_extended = snapshot_extended.expect("SQL Server snapshot row exists");
+        require_extended_values(&snapshot_extended);
+
+        cancellation.cancel();
+        (&mut source_task).await.unwrap().unwrap();
+
+        let SourcePosition::SqlServer(mut recovery_position) = snapshot_position else {
+            panic!("SQL Server snapshot position has the wrong source type");
+        };
+        recovery_position.commit_lsn = "0x00000000000000000001".into();
+        recovery_position.change_lsn = "0x00000000000000000000".into();
+        recovery_position.event_serial = 0;
+        recovery_position.snapshot = false;
+        let recovery_checkpoint = Checkpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            connector_name: "inventory-sqlserver".into(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: SourcePosition::SqlServer(recovery_position),
+            snapshot_completed: true,
+            config_fingerprint: "sqlserver-when-needed-recovery-test".into(),
+            updated_at: std::time::SystemTime::now(),
+            connector_state: None,
+        };
+        let mut recovery_source = SqlServerSource::new(
+            "inventory-sqlserver",
+            config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::WhenNeeded,
+                fetch_size: 128,
+            },
+        )
+        .with_retry_policy(RetryPolicy {
+            max_retries: 20,
+            initial_delay: Duration::from_millis(50),
+            max_delay: Duration::from_millis(250),
+        });
+        recovery_source.validate().await.unwrap();
+        let (recovery_output_tx, recovery_output_rx) = mpsc::channel(1);
+        output_rx = recovery_output_rx;
+        let (_recovery_ack_tx, recovery_ack_rx) = watch::channel(None);
+        cancellation = CancellationToken::new();
+        let recovery_cancel = cancellation.clone();
+        source_task = tokio::spawn(async move {
+            recovery_source
+                .run(SourceContext {
+                    output: recovery_output_tx,
+                    acknowledged: recovery_ack_rx,
+                    initial_checkpoint: Some(recovery_checkpoint),
+                    signals: rustium_core::signal_channel(1).1,
+                    cancellation: recovery_cancel,
+                })
+                .await
+        });
+        let mut recovery_snapshot_rows = 0;
         loop {
             let record = tokio::time::timeout(Duration::from_secs(30), output_rx.recv())
                 .await
@@ -376,16 +448,12 @@ async fn snapshots_and_streams_cdc_changes() {
             if record.boundary == RecordBoundary::SnapshotComplete {
                 break;
             }
-            let event = record.event.unwrap();
-            assert_eq!(event.operation, Operation::Read);
-            if snapshot_extended.is_none() {
-                snapshot_extended = event.after;
+            if let Some(event) = record.event {
+                assert_eq!(event.operation, Operation::Read);
+                recovery_snapshot_rows += 1;
             }
-            snapshot_rows += 1;
         }
-        assert_eq!(snapshot_rows, 2);
-        let snapshot_extended = snapshot_extended.expect("SQL Server snapshot row exists");
-        require_extended_values(&snapshot_extended);
+        assert_eq!(recovery_snapshot_rows, 2);
 
         admin
             .simple_query(

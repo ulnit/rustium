@@ -1122,7 +1122,7 @@ async fn reconnects_after_replication_backend_termination() -> TestResult {
         let config = settings.source_config(&publication, &slot_name, &table_name);
         let mut source = PostgresSource::new(
             &connector_name,
-            config,
+            config.clone(),
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
@@ -1136,13 +1136,65 @@ async fn reconnects_after_replication_backend_termination() -> TestResult {
         source.validate().await?;
         let (mut output, cancellation, source_task) =
             start_source_with_output_capacity(source, None, 1);
+        let snapshot_checkpoint = loop {
+            let record = receive(&mut output).await?;
+            if record.boundary == RecordBoundary::SnapshotComplete {
+                break Checkpoint {
+                    schema_version: CHECKPOINT_SCHEMA_VERSION,
+                    connector_name: connector_name.clone(),
+                    generation: uuid::Uuid::new_v4(),
+                    source_position: record.position,
+                    snapshot_completed: true,
+                    config_fingerprint: "postgresql-when-needed-recovery-test".into(),
+                    updated_at: SystemTime::now(),
+                    connector_state: record.connector_state,
+                };
+            }
+        };
+        stop_source(cancellation, source_task).await?;
+
+        client
+            .execute("SELECT pg_drop_replication_slot($1)", &[&slot_name])
+            .await?;
+
+        let mut recovery_source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::WhenNeeded,
+                fetch_size: 1,
+            },
+        )
+        .with_retry_policy(RetryPolicy {
+            max_retries: 20,
+            initial_delay: Duration::from_millis(25),
+            max_delay: Duration::from_millis(250),
+        });
+        recovery_source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source_with_output_capacity(
+            recovery_source,
+            Some(snapshot_checkpoint),
+            1,
+        );
         let capture_result: TestResult = async {
+            let mut recovery_snapshot_rows = 0;
             loop {
                 let record = receive(&mut output).await?;
                 if record.boundary == RecordBoundary::SnapshotComplete {
                     break;
                 }
+                require(
+                    record.event.as_ref().is_some_and(|event| {
+                        event.operation == Operation::Read && event.source.snapshot
+                    }),
+                    "PostgreSQL when_needed recovery emitted a non-snapshot record",
+                )?;
+                recovery_snapshot_rows += 1;
             }
+            require(
+                recovery_snapshot_rows == 1,
+                "PostgreSQL when_needed recovery did not resnapshot the table",
+            )?;
             for cycle in 0..soak_cycles {
                 let first_id = 2_i64 + i64::from(cycle) * 3;
                 let expected_ids = [first_id, first_id + 1, first_id + 2];

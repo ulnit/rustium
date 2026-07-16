@@ -9,7 +9,7 @@ use mysql_async::{Conn, OptsBuilder, prelude::Queryable};
 use rustium_config::{MySqlSourceConfig, SnapshotConfig, SnapshotMode, TableSelection};
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, DataValue, Operation, RecordBoundary, RetryPolicy,
-    SourceConnector, SourceContext,
+    SourceConnector, SourceContext, SourcePosition,
 };
 use rustium_mysql::MySqlSource;
 use tokio::sync::{mpsc, watch};
@@ -274,22 +274,86 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
     });
 
     let mut snapshot_rows = 0;
-    let snapshot_schema_history = loop {
+    let (snapshot_position, snapshot_schema_history) = loop {
         let record = tokio::time::timeout(Duration::from_secs(20), output_rx.recv())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
         if record.boundary == RecordBoundary::SnapshotComplete {
-            break record
-                .connector_state
-                .expect("snapshot completion should carry MySQL schema history");
+            break (
+                record.position,
+                record
+                    .connector_state
+                    .expect("snapshot completion should carry MySQL schema history"),
+            );
         }
         let event = record.event.unwrap();
         assert_eq!(event.operation, Operation::Read);
         snapshot_rows += 1;
     };
     assert_eq!(snapshot_rows, 2);
+
+    cancellation.cancel();
+    source_task.await.unwrap().unwrap();
+
+    let SourcePosition::MySql(mut recovery_position) = snapshot_position.clone() else {
+        panic!("MySQL snapshot position has the wrong source type");
+    };
+    recovery_position.binlog_filename = "rustium-missing-binlog.999999".into();
+    let recovery_checkpoint = Checkpoint {
+        schema_version: CHECKPOINT_SCHEMA_VERSION,
+        connector_name: "inventory-mysql".into(),
+        generation: uuid::Uuid::new_v4(),
+        source_position: SourcePosition::MySql(recovery_position),
+        snapshot_completed: true,
+        config_fingerprint: "mysql-when-needed-recovery-test".into(),
+        updated_at: SystemTime::now(),
+        connector_state: Some(snapshot_schema_history.clone()),
+    };
+    let mut recovery_source = MySqlSource::new(
+        "inventory-mysql",
+        config.clone(),
+        SnapshotConfig {
+            mode: SnapshotMode::WhenNeeded,
+            fetch_size: 1,
+        },
+    )
+    .with_retry_policy(RetryPolicy {
+        max_retries: 20,
+        initial_delay: Duration::from_millis(25),
+        max_delay: Duration::from_millis(250),
+    });
+    recovery_source.validate().await.unwrap();
+    let (recovery_output_tx, mut output_rx) = mpsc::channel(1);
+    let (_recovery_ack_tx, recovery_ack_rx) = watch::channel(None);
+    let cancellation = CancellationToken::new();
+    let source_cancel = cancellation.clone();
+    let source_task = tokio::spawn(async move {
+        recovery_source
+            .run(SourceContext {
+                output: recovery_output_tx,
+                acknowledged: recovery_ack_rx,
+                initial_checkpoint: Some(recovery_checkpoint),
+                signals: rustium_core::signal_channel(1).1,
+                cancellation: source_cancel,
+            })
+            .await
+    });
+    let mut recovery_snapshot_rows = 0;
+    loop {
+        let record = tokio::time::timeout(Duration::from_secs(20), output_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if record.boundary == RecordBoundary::SnapshotComplete {
+            break;
+        }
+        assert_eq!(record.event.as_ref().unwrap().operation, Operation::Read);
+        recovery_snapshot_rows += 1;
+    }
+    assert_eq!(recovery_snapshot_rows, 2);
 
     for query in [
         "START TRANSACTION",
