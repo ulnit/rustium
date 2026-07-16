@@ -21,6 +21,7 @@ source:
   #     identity: index
   #     index: customers_replica_key
   slot_name: rustium_inventory
+  slot_failover: false
   slot_ownership: managed
   tables:
     include:

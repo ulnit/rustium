@@ -72,6 +72,7 @@ impl TestSettings {
             replica_identity_autoset_values: Vec::new(),
             publish_via_partition_root: false,
             slot_name: slot_name.into(),
+            slot_failover: false,
             slot_ownership: SlotOwnership::Managed,
             tables: TableSelection {
                 include: vec![format!(r"public\.{table_name}")],
@@ -1072,6 +1073,123 @@ async fn publishes_partition_changes_via_the_partition_root() -> TestResult {
         &[&first_partition, &second_partition, &root_table],
     )
     .await;
+    connection_task.abort();
+    match (outcome, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 17+ primary with logical replication enabled"]
+async fn creates_postgresql_17_failover_slot() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_failover_{}", &suffix[..12]);
+    let publication = format!("rustium_pg_failover_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_pg_failover_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-failover-slot-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        let server_version = client
+            .query_one("SHOW server_version_num", &[])
+            .await?
+            .get::<_, String>(0)
+            .parse::<u32>()?;
+        require(
+            server_version >= 170_000,
+            "slot.failover integration requires PostgreSQL 17 or newer",
+        )?;
+        let in_recovery = client
+            .query_one("SELECT pg_catalog.pg_is_in_recovery()", &[])
+            .await?
+            .get::<_, bool>(0);
+        require(
+            !in_recovery,
+            "slot.failover integration requires a PostgreSQL primary",
+        )?;
+
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (\
+                    id BIGINT PRIMARY KEY, value TEXT NOT NULL\
+                 ); \
+                 INSERT INTO public.{table_name} VALUES (1, 'snapshot-failover'); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        config.slot_failover = true;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let capture_result: TestResult = async {
+            let snapshot = receive(&mut output).await?;
+            require(
+                snapshot.event.as_ref().is_some_and(|event| {
+                    event.operation == Operation::Read
+                        && event.after.as_ref().and_then(|row| row.get("value"))
+                            == Some(&DataValue::String("snapshot-failover".into()))
+                }),
+                "failover slot initial snapshot row is incorrect",
+            )?;
+            let completion = receive(&mut output).await?;
+            require(
+                completion.boundary == RecordBoundary::SnapshotComplete,
+                "failover slot initial snapshot did not complete",
+            )?;
+            wait_for_active_slot(&client, &slot_name).await?;
+            let failover = client
+                .query_one(
+                    "SELECT failover FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+                    &[&slot_name],
+                )
+                .await?
+                .get::<_, bool>(0);
+            require(
+                failover,
+                "Rustium did not create a PostgreSQL failover slot",
+            )?;
+
+            client
+                .execute(
+                    &format!("INSERT INTO public.{table_name} VALUES (2, 'stream-failover')"),
+                    &[],
+                )
+                .await?;
+            loop {
+                let record = receive(&mut output).await?;
+                let Some(event) = record.event else {
+                    continue;
+                };
+                require(
+                    event.operation == Operation::Create
+                        && event.after.as_ref().and_then(|row| row.get("value"))
+                            == Some(&DataValue::String("stream-failover".into())),
+                    "failover slot did not stream the inserted row",
+                )?;
+                break;
+            }
+            Ok(())
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)
+    }
+    .await;
+
+    let cleanup_result = cleanup(&client, &publication, &slot_name, &[&table_name]).await;
     connection_task.abort();
     match (outcome, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),

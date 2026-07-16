@@ -12,6 +12,8 @@ PostgreSQL `replica.identity.autoset.values` maps to structured native rules wit
 
 PostgreSQL `publish.via.partition.root` maps to native `source.publish_via_partition_root`; existing publication metadata must match the configured value.
 
+PostgreSQL `slot.failover` maps to native `source.slot_failover`. It defaults to false and is fingerprinted only when enabled; failover configuration is valid only for managed slots.
+
 ## 简体中文
 
 Rustium 的版本化配置模型、校验、环境变量插值、语义指纹，以及 PostgreSQL、MySQL、SQL Server、sink、格式和 runtime 的 Debezium 兼容 `.properties` 解析。
@@ -25,3 +27,5 @@ PostgreSQL `publication.autocreate.mode` 支持 `disabled`、`all_tables`、`fil
 PostgreSQL `replica.identity.autoset.values` 映射为带 `table`、`identity` 和可选 `index` 的结构化原生规则。非空规则会进入 fingerprint，因为 validation 会执行事务化表 DDL。
 
 PostgreSQL `publish.via.partition.root` 映射为原生 `source.publish_via_partition_root`；既有 publication metadata 必须与配置值一致。
+
+PostgreSQL `slot.failover` 映射为原生 `source.slot_failover`。默认值为 false，只有启用时才进入 fingerprint；failover 配置只适用于 managed slot。

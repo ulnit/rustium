@@ -219,6 +219,12 @@ impl SourceConfig {
                         .expect("source semantic is an object")
                         .insert("publish_via_partition_root".into(), true.into());
                 }
+                if config.slot_failover {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert("slot_failover".into(), true.into());
+                }
                 add_heartbeat_semantics(
                     &mut semantic,
                     config.heartbeat_interval,
@@ -382,6 +388,8 @@ pub struct PostgresSourceConfig {
     #[serde(default = "default_slot_name")]
     pub slot_name: String,
     #[serde(default)]
+    pub slot_failover: bool,
+    #[serde(default)]
     pub slot_ownership: SlotOwnership,
     #[serde(default)]
     pub tables: TableSelection,
@@ -443,6 +451,11 @@ impl PostgresSourceConfig {
         }
         validate_name(&self.slot_name, "source.slot_name")?;
         validate_name(&self.publication, "source.publication")?;
+        if self.slot_failover && self.slot_ownership == SlotOwnership::External {
+            return Err(Error::Configuration(
+                "source.slot_failover can be enabled only for a managed replication slot".into(),
+            ));
+        }
         if self.connect_timeout.is_zero() {
             return Err(Error::Configuration(
                 "source.connect_timeout must be greater than zero".into(),
@@ -1938,6 +1951,10 @@ sink:
             config.source.semantic_config()["publish_via_partition_root"].is_null(),
             "disabled partition-root publication must preserve the old fingerprint shape"
         );
+        assert!(
+            config.source.semantic_config()["slot_failover"].is_null(),
+            "disabled failover slots must preserve the old fingerprint shape"
+        );
     }
 
     #[test]
@@ -1997,6 +2014,27 @@ sink:
             Config::from_yaml(CONFIG).unwrap().fingerprint(),
             configured.fingerprint()
         );
+    }
+
+    #[test]
+    fn parses_native_postgresql_failover_slot() {
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  slot_failover: true\n",
+        ))
+        .unwrap();
+        assert!(configured.source.as_postgresql().unwrap().slot_failover);
+        assert_ne!(
+            Config::from_yaml(CONFIG).unwrap().fingerprint(),
+            configured.fingerprint()
+        );
+
+        let external = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  slot_failover: true\n  slot_ownership: external\n",
+        ))
+        .unwrap_err();
+        assert!(external.to_string().contains("only for a managed"));
     }
 
     #[test]

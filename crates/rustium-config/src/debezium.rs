@@ -128,6 +128,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 .get("slot.name")
                 .cloned()
                 .unwrap_or_else(|| "debezium".into()),
+            slot_failover: bool_value(&properties, "slot.failover", false)?,
             slot_ownership: SlotOwnership::Managed,
             tables: TableSelection { include, exclude },
             ssl_mode: properties
@@ -1213,6 +1214,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "topic.prefix",
         "plugin.name",
         "slot.name",
+        "slot.failover",
         "publication.name",
         "publication.autocreate.mode",
         "replica.identity.autoset.values",
@@ -1347,6 +1349,7 @@ database.dbname=app
 topic.prefix=app
 plugin.name=pgoutput
 slot.name=orders_slot
+slot.failover=true
 publication.name=orders_pub
 publication.autocreate.mode=filtered
 replica.identity.autoset.values=public\\.orders:FULL,public\\.customers:INDEX customers_replica_key
@@ -1431,6 +1434,7 @@ max.batch.size=1000
         );
         assert_eq!(source.replica_identity_autoset_values.len(), 2);
         assert!(source.publish_via_partition_root);
+        assert!(source.slot_failover);
         assert_eq!(
             source.replica_identity_autoset_values[0].table,
             r"public\.orders"

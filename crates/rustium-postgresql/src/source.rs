@@ -421,6 +421,7 @@ impl SourceConnector for PostgresSource {
             }
         }
 
+        let slot_failover = resolve_slot_failover(&self.config).await?;
         let replication_url = self.config.connection_url(true)?;
         let slot_options = ReplicationSlotOptions {
             snapshot: Some(if snapshot_needed { "export" } else { "nothing" }.into()),
@@ -458,8 +459,14 @@ impl SourceConnector for PostgresSource {
             .as_ref()
             .map(|checkpoint| checkpoint.source_position.clone());
 
-        if snapshot_needed {
+        if self.config.slot_ownership == SlotOwnership::Managed {
             stream.ensure_replication_slot().await.map_err(pg_error)?;
+            if slot_failover {
+                configure_slot_failover(&replication_url, &self.config.slot_name).await?;
+            }
+        }
+
+        if snapshot_needed {
             let snapshot_name = stream
                 .exported_snapshot_name()
                 .ok_or_else(|| {
@@ -1021,6 +1028,60 @@ async fn query_slot_safe_lsn(config: &PostgresSourceConfig) -> Result<u64> {
     })
     .await
     .map_err(|error| Error::Source(format!("slot LSN query task failed: {error}")))?
+}
+
+async fn resolve_slot_failover(config: &PostgresSourceConfig) -> Result<bool> {
+    if !config.slot_failover {
+        return Ok(false);
+    }
+    if config.slot_ownership != SlotOwnership::Managed {
+        return Err(Error::Configuration(
+            "source.slot_failover can be enabled only for a managed replication slot".into(),
+        ));
+    }
+    let connection_url = config.connection_url(false)?;
+    let (server_version, in_recovery) = tokio::task::spawn_blocking(move || {
+        let mut connection = connect(&connection_url)?;
+        let server_version = scalar(&mut connection, "SHOW server_version_num")?
+            .parse::<u32>()
+            .map_err(|error| Error::Source(format!("invalid PostgreSQL version: {error}")))?;
+        let in_recovery = scalar(
+            &mut connection,
+            "SELECT pg_catalog.pg_is_in_recovery()::text",
+        )?;
+        Ok::<_, Error>((server_version, matches!(in_recovery.as_str(), "true" | "t")))
+    })
+    .await
+    .map_err(|error| Error::Source(format!("failover slot capability task failed: {error}")))??;
+
+    if server_version < 170_000 {
+        warn!(
+            server_version,
+            "PostgreSQL slot.failover requires PostgreSQL 17 or newer; creating a regular logical slot"
+        );
+        return Ok(false);
+    }
+    if in_recovery {
+        warn!(
+            "PostgreSQL slot.failover is unavailable on a standby; creating a regular logical slot"
+        );
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+async fn configure_slot_failover(replication_url: &str, slot_name: &str) -> Result<()> {
+    let replication_url = replication_url.to_string();
+    let slot_name = slot_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut connection = connect(&replication_url)?;
+        connection
+            .alter_replication_slot(&slot_name, None, Some(true))
+            .map_err(pg_error)?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| Error::Source(format!("failover slot configuration task failed: {error}")))?
 }
 
 async fn validate_resume_slot(config: &PostgresSourceConfig) -> Result<()> {
@@ -2887,6 +2948,7 @@ mod tests {
             replica_identity_autoset_values: Vec::new(),
             publish_via_partition_root: false,
             slot_name: "orders_slot".into(),
+            slot_failover: false,
             slot_ownership: SlotOwnership::Managed,
             tables: TableSelection::default(),
             ssl_mode: "disable".into(),
