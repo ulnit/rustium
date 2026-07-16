@@ -192,6 +192,8 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
         "GRANT SELECT, RELOAD, FLUSH_TABLES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'rustium'@'%'",
         "CREATE TABLE inventory.orders (id BIGINT PRIMARY KEY, customer VARCHAR(100) NOT NULL, amount DECIMAL(10,2) NOT NULL)",
         "INSERT INTO inventory.orders VALUES (1, 'Alice', 12.30), (2, 'Bob', 45.60)",
+        "CREATE TABLE inventory.rustium_signal (id VARCHAR(255) PRIMARY KEY, type VARCHAR(64) NOT NULL, data TEXT NOT NULL)",
+        "INSERT INTO inventory.rustium_signal VALUES ('seed', 'execute-snapshot', '{\"type\":\"incremental\",\"data-collections\":[\"inventory\\\\.orders\"]}')",
     ] {
         root.query_drop(query).await.unwrap();
     }
@@ -228,7 +230,7 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
         heartbeat_action_query: None,
         heartbeat_topics_prefix: "__debezium-heartbeat".into(),
         heartbeat_topic_name: None,
-        signal_data_collection: None,
+        signal_data_collection: Some("inventory.rustium_signal".into()),
         signal_enabled_channels: vec!["source".into(), "file".into(), "in-process".into()],
         signal_file: "signals.jsonl".into(),
         signal_poll_interval: Duration::from_millis(500),
