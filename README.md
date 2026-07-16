@@ -155,10 +155,11 @@ export RUSTIUM_SQLSERVER_TEST_PORT=1433
 export RUSTIUM_SQLSERVER_TEST_USER=sa
 export RUSTIUM_SQLSERVER_TEST_PASSWORD='replace-me'
 export RUSTIUM_SQLSERVER_TEST_DATABASE=cdc_demo
+export RUSTIUM_KAFKA_TEST_BOOTSTRAP_SERVERS=kafka.example.com:9092
 cargo test -p rustium-sqlserver --test sqlserver_external -- --ignored --nocapture
 ```
 
-The test creates a uniquely named table and capture instance. It verifies snapshot rows, CDC initialization, ordered transactional create/update/delete events, the commit boundary, checkpoint restart without snapshot replay, and cleanup.
+The tests create uniquely named business tables, signal tables, capture instances, and Kafka topics. They verify snapshot rows, CDC initialization, ordered transactional create/update/delete events, commit boundaries, checkpoint restart without snapshot replay, heartbeat/action-query, incremental snapshot keyset recovery and concurrent-update deduplication, durable completed signal IDs, real-broker replay across the connector-checkpoint/Kafka-offset crash window, and cleanup.
 
 ### Embed Rustium in a Rust Project
 
@@ -463,7 +464,7 @@ Implemented behavior:
 
 The current implementation requires exactly one entry in `database.names`, one active capture instance per selected table, and `data.query.mode=direct`. Incremental snapshots require a primary key, capture a fixed maximum key, and persist typed single/composite keyset progress plus a bounded completed-signal history. Every incremental snapshot channel also requires `signal.data.collection`: the table must contain exactly text-compatible `id`, `type`, and `data` columns in that order, `id` must hold at least 42 characters, the table must be CDC-enabled, and the connector user must have `INSERT`. These constraints and object permission are checked during source validation. Rustium waits until CDC observes the open watermark, buffers the chunk, removes primary keys found in CDC before/after images, and emits remaining reads only when CDC observes the close watermark commit. Signal-table rows are never exposed as business events. The event loop processes one chunk at a time outside active CDC transactions, so pause/resume/stop commands are observed between chunks. An uncommitted in-memory window is discarded on restart, and the source verifies the table schema before the query and again at close.
 
-The SQL Server 2022 Developer RTM-CU25 external gate verifies snapshot handoff, fetch-size-one continuation through update before/after pairs, mid-transaction checkpoint restart with preserved transaction ordinals, concurrent transactions ordered by commit LSN, retention fail-closed behavior, heartbeat/action-query, core snapshot/CDC type equality, in-process keyset restart, source-table signaling with additional conditions, CDC-window concurrent-update deduplication, and cleanup. See [examples/sqlserver.properties](examples/sqlserver.properties).
+The SQL Server 2022 Developer RTM-CU25 external gate verifies snapshot handoff, fetch-size-one continuation through update before/after pairs, mid-transaction checkpoint restart with preserved transaction ordinals, concurrent transactions ordered by commit LSN, retention fail-closed behavior, heartbeat/action-query, core snapshot/CDC type equality, in-process keyset restart, source-table signaling with additional conditions, CDC-window concurrent-update deduplication, real-broker Kafka replay after a completed connector checkpoint but before the signal offset is committed, and cleanup. See [examples/sqlserver.properties](examples/sqlserver.properties).
 
 The database must have CDC enabled, SQL Server Agent must run the capture job, and the connector user needs source-table reads plus direct read access to the `cdc` schema. The separate Docker portability test remains runnable with:
 
@@ -704,10 +705,11 @@ export RUSTIUM_SQLSERVER_TEST_PORT=1433
 export RUSTIUM_SQLSERVER_TEST_USER=sa
 export RUSTIUM_SQLSERVER_TEST_PASSWORD='replace-me'
 export RUSTIUM_SQLSERVER_TEST_DATABASE=cdc_demo
+export RUSTIUM_KAFKA_TEST_BOOTSTRAP_SERVERS=kafka.example.com:9092
 cargo test -p rustium-sqlserver --test sqlserver_external -- --ignored --nocapture
 ```
 
-测试会创建唯一命名的表和 capture instance，验证快照记录、CDC 初始化、同一事务内有序的 create/update/delete 事件、commit 边界、checkpoint 重启不重复快照，以及资源清理。
+测试会创建唯一命名的业务表、信号表、capture instance 和 Kafka topic，验证快照记录、CDC 初始化、同一事务内有序的 create/update/delete 事件、commit 边界、checkpoint 重启不重复快照、heartbeat/action-query、增量快照 keyset 恢复和并发更新去重、已完成 signal ID 持久化、connector checkpoint/Kafka offset 崩溃窗口中的真实 broker 重放，以及资源清理。
 
 ### 在 Rust 项目中嵌入 Rustium
 
@@ -1068,7 +1070,7 @@ SQL Server 连接器基于原生 SQL Server CDC change table 实现。
 
 当前实现要求 `database.names` 只有一个数据库、每张选表只有一个活动 capture instance，并使用 `data.query.mode=direct`。增量快照要求主键，会固定最大主键，并持久化带类型的单列/复合 keyset 进度和有界的已完成 signal 历史。所有增量快照 channel 还必须配置 `signal.data.collection`：该表必须按顺序且仅包含文本兼容的 `id`、`type`、`data` 列，`id` 至少容纳 42 个字符，表必须启用 CDC，连接器用户必须具有 `INSERT`。这些约束和对象权限会在 Source 校验阶段检查。Rustium 等待 CDC 观察到 open watermark 后缓存 chunk，根据 CDC before/after image 移除主键，并只在 CDC 观察到 close watermark commit 后发出剩余 read。信号表行不会暴露为业务事件。事件循环只在没有活动 CDC 事务时逐次处理一个 chunk，因此 pause/resume/stop 会在 chunk 之间生效。未提交的内存窗口会在重启时丢弃，Source 会在查询前和 close 时再次校验表 schema。
 
-SQL Server 2022 Developer RTM-CU25 外部门槛已验证快照切换、fetch size 为 1 时跨 update before/after 的继续读取、保持事务序号的事务中间 checkpoint 重启、按 commit LSN 排序的并发事务、retention fail-closed、heartbeat/action-query、核心快照/CDC 类型一致性、in-process keyset 重启、带 additional condition 的 source-table signaling、CDC window 并发更新去重和资源清理。示例见 [examples/sqlserver.properties](examples/sqlserver.properties)。
+SQL Server 2022 Developer RTM-CU25 外部门槛已验证快照切换、fetch size 为 1 时跨 update before/after 的继续读取、保持事务序号的事务中间 checkpoint 重启、按 commit LSN 排序的并发事务、retention fail-closed、heartbeat/action-query、核心快照/CDC 类型一致性、in-process keyset 重启、带 additional condition 的 source-table signaling、CDC window 并发更新去重、connector checkpoint 已完成但 signal offset 尚未提交时的真实 broker Kafka 重放，以及资源清理。示例见 [examples/sqlserver.properties](examples/sqlserver.properties)。
 
 数据库必须启用 CDC，SQL Server Agent 必须运行 capture job，连接器用户需要读取源表，并能直接读取 `cdc` schema。独立的 Docker 可移植性测试仍可通过以下命令运行：
 
