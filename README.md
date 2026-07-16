@@ -548,10 +548,12 @@ The server binds to `127.0.0.1:8080` by default.
 |---|---|
 | `GET /health/live` | Process liveness |
 | `GET /health/ready` | Connector readiness |
-| `GET /v1/connector/status` | State, position, checkpoint time, queue, and delivery counters |
+| `GET /v1/connector/status` | State/reason, position, checkpoint and source-event times, lag, queue, and counters |
 | `POST /v1/connector/stop` | Graceful stop when mutations are enabled |
 | `POST /v1/connector/signals` | Submit a Debezium-compatible in-process signal when mutations and the channel are enabled |
 | `GET /metrics` | Prometheus exposition |
+
+Status and metrics advance only after the sink write and checkpoint succeed. `rustium_source_lag_seconds` is the current wall-clock distance from the last durably acknowledged source timestamp and is `NaN` when the connector or database cannot provide one. Encoding and sink-delivery failures increment `failed_events`, transition the connector to `FAILED`, cancel the Source, and still run Sink shutdown; a Source that ignores cancellation is aborted after `runtime.shutdown_timeout`.
 
 ### Documentation and Contribution Policy
 
@@ -1094,10 +1096,12 @@ Server 默认绑定 `127.0.0.1:8080`。
 |---|---|
 | `GET /health/live` | 进程存活 |
 | `GET /health/ready` | 连接器就绪状态 |
-| `GET /v1/connector/status` | 状态、位点、checkpoint 时间、队列和投递计数 |
+| `GET /v1/connector/status` | 状态/原因、位点、checkpoint 与源事件时间、lag、队列和计数 |
 | `POST /v1/connector/stop` | 启用变更端点时优雅停止 |
 | `POST /v1/connector/signals` | 启用变更端点和 channel 时提交 Debezium 兼容 in-process 信号 |
 | `GET /metrics` | Prometheus 指标 |
+
+状态和指标只有在 Sink 写入及 checkpoint 成功后才会推进。`rustium_source_lag_seconds` 表示当前时间与最后一个已持久确认源时间戳之间的距离；连接器或数据库无法提供源时间戳时为 `NaN`。编码和 Sink 投递失败会增加 `failed_events`、把连接器转为 `FAILED`、取消 Source，并仍然执行 Sink shutdown；若 Source 忽略取消，则会在 `runtime.shutdown_timeout` 后被 abort。
 
 ### 文档与贡献策略
 

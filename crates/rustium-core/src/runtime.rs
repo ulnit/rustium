@@ -59,6 +59,9 @@ pub struct StatusSnapshot {
     pub state_reason: Option<String>,
     pub last_position: Option<SourcePosition>,
     pub last_checkpoint_at: Option<DateTime<Utc>>,
+    pub last_source_event_at: Option<DateTime<Utc>>,
+    pub last_event_observed_at: Option<DateTime<Utc>>,
+    pub source_lag_millis: Option<u64>,
     pub delivered_events: u64,
     pub failed_events: u64,
     pub queue_depth: usize,
@@ -77,6 +80,9 @@ impl RuntimeStatus {
             state_reason: None,
             last_position: None,
             last_checkpoint_at: None,
+            last_source_event_at: None,
+            last_event_observed_at: None,
+            source_lag_millis: None,
             delivered_events: 0,
             failed_events: 0,
             queue_depth: 0,
@@ -84,7 +90,11 @@ impl RuntimeStatus {
     }
 
     pub async fn snapshot(&self) -> StatusSnapshot {
-        self.0.read().await.clone()
+        let mut snapshot = self.0.read().await.clone();
+        snapshot.source_lag_millis = snapshot
+            .last_source_event_at
+            .map(|source_time| event_lag_millis(source_time, Utc::now()));
+        snapshot
     }
 
     pub async fn transition(&self, state: ConnectorState, reason: Option<String>) {
@@ -98,12 +108,38 @@ impl RuntimeStatus {
         self.0.write().await.queue_depth = depth;
     }
 
-    async fn checkpointed(&self, position: SourcePosition, delivered: usize) {
+    async fn increment_failed_events(&self, failed: usize) {
+        self.0.write().await.failed_events += failed as u64;
+    }
+
+    async fn checkpointed(
+        &self,
+        position: SourcePosition,
+        delivered: usize,
+        event_timing: Option<EventTiming>,
+    ) {
         let mut status = self.0.write().await;
         status.last_position = Some(position);
         status.last_checkpoint_at = Some(Utc::now());
         status.delivered_events += delivered as u64;
+        if let Some(event_timing) = event_timing {
+            status.last_source_event_at = event_timing.source_time;
+            status.last_event_observed_at = Some(event_timing.observed_time);
+            status.source_lag_millis = event_timing
+                .source_time
+                .map(|source_time| event_lag_millis(source_time, Utc::now()));
+        }
     }
+}
+
+fn event_lag_millis(source_time: DateTime<Utc>, observed_time: DateTime<Utc>) -> u64 {
+    u64::try_from(
+        observed_time
+            .signed_duration_since(source_time)
+            .num_milliseconds()
+            .max(0),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 pub struct ConnectorRuntime {
@@ -121,7 +157,14 @@ pub struct ConnectorRuntime {
 struct PendingBatch {
     encoded: Vec<EncodedEvent>,
     highest_position: Option<SourcePosition>,
+    latest_event_timing: Option<EventTiming>,
     signal_acknowledgements: Vec<crate::SignalAcknowledgement>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EventTiming {
+    source_time: Option<DateTime<Utc>>,
+    observed_time: DateTime<Utc>,
 }
 
 impl PendingBatch {
@@ -129,6 +172,7 @@ impl PendingBatch {
         Self {
             encoded: Vec::with_capacity(capacity),
             highest_position: None,
+            latest_event_timing: None,
             signal_acknowledgements: Vec::new(),
         }
     }
@@ -164,7 +208,20 @@ impl ConnectorRuntime {
         self.signal_sender.clone()
     }
 
-    pub async fn run(mut self, cancellation: CancellationToken) -> Result<()> {
+    pub async fn run(self, cancellation: CancellationToken) -> Result<()> {
+        let status = self.status.clone();
+        let result = self.run_inner(cancellation).await;
+        if let Err(error) = &result
+            && !matches!(error, Error::Cancelled)
+        {
+            status
+                .transition(ConnectorState::Failed, Some(error.to_string()))
+                .await;
+        }
+        result
+    }
+
+    async fn run_inner(mut self, cancellation: CancellationToken) -> Result<()> {
         self.status.transition(ConnectorState::Starting, None).await;
         let mut source = self
             .source
@@ -200,7 +257,7 @@ impl ConnectorRuntime {
             .as_ref()
             .and_then(|checkpoint| checkpoint.connector_state.clone());
         let source_cancel = cancellation.child_token();
-        let source_handle: JoinHandle<Result<()>> = tokio::spawn(async move {
+        let mut source_handle: JoinHandle<Result<()>> = tokio::spawn(async move {
             source
                 .run(SourceContext {
                     output: source_tx,
@@ -212,61 +269,72 @@ impl ConnectorRuntime {
                 .await
         });
 
-        self.status
-            .transition(ConnectorState::Streaming, None)
-            .await;
-        let mut interval = tokio::time::interval_at(
-            Instant::now() + self.config.flush_interval,
-            self.config.flush_interval,
-        );
-        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let pipeline_result: Result<()> = async {
+            self.status
+                .transition(ConnectorState::Streaming, None)
+                .await;
+            let mut interval = tokio::time::interval_at(
+                Instant::now() + self.config.flush_interval,
+                self.config.flush_interval,
+            );
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        let mut pending = PendingBatch::new(self.config.max_batch_size);
-        let mut snapshot_completed = snapshot_completed;
+            let mut pending = PendingBatch::new(self.config.max_batch_size);
+            let mut snapshot_completed = snapshot_completed;
 
-        loop {
-            tokio::select! {
-                _ = cancellation.cancelled() => {
-                    self.status.transition(ConnectorState::Stopping, None).await;
-                    break;
-                }
-                _ = interval.tick() => {
-                    self.flush_batch(
-                        &mut pending,
-                        snapshot_completed,
-                        &connector_state,
-                        &ack_tx,
-                    ).await?;
-                }
-                record = source_rx.recv() => {
-                    let Some(record) = record else { break };
-                    let record = record?;
-                    self.status.set_queue_depth(source_rx.len()).await;
-                    self.consume_record(
-                        record,
-                        &mut pending,
-                        &mut snapshot_completed,
-                        &mut connector_state,
-                        &ack_tx,
-                    ).await?;
+            loop {
+                tokio::select! {
+                    _ = cancellation.cancelled() => break,
+                    _ = interval.tick() => {
+                        self.flush_batch(
+                            &mut pending,
+                            snapshot_completed,
+                            &connector_state,
+                            &ack_tx,
+                        ).await?;
+                    }
+                    record = source_rx.recv() => {
+                        let Some(record) = record else { break };
+                        let record = record?;
+                        self.status.set_queue_depth(source_rx.len()).await;
+                        self.consume_record(
+                            record,
+                            &mut pending,
+                            &mut snapshot_completed,
+                            &mut connector_state,
+                            &ack_tx,
+                        ).await?;
+                    }
                 }
             }
-        }
 
-        self.flush_batch(&mut pending, snapshot_completed, &connector_state, &ack_tx)
-            .await?;
-        self.sink.flush().await?;
+            self.flush_batch(&mut pending, snapshot_completed, &connector_state, &ack_tx)
+                .await?;
+            self.sink.flush().await
+        }
+        .await;
+
+        if pipeline_result.is_ok() {
+            self.status.transition(ConnectorState::Stopping, None).await;
+        }
         cancellation.cancel();
 
-        match tokio::time::timeout(self.config.shutdown_timeout, source_handle).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) if !matches!(error, Error::Cancelled) => return Err(error),
-            Ok(Err(error)) => return Err(Error::Source(format!("source task failed: {error}"))),
-            Err(_) => return Err(Error::Source("source shutdown timed out".into())),
-            _ => {}
-        }
+        let source_result =
+            match tokio::time::timeout(self.config.shutdown_timeout, &mut source_handle).await {
+                Ok(Ok(Ok(()))) | Ok(Ok(Err(Error::Cancelled))) => Ok(()),
+                Ok(Ok(Err(error))) => Err(error),
+                Ok(Err(error)) => Err(Error::Source(format!("source task failed: {error}"))),
+                Err(_) => {
+                    source_handle.abort();
+                    let _ = source_handle.await;
+                    Err(Error::Source("source shutdown timed out".into()))
+                }
+            };
 
-        self.sink.shutdown().await?;
+        let shutdown_result = self.sink.shutdown().await;
+        pipeline_result?;
+        source_result?;
+        shutdown_result?;
         self.status.transition(ConnectorState::Stopped, None).await;
         info!(connector = %self.identity.name, "connector stopped");
         Ok(())
@@ -305,7 +373,17 @@ impl ConnectorRuntime {
                     .transition(ConnectorState::Snapshotting, None)
                     .await;
             }
-            pending.encoded.extend(self.encoder.encode_batch(event)?);
+            match self.encoder.encode_batch(event) {
+                Ok(encoded) => pending.encoded.extend(encoded),
+                Err(error) => {
+                    self.status.increment_failed_events(1).await;
+                    return Err(error);
+                }
+            }
+            pending.latest_event_timing = Some(EventTiming {
+                source_time: event.source_time,
+                observed_time: event.observed_time,
+            });
         }
         pending.highest_position = Some(record.position);
         if let Some(state) = record.connector_state {
@@ -360,9 +438,7 @@ impl ConnectorRuntime {
             };
             if let Err(error) = self.sink.write(&batch).await {
                 error!(connector = %self.identity.name, %error, "sink delivery failed");
-                self.status
-                    .transition(ConnectorState::Failed, Some(error.to_string()))
-                    .await;
+                self.status.increment_failed_events(delivered).await;
                 return Err(error);
             }
         }
@@ -384,7 +460,9 @@ impl ConnectorRuntime {
         for acknowledgement in pending.signal_acknowledgements.drain(..) {
             acknowledgement.acknowledge();
         }
-        self.status.checkpointed(position, delivered).await;
+        self.status
+            .checkpointed(position, delivered, pending.latest_event_timing.take())
+            .await;
         Ok(())
     }
 }
@@ -393,7 +471,10 @@ impl ConnectorRuntime {
 mod tests {
     use std::{
         collections::BTreeMap,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
     };
 
     use async_trait::async_trait;
@@ -416,6 +497,23 @@ mod tests {
 
     struct CheckpointSignalSource {
         position: SourcePosition,
+    }
+
+    struct CancellableStateSource {
+        record: SourceRecord,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    struct StuckSource {
+        dropped: Arc<AtomicBool>,
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
@@ -492,6 +590,44 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl SourceConnector for CancellableStateSource {
+        fn source_type(&self) -> &'static str {
+            "cancellable-test"
+        }
+
+        async fn validate(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn run(&mut self, context: SourceContext) -> Result<()> {
+            context
+                .output
+                .send(Ok(self.record.clone()))
+                .await
+                .map_err(|_| Error::Cancelled)?;
+            context.cancellation.cancelled().await;
+            self.cancelled.store(true, Ordering::SeqCst);
+            Err(Error::Cancelled)
+        }
+    }
+
+    #[async_trait]
+    impl SourceConnector for StuckSource {
+        fn source_type(&self) -> &'static str {
+            "stuck-test"
+        }
+
+        async fn validate(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn run(&mut self, _context: SourceContext) -> Result<()> {
+            let _drop_flag = DropFlag(self.dropped.clone());
+            std::future::pending().await
+        }
+    }
+
     struct UnusedEncoder;
 
     impl EventEncoder for UnusedEncoder {
@@ -563,6 +699,10 @@ mod tests {
         batch_sizes: Arc<Mutex<Vec<usize>>>,
     }
 
+    struct FailingSink {
+        shutdown: Arc<AtomicBool>,
+    }
+
     #[async_trait]
     impl Sink for RecordingSink {
         fn name(&self) -> &'static str {
@@ -585,6 +725,34 @@ mod tests {
         }
 
         async fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Sink for FailingSink {
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+
+        fn durability(&self) -> Durability {
+            Durability::Durable
+        }
+
+        async fn validate(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn write(&mut self, _batch: &DeliveryBatch) -> Result<()> {
+            Err(Error::Sink("intentional delivery failure".into()))
+        }
+
+        async fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> Result<()> {
+            self.shutdown.store(true, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -738,6 +906,8 @@ mod tests {
             event_serial: 1,
             snapshot: false,
         });
+        let source_time = Utc::now() - chrono::Duration::seconds(2);
+        let observed_time = Utc::now();
         let event = ChangeEvent {
             id: EventId::deterministic("orders", "mysql", &position, "app.orders", 1),
             source: SourceMetadata {
@@ -760,8 +930,8 @@ mod tests {
                 version: 1,
                 fields: Vec::new(),
             },
-            source_time: None,
-            observed_time: Utc::now(),
+            source_time: Some(source_time),
+            observed_time,
         };
         let source = StateSource {
             record: SourceRecord {
@@ -800,6 +970,116 @@ mod tests {
                 .source_position,
             position
         );
-        assert_eq!(status.snapshot().await.delivered_events, 2);
+        let status = status.snapshot().await;
+        assert_eq!(status.delivered_events, 2);
+        assert_eq!(status.last_source_event_at, Some(source_time));
+        assert_eq!(status.last_event_observed_at, Some(observed_time));
+        assert!(status.source_lag_millis.is_some_and(|lag| lag >= 2_000));
+    }
+
+    #[tokio::test]
+    async fn cancels_source_shuts_down_sink_and_counts_failed_batches() {
+        let position = SourcePosition::MySql(MySqlPosition {
+            binlog_filename: "mysql-bin.000001".into(),
+            binlog_position: 512,
+            gtid_set: None,
+            server_id: 1,
+            event_serial: 2,
+            snapshot: false,
+        });
+        let event = ChangeEvent {
+            id: EventId::deterministic("orders", "mysql", &position, "app.orders", 2),
+            source: SourceMetadata {
+                connector: "mysql".into(),
+                connector_name: "orders".into(),
+                database: "app".into(),
+                schema: None,
+                table: Some("orders".into()),
+                snapshot: false,
+                version: "test".into(),
+                attributes: BTreeMap::new(),
+            },
+            position: position.clone(),
+            transaction: None,
+            operation: Operation::Delete,
+            before: None,
+            after: None,
+            schema: EventSchema {
+                name: "orders".into(),
+                version: 1,
+                fields: Vec::new(),
+            },
+            source_time: Some(Utc::now()),
+            observed_time: Utc::now(),
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let status = RuntimeStatus::new("runtime-failure-test");
+        let runtime = ConnectorRuntime::new(
+            ConnectorIdentity::new("runtime-failure-test"),
+            Box::new(CancellableStateSource {
+                record: SourceRecord {
+                    event: Some(event),
+                    position,
+                    boundary: RecordBoundary::TransactionCommit,
+                    connector_state: None,
+                    signal_acknowledgements: Vec::new(),
+                },
+                cancelled: cancelled.clone(),
+            }),
+            Arc::new(BatchEncoder),
+            Box::new(FailingSink {
+                shutdown: shutdown.clone(),
+            }),
+            Arc::new(MemoryCheckpointStore::default()),
+            RuntimeConfig::default(),
+            status.clone(),
+        );
+
+        let error = runtime.run(CancellationToken::new()).await.unwrap_err();
+        assert!(error.to_string().contains("intentional delivery failure"));
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert!(shutdown.load(Ordering::SeqCst));
+        let status = status.snapshot().await;
+        assert_eq!(status.state, ConnectorState::Failed);
+        assert_eq!(status.failed_events, 2);
+        assert!(
+            status
+                .state_reason
+                .is_some_and(|reason| reason.contains("intentional delivery failure"))
+        );
+    }
+
+    #[tokio::test]
+    async fn aborts_a_source_that_exceeds_the_shutdown_timeout() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let status = RuntimeStatus::new("runtime-timeout-test");
+        let runtime = ConnectorRuntime::new(
+            ConnectorIdentity::new("runtime-timeout-test"),
+            Box::new(StuckSource {
+                dropped: dropped.clone(),
+            }),
+            Arc::new(UnusedEncoder),
+            Box::new(FailingSink {
+                shutdown: shutdown.clone(),
+            }),
+            Arc::new(MemoryCheckpointStore::default()),
+            RuntimeConfig {
+                shutdown_timeout: Duration::from_millis(10),
+                ..RuntimeConfig::default()
+            },
+            status.clone(),
+        );
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = runtime.run(cancellation).await.unwrap_err();
+        assert!(error.to_string().contains("source shutdown timed out"));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(shutdown.load(Ordering::SeqCst));
+        let status = status.snapshot().await;
+        assert_eq!(status.state, ConnectorState::Failed);
+        assert_eq!(status.failed_events, 0);
     }
 }

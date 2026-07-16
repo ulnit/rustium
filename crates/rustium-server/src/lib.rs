@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use prometheus::{Encoder, IntGauge, Registry, TextEncoder};
+use prometheus::{Encoder, Gauge, IntGauge, Registry, TextEncoder};
 use rustium_core::{ConnectorState, Error, Result, RuntimeStatus, SignalRecord, SignalSender};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -31,6 +31,7 @@ struct Metrics {
     failed_events: IntGauge,
     queue_depth: IntGauge,
     connector_state: IntGauge,
+    source_lag_seconds: Gauge,
 }
 
 impl Metrics {
@@ -56,11 +57,17 @@ impl Metrics {
             "Connector state as a numeric lifecycle value",
         )
         .map_err(metrics_error)?;
+        let source_lag_seconds = Gauge::new(
+            "rustium_source_lag_seconds",
+            "Current wall-clock lag from the last durably acknowledged source timestamp, or NaN when unavailable",
+        )
+        .map_err(metrics_error)?;
         for collector in [
             Box::new(delivered_events.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(failed_events.clone()),
             Box::new(queue_depth.clone()),
             Box::new(connector_state.clone()),
+            Box::new(source_lag_seconds.clone()),
         ] {
             registry.register(collector).map_err(metrics_error)?;
         }
@@ -70,6 +77,7 @@ impl Metrics {
             failed_events,
             queue_depth,
             connector_state,
+            source_lag_seconds,
         })
     }
 }
@@ -189,6 +197,11 @@ async fn metrics(State(state): State<AppState>) -> Response {
         .metrics
         .connector_state
         .set(state_number(status.state));
+    state.metrics.source_lag_seconds.set(
+        status
+            .source_lag_millis
+            .map_or(f64::NAN, |lag| lag as f64 / 1_000.0),
+    );
 
     let encoder = TextEncoder::new();
     let mut body = Vec::new();
@@ -257,5 +270,16 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let response = submit_signal(State(app_state(true, None)), Json(signal)).await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn exposes_unknown_source_lag_as_nan() {
+        let response = metrics(State(app_state(false, None))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("rustium_source_lag_seconds NaN"));
     }
 }
