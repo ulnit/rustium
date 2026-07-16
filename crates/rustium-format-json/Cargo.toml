@@ -11,7 +11,7 @@ authors.workspace = true
 [dependencies]
 bytes.workspace = true
 chrono.workspace = true
-rustium-core = { path = "../rustium-core" }
+rustium-core.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

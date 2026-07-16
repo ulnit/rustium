@@ -11,7 +11,7 @@ authors.workspace = true
 [dependencies]
 humantime-serde.workspace = true
 regex.workspace = true
-rustium-core = { path = "../rustium-core" }
+rustium-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

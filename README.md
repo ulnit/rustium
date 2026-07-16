@@ -45,7 +45,8 @@ The repository contains a runnable alpha implementation.
 | MySQL 8+ snapshot, row-binlog streaming, GTID source filters, persistent schema history, and heartbeat records | Implemented; required Docker CI and external MySQL 8.4 recovery/soak gates pass |
 | SQL Server CDC | Implemented; required Docker CI and external SQL Server 2022 recovery/soak gates pass |
 | CLI, health, status, stop, and Prometheus endpoints | Implemented |
-| Container image, Helm chart, published crates | Not published |
+| Reproducible non-root container image and Helm chart source | Implemented; packaging gate runs in CI |
+| Published container image, Helm chart, and crates | Not published yet |
 
 This is not a production-stable release. Persisted state and public configuration may still change before `1.0`.
 
@@ -101,6 +102,14 @@ cargo test -p rustium-core --test runtime_soak -- --ignored --nocapture
 ```
 
 The gate repeatedly holds a capacity-one Source queue behind a retrying Sink and requires byte-identical batch replay, an unchanged checkpoint until delivery succeeds, ordered final progress, bounded queue admission, exact retry metrics, and Sink shutdown. Separate repeated paths exhaust the finite retry budget and cancel an unbounded 60-second retry wait, proving that the Source is cancelled, the Sink is closed, unacknowledged positions remain uncheckpointed, operational exhaustion enters `FAILED`, and cancellation exits promptly in `STOPPED` without counting a failed event. `RUSTIUM_RUNTIME_SOAK_CYCLES` accepts `1..10000`; CI requires 256 cycles.
+
+Build and verify the production container and Helm chart:
+
+```bash
+bash scripts/test-packaging.sh
+```
+
+The multi-stage image compiles Rustium with the locked workspace dependencies, contains only the runtime libraries needed by the Kafka/TLS clients, runs as UID/GID `65532`, uses `/var/lib/rustium` for the SQLite checkpoint, and exposes the management server on port `8080`. The packaging gate runs `rustium --version`, checks OCI labels and non-root metadata, lints and renders the Chart, verifies its live/ready probes, read-only root filesystem, retained checkpoint PVC, external configuration Secret mode, and rejects more than one replica. Published image and Helm OCI coordinates are intentionally not claimed until a tagged release is created.
 
 Run the real MySQL 8.4 integration test:
 
@@ -620,6 +629,22 @@ The server binds to `127.0.0.1:8080` by default.
 
 Status and metrics advance only after the sink write and checkpoint succeed. `rustium_source_lag_seconds` is the current wall-clock distance from the last durably acknowledged source timestamp and is `NaN` when the connector or database cannot provide one; `rustium_sink_retry_attempts` counts scheduled Sink retries across validation, delivery, and flush. Encoding and exhausted or non-retryable sink-delivery failures increment `failed_events`, transition the connector to `FAILED`, cancel the Source, and still run Sink shutdown; a Source that ignores cancellation is aborted after `runtime.shutdown_timeout`.
 
+### Container and Kubernetes Deployment
+
+The repository includes a multi-stage `Dockerfile` and a Helm chart at [deploy/helm/rustium](deploy/helm/rustium). The chart intentionally runs one connector replica because SQLite checkpoint ownership and source ordering are single-owner contracts. It defaults to a retained `ReadWriteOnce` PVC, a `Recreate` strategy, non-root UID/GID `65532`, a read-only root filesystem, disabled ServiceAccount token mounting, and `/health/live` plus `/health/ready` probes.
+
+For Kubernetes, create a Secret containing the complete configuration and install the chart:
+
+```bash
+kubectl -n rustium create secret generic rustium-config \
+  --from-file=rustium.yaml=./rustium.yaml
+helm upgrade --install rustium deploy/helm/rustium \
+  --namespace rustium --create-namespace \
+  --set config.existingSecret=rustium-config
+```
+
+The mounted configuration should use `server.bind: 0.0.0.0:8080` and `state.path: /var/lib/rustium/rustium.db`. Interpolate database, Kafka, and Schema Registry credentials from Kubernetes Secret environment variables; do not commit them in values files. See [deploy/helm/rustium/README.md](deploy/helm/rustium/README.md) for the complete English-first bilingual deployment contract.
+
 ### Documentation and Contribution Policy
 
 - User-facing documentation is complete English first, followed by complete Simplified Chinese.
@@ -666,7 +691,8 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 | MySQL 8+ 快照、行级 binlog、GTID source 过滤、持久 schema history 和 heartbeat record | 已实现；必选 Docker CI 和外部 MySQL 8.4 恢复/soak 门槛通过 |
 | SQL Server CDC | 已实现；必选 Docker CI 和外部 SQL Server 2022 恢复/soak 门槛通过 |
 | CLI、健康、状态、停止和 Prometheus 端点 | 已实现 |
-| 容器镜像、Helm Chart、已发布 crate | 尚未发布 |
+| 可复现的非 root 容器镜像与 Helm Chart 源码 | 已实现；CI 强制运行 packaging gate |
+| 已发布容器镜像、Helm Chart 与 crate | 尚未发布 |
 
 当前版本尚未达到生产稳定。`1.0` 之前，持久化状态和公共配置仍可能调整。
 
@@ -722,6 +748,14 @@ cargo test -p rustium-core --test runtime_soak -- --ignored --nocapture
 ```
 
 该门槛会反复让容量为 1 的 Source 队列被重试中的 Sink 阻塞，并要求每次重放的 batch 字节级一致、投递成功前 checkpoint 不变、最终位点有序推进、队列准入有界、重试指标精确且 Sink 完成关闭。独立的重复路径还会耗尽有限重试预算，并取消一次 60 秒的无限重试等待，以证明 Source 被取消、Sink 被关闭、未确认位点不进入 checkpoint、业务性重试耗尽进入 `FAILED`，而取消会迅速进入 `STOPPED` 且不计失败事件。`RUSTIUM_RUNTIME_SOAK_CYCLES` 接受 `1..10000`；CI 固定要求 256 轮。
+
+构建并验证生产容器和 Helm Chart：
+
+```bash
+bash scripts/test-packaging.sh
+```
+
+多阶段镜像使用 locked workspace 依赖编译 Rustium，只包含 Kafka/TLS client 所需的运行库，以 UID/GID `65532` 运行，使用 `/var/lib/rustium` 保存 SQLite checkpoint，并暴露 `8080` 管理端口。Packaging gate 会执行 `rustium --version`，检查 OCI label 和非 root 元数据，lint/render Chart，验证 live/ready probe、只读根文件系统、保留 checkpoint PVC 和外部配置 Secret 模式，并拒绝多副本。只有创建 tagged release 后才会发布镜像和 Helm OCI 坐标，当前不提前宣称已发布。
 
 运行真实 MySQL 8.4 集成测试：
 
@@ -1232,6 +1266,22 @@ Server 默认绑定 `127.0.0.1:8080`。
 | `GET /metrics` | Prometheus 指标 |
 
 状态和指标只有在 Sink 写入及 checkpoint 成功后才会推进。`rustium_source_lag_seconds` 表示当前时间与最后一个已持久确认源时间戳之间的距离；连接器或数据库无法提供源时间戳时为 `NaN`。`rustium_sink_retry_attempts` 统计 Sink 校验、投递和 flush 阶段已调度的重试。编码失败、重试耗尽或不可重试的 Sink 投递失败会增加 `failed_events`、把连接器转为 `FAILED`、取消 Source，并仍然执行 Sink shutdown；若 Source 忽略取消，则会在 `runtime.shutdown_timeout` 后被 abort。
+
+### 容器与 Kubernetes 部署
+
+仓库提供多阶段 `Dockerfile` 和 [deploy/helm/rustium](deploy/helm/rustium) Helm Chart。由于 SQLite checkpoint 所有权和源顺序都是单所有者契约，Chart 有意只运行一个 connector 副本。默认使用保留的 `ReadWriteOnce` PVC、`Recreate` 策略、非 root UID/GID `65532`、只读根文件系统、关闭 ServiceAccount token 挂载，以及 `/health/live` 和 `/health/ready` probe。
+
+在 Kubernetes 中创建包含完整配置的 Secret 并安装 Chart：
+
+```bash
+kubectl -n rustium create secret generic rustium-config \
+  --from-file=rustium.yaml=./rustium.yaml
+helm upgrade --install rustium deploy/helm/rustium \
+  --namespace rustium --create-namespace \
+  --set config.existingSecret=rustium-config
+```
+
+挂载配置应使用 `server.bind: 0.0.0.0:8080` 和 `state.path: /var/lib/rustium/rustium.db`。数据库、Kafka 和 Schema Registry 凭据应通过 Kubernetes Secret 环境变量插入，不要提交到 values 文件。完整英中部署契约见 [deploy/helm/rustium/README.md](deploy/helm/rustium/README.md)。
 
 ### 文档与贡献策略
 

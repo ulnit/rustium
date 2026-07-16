@@ -12,7 +12,7 @@ authors.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 rdkafka.workspace = true
-rustium-core = { path = "../rustium-core" }
+rustium-core.workspace = true
 schema_registry_converter.workspace = true
 tokio.workspace = true
 url.workspace = true
@@ -23,9 +23,9 @@ chrono.workspace = true
 mockito.workspace = true
 prost-reflect.workspace = true
 protox-parse.workspace = true
-rustium-format-avro = { path = "../rustium-format-avro" }
-rustium-format-json = { path = "../rustium-format-json" }
-rustium-format-protobuf = { path = "../rustium-format-protobuf" }
+rustium-format-avro.workspace = true
+rustium-format-json.workspace = true
+rustium-format-protobuf.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 

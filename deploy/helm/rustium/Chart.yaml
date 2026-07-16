@@ -1,0 +1,17 @@
+apiVersion: v2
+name: rustium
+description: Standalone log-based Change Data Capture service
+type: application
+version: 0.1.0-alpha.1
+appVersion: 0.1.0-alpha.1
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/ulnit/rustium
+sources:
+  - https://github.com/ulnit/rustium
+maintainers:
+  - name: Rustium Contributors
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/links: |
+    - name: Source
+      url: https://github.com/ulnit/rustium

@@ -10,7 +10,7 @@ authors.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-rustium-core = { path = "../rustium-core" }
+rustium-core.workspace = true
 tokio.workspace = true
 
 [lints]

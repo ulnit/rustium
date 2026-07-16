@@ -1,0 +1,12 @@
+.git
+.github
+.idea
+.vscode
+target
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+.env
+docs/README (参考).md
+docs/Rustium_完整方案(参考).md

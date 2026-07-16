@@ -12,7 +12,7 @@ authors.workspace = true
 apache-avro.workspace = true
 bytes.workspace = true
 hex.workspace = true
-rustium-core = { path = "../rustium-core" }
+rustium-core.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

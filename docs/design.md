@@ -66,7 +66,8 @@ The workspace contains a runnable alpha service.
 | MySQL source | Implemented; required Docker CI and external MySQL 8.4 recovery/soak gates pass |
 | SQL Server source | Implemented; required Docker CI and external SQL Server 2022 recovery/soak gates pass |
 | CLI and HTTP management | Implemented |
-| Published image/package/Helm chart | Not available |
+| Reproducible non-root container image and Helm chart source | Implemented; packaging gate enforced by CI |
+| Published image/package/Helm chart | Not published until a tagged release |
 
 Alpha means the source and delivery contracts are functional, but configuration and persisted state are not stable yet.
 
@@ -424,6 +425,10 @@ Metrics expose connector state, delivered events, failed events, pipeline queue 
 - Mutating HTTP endpoints are disabled by default.
 - Secrets are interpolated at load time and excluded from status and semantic fingerprints.
 
+#### 14.1 Container and Kubernetes Packaging
+
+The repository ships a multi-stage `Dockerfile` and `deploy/helm/rustium` chart. The runtime image contains the Rustium binary and only the native Kafka/TLS libraries required at runtime, runs as UID/GID `65532`, uses `/var/lib/rustium` as its writable state directory, and exposes management port `8080`. The chart deliberately enforces one replica and `Recreate` because SQLite checkpoint ownership and source ordering are single-owner contracts. Its default pod uses a retained `ReadWriteOnce` PVC, a read-only root filesystem, dropped Linux capabilities, disabled ServiceAccount token mounting, and live/ready probes. Configuration is mounted from a Secret; production installations should use an externally managed Secret and interpolate database, Kafka, and Registry credentials through environment variables. `scripts/test-packaging.sh` builds the image, executes `rustium --version`, checks OCI/non-root metadata, lints and renders the chart, verifies persistence/probe/security invariants, and rejects multiple replicas. Published OCI artifacts remain a tagged-release operation and are not claimed by the source tree.
+
 ### 15. Testing and Release Gates
 
 A connector is not complete because it compiles. Required gates include:
@@ -524,7 +529,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. Roadmap
 
-1. Add packaging, a security policy, operational runbooks, and stable upgrade migrations before `1.0`.
+1. Add a security policy, operational runbooks, and stable upgrade migrations before `1.0`; reproducible container and Helm packaging is implemented, while publication remains a tagged-release operation.
 2. Freeze the public configuration, event, and persisted-state compatibility contracts after the remaining release gates pass.
 3. Consider additional databases only after the current three connectors and shared runtime pass the full `1.0` gates.
 
@@ -584,7 +589,8 @@ Workspace 已包含可运行的 alpha 服务。
 | MySQL Source | 已实现；必选 Docker CI 和外部 MySQL 8.4 恢复/soak 门槛通过 |
 | SQL Server Source | 已实现；必选 Docker CI 和外部 SQL Server 2022 恢复/soak 门槛通过 |
 | CLI 和 HTTP 管理 | 已实现 |
-| 已发布镜像/包/Helm Chart | 尚不可用 |
+| 可复现的非 root 容器镜像与 Helm Chart 源码 | 已实现；CI 强制运行 packaging gate |
+| 已发布镜像/包/Helm Chart | tagged release 前不发布 |
 
 Alpha 表示源端和投递契约可以运行，但配置和持久化状态尚未稳定。
 
@@ -942,6 +948,10 @@ stdout 是 best-effort，仅用于开发，并将 tombstone 输出为一行 `nul
 - 变更型 HTTP 端点默认禁用。
 - Secret 在加载时插值，不进入状态和语义指纹。
 
+#### 14.1 容器与 Kubernetes 打包
+
+仓库提供多阶段 `Dockerfile` 和 `deploy/helm/rustium` Chart。运行时镜像只包含 Rustium 二进制及 Kafka/TLS client 所需的原生运行库，以 UID/GID `65532` 运行，将 `/var/lib/rustium` 作为可写状态目录，并暴露 `8080` 管理端口。由于 SQLite checkpoint 所有权与源顺序都是单所有者契约，Chart 强制单副本和 `Recreate`。默认 Pod 使用保留的 `ReadWriteOnce` PVC、只读根文件系统、删除全部 Linux capabilities、关闭 ServiceAccount token 挂载，以及 live/ready probe。配置从 Secret 挂载；生产部署应使用外部管理的 Secret，并通过环境变量插入数据库、Kafka 和 Registry 凭据。`scripts/test-packaging.sh` 会构建镜像、执行 `rustium --version`、检查 OCI/非 root 元数据、lint/render Chart、验证持久化/probe/安全不变量，并拒绝多副本。OCI artifact 发布仍属于 tagged release 操作，源码仓库不会提前宣称已发布。
+
 ### 15. 测试与发布门槛
 
 连接器能编译不代表完成。必要门槛包括：
@@ -1042,6 +1052,6 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. 路线图
 
-1. 在 `1.0` 前补打包、安全策略、运维手册和稳定升级迁移。
+1. 在 `1.0` 前补安全策略、运维手册和稳定升级迁移；可复现容器与 Helm 打包已实现，发布仍由 tagged release 完成。
 2. 剩余发布门槛通过后，冻结公共配置、事件和持久化状态兼容契约。
 3. 只有当当前三个连接器和共享运行时通过完整 `1.0` 门槛后，才考虑更多数据库。

@@ -1,0 +1,147 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/ulnit/rustium
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automountServiceAccountToken: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+
+config:
+  # Prefer an externally managed Secret in production. It must contain the key below.
+  existingSecret: ""
+  secretKey: rustium.yaml
+  content: |
+    api_version: rustium.io/v1alpha1
+    kind: Connector
+    metadata:
+      name: rustium-postgresql
+    source:
+      type: postgresql
+      hostname: postgres.example.com
+      port: 5432
+      database: inventory
+      username: rustium
+      password: ${RUSTIUM_DATABASE_PASSWORD}
+      publication: rustium_publication
+      slot_name: rustium_inventory
+      slot_ownership: managed
+      tables:
+        include:
+          - public\.orders
+      ssl_mode: verify_identity
+    snapshot:
+      mode: initial
+      fetch_size: 1024
+    format:
+      type: debezium_json
+      tombstones_on_delete: true
+    sink:
+      type: stdout
+      topic_prefix: inventory
+    state:
+      type: sqlite
+      path: /var/lib/rustium/rustium.db
+    runtime:
+      channel_capacity: 2048
+      max_batch_size: 512
+      flush_interval: 100ms
+      shutdown_timeout: 30s
+    server:
+      bind: 0.0.0.0:8080
+      enable_mutations: false
+    observability:
+      log_format: json
+      log_level: info
+      metrics: true
+
+extraEnv: []
+envFrom: []
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+persistence:
+  enabled: true
+  existingClaim: ""
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+  annotations:
+    helm.sh/resource-policy: keep
+
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 6
+
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 2
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 6
+
+terminationGracePeriodSeconds: 60
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  interval: 30s
+  scrapeTimeout: 10s
+  additionalLabels: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+extraVolumes: []
+extraVolumeMounts: []

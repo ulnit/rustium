@@ -15,8 +15,8 @@ futures.workspace = true
 hex.workspace = true
 indexmap.workspace = true
 regex.workspace = true
-rustium-config = { path = "../rustium-config" }
-rustium-core = { path = "../rustium-core" }
+rustium-config.workspace = true
+rustium-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tiberius.workspace = true
@@ -27,7 +27,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 rdkafka.workspace = true
-rustium-signal-kafka = { path = "../rustium-signal-kafka" }
+rustium-signal-kafka.workspace = true
 tempfile.workspace = true
 
 [lints]

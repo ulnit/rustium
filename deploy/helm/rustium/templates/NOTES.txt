@@ -1,0 +1,13 @@
+Rustium has been installed as {{ include "rustium.fullname" . }}.
+
+Check the connector status:
+  kubectl -n {{ .Release.Namespace }} port-forward service/{{ include "rustium.fullname" . }} 8080:{{ .Values.service.port }}
+  curl http://127.0.0.1:8080/v1/connector/status
+
+The SQLite checkpoint is stored in /var/lib/rustium. The chart intentionally uses one
+replica and a Recreate strategy because a connector has one source-position owner.
+{{- if not .Values.persistence.enabled }}
+
+WARNING: persistence is disabled. A Pod replacement loses the checkpoint and may require
+a new snapshot. This mode is intended only for disposable development environments.
+{{- end }}

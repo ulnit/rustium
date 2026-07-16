@@ -49,6 +49,19 @@ protox-parse = "0.9.0"
 rdkafka = { version = "0.39.0", features = ["cmake-build", "ssl", "sasl"] }
 regex = "1.11.1"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
+rustium-config = { version = "0.1.0-alpha.1", path = "crates/rustium-config" }
+rustium-core = { version = "0.1.0-alpha.1", path = "crates/rustium-core" }
+rustium-format-avro = { version = "0.1.0-alpha.1", path = "crates/rustium-format-avro" }
+rustium-format-json = { version = "0.1.0-alpha.1", path = "crates/rustium-format-json" }
+rustium-format-protobuf = { version = "0.1.0-alpha.1", path = "crates/rustium-format-protobuf" }
+rustium-mysql = { version = "0.1.0-alpha.1", path = "crates/rustium-mysql" }
+rustium-postgresql = { version = "0.1.0-alpha.1", path = "crates/rustium-postgresql" }
+rustium-server = { version = "0.1.0-alpha.1", path = "crates/rustium-server" }
+rustium-signal-kafka = { version = "0.1.0-alpha.1", path = "crates/rustium-signal-kafka" }
+rustium-sink-kafka = { version = "0.1.0-alpha.1", path = "crates/rustium-sink-kafka" }
+rustium-sink-stdout = { version = "0.1.0-alpha.1", path = "crates/rustium-sink-stdout" }
+rustium-sqlserver = { version = "0.1.0-alpha.1", path = "crates/rustium-sqlserver" }
+rustium-state = { version = "0.1.0-alpha.1", path = "crates/rustium-state" }
 schema_registry_converter = { version = "4.10.0", default-features = false, features = ["futures", "rustls_tls"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"

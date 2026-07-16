@@ -14,7 +14,7 @@ hex.workspace = true
 prost.workspace = true
 prost-reflect.workspace = true
 protox-parse.workspace = true
-rustium-core = { path = "../rustium-core" }
+rustium-core.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 

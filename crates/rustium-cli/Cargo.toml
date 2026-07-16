@@ -14,19 +14,19 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-rustium-config = { path = "../rustium-config" }
-rustium-core = { path = "../rustium-core" }
-rustium-format-avro = { path = "../rustium-format-avro" }
-rustium-format-json = { path = "../rustium-format-json" }
-rustium-format-protobuf = { path = "../rustium-format-protobuf" }
-rustium-mysql = { path = "../rustium-mysql" }
-rustium-postgresql = { path = "../rustium-postgresql" }
-rustium-server = { path = "../rustium-server" }
-rustium-signal-kafka = { path = "../rustium-signal-kafka" }
-rustium-sink-kafka = { path = "../rustium-sink-kafka" }
-rustium-sink-stdout = { path = "../rustium-sink-stdout" }
-rustium-sqlserver = { path = "../rustium-sqlserver" }
-rustium-state = { path = "../rustium-state" }
+rustium-config.workspace = true
+rustium-core.workspace = true
+rustium-format-avro.workspace = true
+rustium-format-json.workspace = true
+rustium-format-protobuf.workspace = true
+rustium-mysql.workspace = true
+rustium-postgresql.workspace = true
+rustium-server.workspace = true
+rustium-signal-kafka.workspace = true
+rustium-sink-kafka.workspace = true
+rustium-sink-stdout.workspace = true
+rustium-sqlserver.workspace = true
+rustium-state.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
