@@ -2300,7 +2300,10 @@ fn change_value_expression(index: usize, field: &FieldSchema) -> String {
         "date" | "time" | "datetime" | "datetime2" | "smalldatetime" | "datetimeoffset" => {
             format!("CONVERT(nvarchar(64), {column}, 126)")
         }
-        "geometry" | "geography" | "hierarchyid" => format!("{column}.ToString()"),
+        "geometry" | "geography" => {
+            format!("CONVERT(varchar(max), {column}.Serialize(), 2)")
+        }
+        "hierarchyid" => format!("{column}.ToString()"),
         _ => format!("CONVERT(nvarchar(max), {column})"),
     };
     format!("{value} AS [c{index}]")
@@ -2373,7 +2376,8 @@ fn convert_sqlserver_text(value: &str, type_name: &str) -> DataValue {
             .parse::<f64>()
             .map_or_else(|_| DataValue::String(value.into()), DataValue::Float64),
         "decimal" | "numeric" | "money" | "smallmoney" => DataValue::Decimal(value.into()),
-        "binary" | "varbinary" | "image" | "rowversion" | "timestamp" => {
+        "binary" | "varbinary" | "image" | "rowversion" | "timestamp" | "geometry"
+        | "geography" => {
             hex::decode(value).map_or_else(|_| DataValue::String(value.into()), DataValue::Bytes)
         }
         "date" => DataValue::Date(value.into()),
@@ -2649,6 +2653,22 @@ mod tests {
         assert_eq!(
             convert_sqlserver_text("00FF", "varbinary(2)"),
             DataValue::Bytes(vec![0, 255])
+        );
+        assert_eq!(
+            convert_sqlserver_text("E6100000010C0000000000000040000000000000F03F", "geometry"),
+            DataValue::Bytes(hex::decode("E6100000010C0000000000000040000000000000F03F").unwrap())
+        );
+        assert_eq!(
+            change_value_expression(
+                0,
+                &FieldSchema {
+                    name: "location".into(),
+                    type_name: "geography".into(),
+                    optional: false,
+                    primary_key: false,
+                }
+            ),
+            "CONVERT(varchar(max), ct.[location].Serialize(), 2) AS [c0]"
         );
         assert_eq!(
             sqlserver_datetime(

@@ -739,13 +739,21 @@ async fn keeps_snapshot_and_cdc_type_conversion_identical() -> TestResult {
                     time_value time(4) NOT NULL, \
                     datetime2_value datetime2(4) NOT NULL, \
                     offset_value datetimeoffset(4) NOT NULL, \
-                    text_value nvarchar(100) NULL\
+                    text_value nvarchar(100) NULL, \
+                    xml_value xml NOT NULL, \
+                    hierarchy_value hierarchyid NOT NULL, \
+                    geometry_value geometry NOT NULL, \
+                    geography_value geography NOT NULL\
                  ); \
                  INSERT INTO dbo.{table_name} VALUES (\
                     1, 1, 255, -1234, 123456, 9876543210, 12345.6789, 42.5000, \
                     1.25, 9.5, '550e8400-e29b-41d4-a716-446655440000', 0x00FF10AA, \
                     '2026-07-16', '09:30:45.1234', '2026-07-16T09:30:45.1234', \
-                    '2026-07-16T09:30:45.1234+08:00', N'Rustium type matrix'\
+                    '2026-07-16T09:30:45.1234+08:00', N'Rustium type matrix', \
+                    CONVERT(xml, N'<root><value>Rustium</value></root>'), \
+                    hierarchyid::Parse('/1/2/'), \
+                    geometry::STGeomFromText('POINT (1 2)', 4326), \
+                    geography::STGeomFromText('POINT (1 2)', 4326)\
                  ); \
                  EXEC sys.sp_cdc_enable_table \
                     @source_schema=N'dbo', \
@@ -792,7 +800,11 @@ async fn keeps_snapshot_and_cdc_type_conversion_identical() -> TestResult {
                         2, 1, 255, -1234, 123456, 9876543210, 12345.6789, 42.5000, \
                         1.25, 9.5, '550e8400-e29b-41d4-a716-446655440000', 0x00FF10AA, \
                         '2026-07-16', '09:30:45.1234', '2026-07-16T09:30:45.1234', \
-                        '2026-07-16T09:30:45.1234+08:00', N'Rustium type matrix'\
+                        '2026-07-16T09:30:45.1234+08:00', N'Rustium type matrix', \
+                        CONVERT(xml, N'<root><value>Rustium</value></root>'), \
+                        hierarchyid::Parse('/1/2/'), \
+                        geometry::STGeomFromText('POINT (1 2)', 4326), \
+                        geography::STGeomFromText('POINT (1 2)', 4326)\
                      )"
                 ),
             )
@@ -817,6 +829,26 @@ async fn keeps_snapshot_and_cdc_type_conversion_identical() -> TestResult {
                 &format!(
                     "SQL Server snapshot/CDC type conversion differs: snapshot={snapshot_values:?}, cdc={cdc_values:?}"
                 ),
+            )?;
+            require(
+                matches!(snapshot_values.get("geometry_value"), Some(DataValue::Bytes(value)) if !value.is_empty()),
+                "SQL Server geometry did not retain native serialization bytes",
+            )?;
+            require(
+                matches!(snapshot_values.get("geography_value"), Some(DataValue::Bytes(value)) if !value.is_empty()),
+                "SQL Server geography did not retain native serialization bytes",
+            )?;
+            require(
+                snapshot_values.get("hierarchy_value")
+                    == Some(&DataValue::String("/1/2/".into())),
+                "SQL Server hierarchyid did not retain its canonical path",
+            )?;
+            require(
+                snapshot_values.get("xml_value")
+                    == Some(&DataValue::String(
+                        "<root><value>Rustium</value></root>".into(),
+                    )),
+                "SQL Server XML did not retain its canonical text",
             )
         }
         .await;

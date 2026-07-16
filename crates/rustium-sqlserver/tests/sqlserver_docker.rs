@@ -1,7 +1,7 @@
 use std::{process::Command, time::Duration};
 
 use rustium_config::{SnapshotConfig, SnapshotMode, SqlServerSourceConfig, TableSelection};
-use rustium_core::{Operation, RecordBoundary, SourceConnector, SourceContext};
+use rustium_core::{DataValue, Operation, RecordBoundary, Row, SourceConnector, SourceContext};
 use rustium_sqlserver::SqlServerSource;
 use tiberius::{AuthMethod, Client, Config};
 use tokio::{
@@ -35,13 +35,50 @@ async fn connect(
     Client::connect(config, tcp.compat_write()).await
 }
 
+fn mapped_port(container: &str) -> u16 {
+    let output = Command::new("docker")
+        .args(["port", container, "1433/tcp"])
+        .output()
+        .expect("inspect SQL Server Docker port");
+    assert!(
+        output.status.success(),
+        "docker port failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("SQL Server Docker port is UTF-8")
+        .trim()
+        .rsplit(':')
+        .next()
+        .expect("SQL Server Docker port mapping has a port")
+        .parse()
+        .expect("SQL Server Docker port is numeric")
+}
+
+fn require_extended_values(row: &Row) {
+    assert!(
+        matches!(row.get("geometry_value"), Some(DataValue::Bytes(value)) if !value.is_empty())
+    );
+    assert!(
+        matches!(row.get("geography_value"), Some(DataValue::Bytes(value)) if !value.is_empty())
+    );
+    assert_eq!(
+        row.get("hierarchy_value"),
+        Some(&DataValue::String("/1/2/".into()))
+    );
+    assert_eq!(
+        row.get("xml_value"),
+        Some(&DataValue::String(
+            "<root><value>Rustium</value></root>".into()
+        ))
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker and the SQL Server 2022 image"]
 async fn snapshots_and_streams_cdc_changes() {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let name = format!("rustium-sqlserver-{suffix}");
-    let port = 35_000 + u16::try_from(std::process::id() % 1_000).unwrap();
-    let port_mapping = format!("{port}:1433");
     let output = Command::new("docker")
         .args([
             "run",
@@ -51,7 +88,7 @@ async fn snapshots_and_streams_cdc_changes() {
             "--name",
             &name,
             "-p",
-            &port_mapping,
+            "127.0.0.1::1433",
             "-e",
             "ACCEPT_EULA=Y",
             "-e",
@@ -68,9 +105,10 @@ async fn snapshots_and_streams_cdc_changes() {
         String::from_utf8_lossy(&output.stderr)
     );
     let _container = DockerContainer(name);
+    let port = mapped_port(&_container.0);
 
     let mut admin = None;
-    for _ in 0..120 {
+    for _ in 0..180 {
         match connect(port, "master", "sa", "Rustium_Strong_2026!").await {
             Ok(client) => {
                 admin = Some(client);
@@ -99,8 +137,22 @@ async fn snapshots_and_streams_cdc_changes() {
     admin
         .simple_query(
             "EXEC sys.sp_cdc_enable_db; \
-             CREATE TABLE dbo.orders (id bigint NOT NULL PRIMARY KEY, customer nvarchar(100) NOT NULL, amount decimal(10,2) NOT NULL); \
-             INSERT INTO dbo.orders VALUES (1, N'Alice', 12.30), (2, N'Bob', 45.60); \
+             CREATE TABLE dbo.orders (\
+                id bigint NOT NULL PRIMARY KEY, \
+                customer nvarchar(100) NOT NULL, \
+                amount decimal(10,2) NOT NULL, \
+                xml_value xml NOT NULL, \
+                hierarchy_value hierarchyid NOT NULL, \
+                geometry_value geometry NOT NULL, \
+                geography_value geography NOT NULL\
+             ); \
+             INSERT INTO dbo.orders VALUES \
+                (1, N'Alice', 12.30, CONVERT(xml, N'<root><value>Rustium</value></root>'), \
+                 hierarchyid::Parse('/1/2/'), geometry::STGeomFromText('POINT (1 2)', 4326), \
+                 geography::STGeomFromText('POINT (1 2)', 4326)), \
+                (2, N'Bob', 45.60, CONVERT(xml, N'<root><value>Rustium</value></root>'), \
+                 hierarchyid::Parse('/1/2/'), geometry::STGeomFromText('POINT (1 2)', 4326), \
+                 geography::STGeomFromText('POINT (1 2)', 4326)); \
              EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'orders', @role_name=NULL, @supports_net_changes=0; \
              CREATE USER rustium FOR LOGIN rustium; \
              GRANT SELECT TO rustium; \
@@ -111,6 +163,29 @@ async fn snapshots_and_streams_cdc_changes() {
         .into_results()
         .await
         .unwrap();
+
+    let mut capture_ready = false;
+    for _ in 0..180 {
+        let ready = match admin
+            .simple_query("SELECT sys.fn_cdc_get_min_lsn(N'dbo_orders') AS min_lsn")
+            .await
+        {
+            Ok(stream) => stream
+                .into_row()
+                .await
+                .ok()
+                .flatten()
+                .and_then(|row| row.get::<&[u8], _>("min_lsn").map(<[u8]>::to_vec))
+                .is_some_and(|lsn| lsn.len() == 10 && lsn.iter().any(|byte| *byte != 0)),
+            Err(_) => false,
+        };
+        if ready {
+            capture_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(capture_ready, "SQL Server CDC capture did not become ready");
 
     let config = SqlServerSourceConfig {
         hostname: "127.0.0.1".into(),
@@ -171,6 +246,7 @@ async fn snapshots_and_streams_cdc_changes() {
     });
 
     let mut snapshot_rows = 0;
+    let mut snapshot_extended = None;
     loop {
         let record = tokio::time::timeout(Duration::from_secs(30), output_rx.recv())
             .await
@@ -180,15 +256,25 @@ async fn snapshots_and_streams_cdc_changes() {
         if record.boundary == RecordBoundary::SnapshotComplete {
             break;
         }
-        assert_eq!(record.event.unwrap().operation, Operation::Read);
+        let event = record.event.unwrap();
+        assert_eq!(event.operation, Operation::Read);
+        if snapshot_extended.is_none() {
+            snapshot_extended = event.after;
+        }
         snapshot_rows += 1;
     }
     assert_eq!(snapshot_rows, 2);
+    let snapshot_extended = snapshot_extended.expect("SQL Server snapshot row exists");
+    require_extended_values(&snapshot_extended);
 
     admin
         .simple_query(
             "BEGIN TRANSACTION; \
-             INSERT INTO dbo.orders VALUES (3, N'Cara', 10.25); \
+             INSERT INTO dbo.orders VALUES (\
+                3, N'Cara', 10.25, CONVERT(xml, N'<root><value>Rustium</value></root>'), \
+                hierarchyid::Parse('/1/2/'), geometry::STGeomFromText('POINT (1 2)', 4326), \
+                geography::STGeomFromText('POINT (1 2)', 4326)\
+             ); \
              UPDATE dbo.orders SET amount = 13.30 WHERE id = 1; \
              DELETE FROM dbo.orders WHERE id = 2; \
              COMMIT TRANSACTION;",
@@ -200,6 +286,7 @@ async fn snapshots_and_streams_cdc_changes() {
         .unwrap();
 
     let mut operations = Vec::new();
+    let mut create_extended = None;
     loop {
         let record = tokio::time::timeout(Duration::from_secs(60), output_rx.recv())
             .await
@@ -210,6 +297,9 @@ async fn snapshots_and_streams_cdc_changes() {
             break;
         }
         if let Some(event) = record.event {
+            if event.operation == Operation::Create {
+                create_extended = event.after.clone();
+            }
             operations.push(event.operation);
         }
     }
@@ -217,6 +307,16 @@ async fn snapshots_and_streams_cdc_changes() {
         operations,
         [Operation::Create, Operation::Update, Operation::Delete]
     );
+    let create_extended = create_extended.expect("SQL Server CDC create row exists");
+    require_extended_values(&create_extended);
+    for field in [
+        "xml_value",
+        "hierarchy_value",
+        "geometry_value",
+        "geography_value",
+    ] {
+        assert_eq!(snapshot_extended.get(field), create_extended.get(field));
+    }
 
     cancellation.cancel();
     source_task.await.unwrap().unwrap();
