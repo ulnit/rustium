@@ -401,7 +401,7 @@ Protobuf row wrappers distinguish native values, null through wrapper absence, u
 
 With `tombstones.on.delete=true`, which is the Debezium-compatible default, encoding one delete produces an ordered pair in the same delivery batch: the delete envelope followed by the same key with a null payload. The tombstone has its own deterministic derived event ID. Sink success, checkpoint persistence, and source acknowledgement cover both records together. Native YAML exposes the same setting as `format.tombstones_on_delete`; the native Rustium JSON format does not emit tombstones.
 
-Checked-in golden fixtures pin the complete Debezium JSON destination, key, and envelope for PostgreSQL, MySQL, and SQL Server using fixed source positions and timestamps. The unit gate compares structured JSON values rather than formatting bytes, so semantically relevant metadata and routing changes require an intentional fixture update while harmless object-key ordering does not.
+Checked-in golden fixtures pin the complete Debezium JSON destination, key, and envelope for PostgreSQL, MySQL, and SQL Server using fixed source positions and timestamps. Companion JSON Schema, Avro, and Protobuf fixtures pin each prioritized connector's destination, key/value subjects, schema type, and complete key/value definitions. JSON-based definitions are compared as structured values, while Protobuf definitions are compared as deterministic source text. Semantically relevant metadata, routing, source fields, field numbers, or wire-schema changes therefore require an intentional fixture update while harmless JSON object-key ordering does not. Each format crate also includes an explicitly ignored regeneration test for controlled fixture updates.
 
 stdout is best-effort and intended for development; it prints tombstones as a `null` line. Kafka uses `librdkafka`, sends tombstones as a true null value, and requires `acks=all` or `-1` so `write` returns only after replica acknowledgement. Producer idempotence is always enabled. Rustium owns bootstrap, acknowledgement, compression, idempotence, and delivery-timeout properties; pass-through properties cannot replace these durability settings. Producer idempotence does not make source-to-Kafka delivery exactly-once.
 
@@ -442,7 +442,7 @@ The security response and deployment baseline are normative in [SECURITY.md](../
 
 The repository ships a multi-stage `Dockerfile` and `deploy/helm/rustium` chart. The runtime image contains the Rustium binary and only the native Kafka/TLS libraries required at runtime, runs as UID/GID `65532`, uses `/var/lib/rustium` as its writable state directory, and exposes management port `8080`. The chart deliberately enforces one replica and `Recreate` because SQLite checkpoint ownership and source ordering are single-owner contracts. Its default pod uses a retained `ReadWriteOnce` PVC, a read-only root filesystem, dropped Linux capabilities, disabled ServiceAccount token mounting, and live/ready probes. Configuration is mounted from a Secret; production installations should use an externally managed Secret and interpolate database, Kafka, and Registry credentials through environment variables. `scripts/test-packaging.sh` builds the image, executes `rustium --version`, checks OCI/non-root metadata, lints and renders the chart, verifies persistence/probe/security invariants, and rejects multiple replicas. Matching protected `v*` tags run `.github/workflows/release.yml`, which publishes signed multi-architecture GHCR images with SBOM/provenance, a Helm OCI artifact, and a GitHub Release with checksums. Crates.io publication is isolated to the manual `.github/workflows/publish-crates.yml` workflow, which requires an explicitly rotated Secret and publishes from leaf crates to the CLI.
 
-Every publishable workspace crate also carries a concise English-first bilingual README. The packaging, release, and publication gates enumerate each Cargo package and require `README.md` in its tarball, so a published crate remains usable without the monorepo checkout.
+Every publishable workspace crate also carries a concise English-first bilingual README. The packaging, release, and publication gates enumerate each Cargo package and require `README.md` in its tarball, so a published crate remains usable without the monorepo checkout. They also require every prioritized connector schema fixture in each schema-aware format crate, preventing a publication manifest from silently dropping its checked-in wire-contract evidence.
 
 ### 15. Testing and Release Gates
 
@@ -941,7 +941,7 @@ Protobuf row wrapper 可区分原生值、通过 wrapper 缺失表达的 null、
 
 `tombstones.on.delete=true` 是 Debezium 兼容默认值。此时一条 delete 会在同一投递批次中编码为有序的两条记录：先发送 delete envelope，再发送 key 相同、payload 为 null 的 tombstone。tombstone 使用独立的确定性派生事件 ID；两条记录共同受 Sink 成功、checkpoint 持久化和 Source 确认约束。原生 YAML 使用 `format.tombstones_on_delete`；原生 Rustium JSON 格式不产生 tombstone。
 
-仓库内置 golden fixture，使用固定 source position 和 timestamp 固定 PostgreSQL、MySQL 与 SQL Server 的完整 Debezium JSON destination、key 和 envelope。单元门禁比较结构化 JSON 值，因此具有语义影响的元数据或 routing 变化必须显式更新 fixture，而无关的对象字段顺序不会造成失败。
+仓库内置 golden fixture，使用固定 source position 和 timestamp 固定 PostgreSQL、MySQL 与 SQL Server 的完整 Debezium JSON destination、key 和 envelope。配套 JSON Schema、Avro 和 Protobuf fixture 还会固定每个优先连接器的 destination、key/value subject、schema type 以及完整 key/value 定义。基于 JSON 的定义按结构化值比较，Protobuf 定义按确定性源码文本比较。因此，具有语义影响的元数据、routing、source 字段、field number 或 wire schema 变化都必须显式更新 fixture，而无关的 JSON 对象字段顺序不会造成失败。每个 format crate 还提供一个显式 ignored 的再生成测试，用于受控更新 fixture。
 
 stdout 是 best-effort，仅用于开发，并将 tombstone 输出为一行 `null`。Kafka 使用 `librdkafka`，将 tombstone 发送为真正的 null value，并要求 `acks=all` 或 `-1`，使 `write` 只在副本确认后返回。Producer 幂等始终启用。Rustium 拥有 bootstrap、确认、压缩、幂等和投递超时参数，透传属性不能替换这些持久性设置。Producer 幂等并不会把 Source 到 Kafka 变为 exactly-once。
 
@@ -982,7 +982,7 @@ stdout 是 best-effort，仅用于开发，并将 tombstone 输出为一行 `nul
 
 仓库提供多阶段 `Dockerfile` 和 `deploy/helm/rustium` Chart。运行时镜像只包含 Rustium 二进制及 Kafka/TLS client 所需的原生运行库，以 UID/GID `65532` 运行，将 `/var/lib/rustium` 作为可写状态目录，并暴露 `8080` 管理端口。由于 SQLite checkpoint 所有权与源顺序都是单所有者契约，Chart 强制单副本和 `Recreate`。默认 Pod 使用保留的 `ReadWriteOnce` PVC、只读根文件系统、删除全部 Linux capabilities、关闭 ServiceAccount token 挂载，以及 live/ready probe。配置从 Secret 挂载；生产部署应使用外部管理的 Secret，并通过环境变量插入数据库、Kafka 和 Registry 凭据。`scripts/test-packaging.sh` 会构建镜像、执行 `rustium --version`、检查 OCI/非 root 元数据、lint/render Chart、验证持久化/probe/安全不变量，并拒绝多副本。匹配的受保护 `v*` tag 会运行 `.github/workflows/release.yml`，发布带签名、SBOM/provenance 的多架构 GHCR 镜像、Helm OCI artifact 和带 checksum 的 GitHub Release。crates.io 仅通过手动 `.github/workflows/publish-crates.yml` workflow 发布，该 workflow 要求显式轮换的 Secret，并按叶子 crate 到 CLI 的顺序执行。
 
-每个可发布 workspace crate 也包含简洁的英中双语 README。Packaging、release 和 publication 门禁会枚举每个 Cargo package，并要求其 tarball 包含 `README.md`，确保发布后的 crate 不依赖 monorepo checkout 才能使用。
+每个可发布 workspace crate 也包含简洁的英中双语 README。Packaging、release 和 publication 门禁会枚举每个 Cargo package，并要求其 tarball 包含 `README.md`，确保发布后的 crate 不依赖 monorepo checkout 才能使用。它们还要求每个 schema-aware format crate 包含全部优先连接器 schema fixture，避免发布 manifest 静默丢失仓库内固定的 wire contract 证据。
 
 ### 15. 测试与发布门槛
 

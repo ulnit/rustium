@@ -18,8 +18,8 @@ trap cleanup EXIT
 command -v docker >/dev/null
 command -v helm >/dev/null
 
-# Validate every package manifest and included README without claiming
-# unpublished internal crates already exist on crates.io.
+# Validate every package manifest, included README, and format contract fixture
+# without claiming unpublished internal crates already exist on crates.io.
 for package in \
   rustium \
   rustium-config \
@@ -37,6 +37,13 @@ for package in \
   rustium-state; do
   package_files="$(cargo package -p "$package" --locked --allow-dirty --list)"
   grep -Fxq "README.md" <<<"$package_files"
+  case "$package" in
+    rustium-format-avro|rustium-format-json|rustium-format-protobuf)
+      for connector in postgresql mysql sqlserver; do
+        grep -Fxq "tests/fixtures/schema-${connector}-create.json" <<<"$package_files"
+      done
+      ;;
+  esac
 done
 
 docker build \

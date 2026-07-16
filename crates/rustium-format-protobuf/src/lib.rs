@@ -1237,6 +1237,8 @@ const fn operation_code(operation: Operation) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
     use chrono::Utc;
     use indexmap::indexmap;
     use rustium_core::{
@@ -1324,6 +1326,70 @@ mod tests {
             source_time: Some(Utc::now()),
             observed_time: Utc::now(),
         }
+    }
+
+    fn connector_events() -> [(&'static str, ChangeEvent); 3] {
+        let mysql = event();
+
+        let mut postgres = event();
+        postgres.source.connector = "postgresql".into();
+        postgres.source.schema = Some("public".into());
+        postgres.schema.name = "inventory.app.public.customers.Envelope".into();
+        postgres.position = SourcePosition::Postgres(PostgresPosition {
+            lsn: 42,
+            commit_lsn: Some(44),
+            transaction_id: Some(7),
+            event_serial: 1,
+            snapshot: false,
+        });
+
+        let mut sqlserver = event();
+        sqlserver.source.connector = "sqlserver".into();
+        sqlserver.source.schema = Some("dbo".into());
+        sqlserver.schema.name = "inventory.app.dbo.customers.Envelope".into();
+        sqlserver.position = SourcePosition::SqlServer(SqlServerPosition {
+            database: "app".into(),
+            commit_lsn: "0001:0002:0003".into(),
+            change_lsn: "0001:0002:0004".into(),
+            event_serial: 2,
+            snapshot: false,
+        });
+
+        [
+            ("postgresql", postgres),
+            ("mysql", mysql),
+            ("sqlserver", sqlserver),
+        ]
+    }
+
+    fn schema_fixture(event: &ChangeEvent) -> serde_json::Value {
+        let encoded = encoder(32).encode(event).unwrap();
+        let key = encoded.key_schema.unwrap();
+        let value = encoded.payload_schema.unwrap();
+        serde_json::json!({
+            "destination": encoded.destination,
+            "key": {
+                "subject": key.subject,
+                "schema_type": format!("{:?}", key.schema_type),
+                "definition": key.definition,
+            },
+            "value": {
+                "subject": value.subject,
+                "schema_type": format!("{:?}", value.schema_type),
+                "definition": value.definition,
+            },
+        })
+    }
+
+    fn golden_fixture(path: &str) -> serde_json::Value {
+        serde_json::from_str(path).unwrap()
+    }
+
+    fn write_fixture(path: &Path, fixture: &serde_json::Value) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut contents = serde_json::to_string_pretty(fixture).unwrap();
+        contents.push('\n');
+        fs::write(path, contents).unwrap();
     }
 
     fn field(name: &str, type_name: &str, optional: bool, primary_key: bool) -> FieldSchema {
@@ -1436,6 +1502,39 @@ mod tests {
             &ProtoValue::I32(1)
         );
         assert_eq!(string_field(&payload, "op"), "c");
+    }
+
+    #[test]
+    fn matches_protobuf_schema_golden_fixtures_for_prioritized_connectors() {
+        let [(_, postgres), (_, mysql), (_, sqlserver)] = connector_events();
+        assert_eq!(
+            schema_fixture(&postgres),
+            golden_fixture(include_str!(
+                "../tests/fixtures/schema-postgresql-create.json"
+            ))
+        );
+        assert_eq!(
+            schema_fixture(&mysql),
+            golden_fixture(include_str!("../tests/fixtures/schema-mysql-create.json"))
+        );
+        assert_eq!(
+            schema_fixture(&sqlserver),
+            golden_fixture(include_str!(
+                "../tests/fixtures/schema-sqlserver-create.json"
+            ))
+        );
+    }
+
+    #[test]
+    #[ignore = "regenerates checked-in Protobuf schema golden fixtures"]
+    fn regenerate_protobuf_schema_golden_fixtures() {
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for (connector, event) in connector_events() {
+            write_fixture(
+                &fixture_dir.join(format!("schema-{connector}-create.json")),
+                &schema_fixture(&event),
+            );
+        }
     }
 
     #[test]

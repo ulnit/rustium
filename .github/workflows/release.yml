@@ -51,7 +51,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test workspace
         run: cargo test --workspace --locked
-      - name: Package manifest and README smoke test
+      - name: Package manifest, README, and schema fixture smoke test
         run: |
           set -euo pipefail
           for package in \
@@ -69,7 +69,15 @@ jobs:
             rustium-sink-stdout \
             rustium-sqlserver \
             rustium-state; do
-            cargo package -p "$package" --locked --allow-dirty --list | grep -Fx README.md >/dev/null
+            package_files="$(cargo package -p "$package" --locked --allow-dirty --list)"
+            grep -Fxq README.md <<<"$package_files"
+            case "$package" in
+              rustium-format-avro|rustium-format-json|rustium-format-protobuf)
+                for connector in postgresql mysql sqlserver; do
+                  grep -Fxq "tests/fixtures/schema-${connector}-create.json" <<<"$package_files"
+                done
+                ;;
+            esac
           done
       - name: Lint Helm chart
         run: helm lint --strict deploy/helm/rustium

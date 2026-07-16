@@ -1,0 +1,250 @@
+{
+  "destination": "app.app.customers",
+  "key": {
+    "definition": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "orders.app.customers.Key",
+      "type": "object"
+    },
+    "schema_type": "Json",
+    "subject": "app.app.customers-key"
+  },
+  "value": {
+    "definition": {
+      "$comment": "Rustium EventSchema version 1",
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "after": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "attributes": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "type": "object"
+                    },
+                    {
+                      "const": "__unavailable",
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "id": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "const": "__unavailable",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "name": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "const": "__unavailable",
+                      "type": "string"
+                    }
+                  ]
+                }
+              },
+              "title": "orders.app.customers.Value",
+              "type": "object"
+            }
+          ]
+        },
+        "before": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "attributes": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "type": "object"
+                    },
+                    {
+                      "const": "__unavailable",
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "id": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "const": "__unavailable",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "name": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "const": "__unavailable",
+                      "type": "string"
+                    }
+                  ]
+                }
+              },
+              "title": "orders.app.customers.Value",
+              "type": "object"
+            }
+          ]
+        },
+        "op": {
+          "enum": [
+            "r",
+            "c",
+            "u",
+            "d",
+            "t",
+            "m"
+          ],
+          "type": "string"
+        },
+        "source": {
+          "additionalProperties": true,
+          "properties": {
+            "connector": {
+              "type": "string"
+            },
+            "db": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "snapshot": {
+              "type": "string"
+            },
+            "table": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ts_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "version",
+            "connector",
+            "name",
+            "ts_ms",
+            "snapshot",
+            "db",
+            "schema",
+            "table"
+          ],
+          "type": "object"
+        },
+        "transaction": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "data_collection_order": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "id": {
+                  "type": "string"
+                },
+                "total_order": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "total_order",
+                "data_collection_order"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "ts_ms": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "before",
+        "after",
+        "source",
+        "op",
+        "ts_ms",
+        "transaction"
+      ],
+      "title": "orders.app.customers.Envelope",
+      "type": "object"
+    },
+    "schema_type": "Json",
+    "subject": "app.app.customers-value"
+  }
+}

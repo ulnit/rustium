@@ -1,0 +1,244 @@
+{
+  "destination": "inventory.app.customers",
+  "key": {
+    "definition": {
+      "connect.name": "inventory.app.customers.Key",
+      "fields": [
+        {
+          "name": "customer_id",
+          "type": "long"
+        }
+      ],
+      "name": "Key",
+      "namespace": "inventory.app.customers",
+      "type": "record"
+    },
+    "schema_type": "Avro",
+    "subject": "inventory.app.customers-key"
+  },
+  "value": {
+    "definition": {
+      "connect.name": "inventory.app.customers.Envelope",
+      "fields": [
+        {
+          "default": null,
+          "name": "before",
+          "type": [
+            "null",
+            {
+              "connect.name": "inventory.app.customers.Value",
+              "fields": [
+                {
+                  "name": "customer_id",
+                  "type": [
+                    "long",
+                    "string"
+                  ]
+                },
+                {
+                  "name": "name",
+                  "type": "string"
+                },
+                {
+                  "name": "amount",
+                  "type": "string"
+                },
+                {
+                  "name": "score",
+                  "type": [
+                    "double",
+                    "string"
+                  ]
+                },
+                {
+                  "name": "binary_value",
+                  "type": [
+                    "bytes",
+                    "string"
+                  ]
+                },
+                {
+                  "name": "counter",
+                  "type": [
+                    "int",
+                    "string"
+                  ]
+                },
+                {
+                  "default": null,
+                  "name": "attributes",
+                  "type": [
+                    "null",
+                    {
+                      "type": "map",
+                      "values": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "string"
+                  ]
+                }
+              ],
+              "name": "Value",
+              "namespace": "inventory.app.customers",
+              "type": "record"
+            }
+          ]
+        },
+        {
+          "default": null,
+          "name": "after",
+          "type": [
+            "null",
+            "inventory.app.customers.Value"
+          ]
+        },
+        {
+          "name": "source",
+          "type": {
+            "connect.name": "inventory.app.customers.Source",
+            "fields": [
+              {
+                "name": "version",
+                "type": "string"
+              },
+              {
+                "name": "connector",
+                "type": "string"
+              },
+              {
+                "name": "name",
+                "type": "string"
+              },
+              {
+                "default": null,
+                "name": "ts_ms",
+                "type": [
+                  "null",
+                  "long"
+                ]
+              },
+              {
+                "name": "snapshot",
+                "type": "string"
+              },
+              {
+                "name": "db",
+                "type": "string"
+              },
+              {
+                "default": null,
+                "name": "schema",
+                "type": [
+                  "null",
+                  "string"
+                ]
+              },
+              {
+                "default": null,
+                "name": "table",
+                "type": [
+                  "null",
+                  "string"
+                ]
+              },
+              {
+                "name": "server_id",
+                "type": "long"
+              },
+              {
+                "default": null,
+                "name": "gtid",
+                "type": [
+                  "null",
+                  "string"
+                ]
+              },
+              {
+                "name": "file",
+                "type": "string"
+              },
+              {
+                "name": "pos",
+                "type": "long"
+              },
+              {
+                "name": "row",
+                "type": "long"
+              },
+              {
+                "default": null,
+                "name": "thread",
+                "type": [
+                  "null",
+                  "long"
+                ]
+              },
+              {
+                "default": null,
+                "name": "query",
+                "type": [
+                  "null",
+                  "string"
+                ]
+              }
+            ],
+            "name": "Source",
+            "namespace": "inventory.app.customers",
+            "type": "record"
+          }
+        },
+        {
+          "name": "op",
+          "type": "string"
+        },
+        {
+          "name": "ts_ms",
+          "type": "long"
+        },
+        {
+          "default": null,
+          "name": "transaction",
+          "type": [
+            "null",
+            {
+              "connect.name": "inventory.app.customers.Transaction",
+              "fields": [
+                {
+                  "name": "id",
+                  "type": "string"
+                },
+                {
+                  "default": null,
+                  "name": "total_order",
+                  "type": [
+                    "null",
+                    "long"
+                  ]
+                },
+                {
+                  "default": null,
+                  "name": "data_collection_order",
+                  "type": [
+                    "null",
+                    "long"
+                  ]
+                }
+              ],
+              "name": "Transaction",
+              "namespace": "inventory.app.customers",
+              "type": "record"
+            }
+          ]
+        }
+      ],
+      "name": "Envelope",
+      "namespace": "inventory.app.customers",
+      "rustium.event.schema.version": 1,
+      "type": "record"
+    },
+    "schema_type": "Avro",
+    "subject": "inventory.app.customers-value"
+  }
+}

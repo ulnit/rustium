@@ -566,6 +566,8 @@ const fn operation_name(operation: Operation) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
     use chrono::{TimeZone, Utc};
     use indexmap::indexmap;
     use rustium_core::{
@@ -667,19 +669,13 @@ mod tests {
         serde_json::from_str(path).unwrap()
     }
 
-    #[test]
-    fn matches_debezium_json_golden_fixtures_for_prioritized_connectors() {
+    fn connector_events() -> [(&'static str, ChangeEvent); 3] {
         let postgres = event();
-        assert_eq!(
-            encoded_fixture(&postgres),
-            golden_fixture(include_str!(
-                "../tests/fixtures/debezium-postgresql-create.json"
-            ))
-        );
 
         let mut mysql = event();
         mysql.source.connector = "mysql".into();
         mysql.source.schema = None;
+        mysql.schema.name = "orders.app.customers.Envelope".into();
         mysql.position = SourcePosition::MySql(MySqlPosition {
             binlog_filename: "mysql-bin.000123".into(),
             binlog_position: 4_567,
@@ -688,14 +684,11 @@ mod tests {
             event_serial: 2,
             snapshot: false,
         });
-        assert_eq!(
-            encoded_fixture(&mysql),
-            golden_fixture(include_str!("../tests/fixtures/debezium-mysql-create.json"))
-        );
 
         let mut sqlserver = event();
         sqlserver.source.connector = "sqlserver".into();
         sqlserver.source.schema = Some("dbo".into());
+        sqlserver.schema.name = "orders.app.dbo.customers.Envelope".into();
         sqlserver.position = SourcePosition::SqlServer(SqlServerPosition {
             database: "app".into(),
             commit_lsn: "0x0000002A000001000001".into(),
@@ -703,12 +696,102 @@ mod tests {
             event_serial: 3,
             snapshot: false,
         });
+
+        [
+            ("postgresql", postgres),
+            ("mysql", mysql),
+            ("sqlserver", sqlserver),
+        ]
+    }
+
+    fn schema_fixture(event: &ChangeEvent) -> serde_json::Value {
+        let encoded = DebeziumJsonSchemaEncoder::new(JsonEncoderConfig {
+            topic_prefix: "app".into(),
+            unavailable_value: "__unavailable".into(),
+            tombstones_on_delete: true,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
+        })
+        .encode(event)
+        .unwrap();
+        let key = encoded.key_schema.unwrap();
+        let value = encoded.payload_schema.unwrap();
+        serde_json::json!({
+            "destination": encoded.destination,
+            "key": {
+                "subject": key.subject,
+                "schema_type": format!("{:?}", key.schema_type),
+                "definition": serde_json::from_str::<serde_json::Value>(&key.definition).unwrap(),
+            },
+            "value": {
+                "subject": value.subject,
+                "schema_type": format!("{:?}", value.schema_type),
+                "definition": serde_json::from_str::<serde_json::Value>(&value.definition).unwrap(),
+            },
+        })
+    }
+
+    fn write_fixture(path: &Path, fixture: &serde_json::Value) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut contents = serde_json::to_string_pretty(fixture).unwrap();
+        contents.push('\n');
+        fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn matches_debezium_json_golden_fixtures_for_prioritized_connectors() {
+        let [(_, postgres), (_, mysql), (_, sqlserver)] = connector_events();
+        assert_eq!(
+            encoded_fixture(&postgres),
+            golden_fixture(include_str!(
+                "../tests/fixtures/debezium-postgresql-create.json"
+            ))
+        );
+
+        assert_eq!(
+            encoded_fixture(&mysql),
+            golden_fixture(include_str!("../tests/fixtures/debezium-mysql-create.json"))
+        );
+
         assert_eq!(
             encoded_fixture(&sqlserver),
             golden_fixture(include_str!(
                 "../tests/fixtures/debezium-sqlserver-create.json"
             ))
         );
+    }
+
+    #[test]
+    fn matches_json_schema_golden_fixtures_for_prioritized_connectors() {
+        let [(_, postgres), (_, mysql), (_, sqlserver)] = connector_events();
+        assert_eq!(
+            schema_fixture(&postgres),
+            golden_fixture(include_str!(
+                "../tests/fixtures/schema-postgresql-create.json"
+            ))
+        );
+        assert_eq!(
+            schema_fixture(&mysql),
+            golden_fixture(include_str!("../tests/fixtures/schema-mysql-create.json"))
+        );
+        assert_eq!(
+            schema_fixture(&sqlserver),
+            golden_fixture(include_str!(
+                "../tests/fixtures/schema-sqlserver-create.json"
+            ))
+        );
+    }
+
+    #[test]
+    #[ignore = "regenerates checked-in JSON Schema golden fixtures"]
+    fn regenerate_json_schema_golden_fixtures() {
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for (connector, event) in connector_events() {
+            write_fixture(
+                &fixture_dir.join(format!("schema-{connector}-create.json")),
+                &schema_fixture(&event),
+            );
+        }
     }
 
     #[test]
