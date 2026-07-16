@@ -8,6 +8,8 @@ Use this crate when an embedded Rustium application needs the same strict config
 
 PostgreSQL `publication.autocreate.mode` supports `disabled`, `all_tables`, `filtered`, and `no_tables`. Debezium properties default to `all_tables`; native `source.publication_autocreate_mode` defaults to `disabled` for backward-compatible ownership and fingerprints.
 
+PostgreSQL `replica.identity.autoset.values` maps to structured native rules with `table`, `identity`, and optional `index`. Non-empty rules are fingerprinted because validation applies transactional table DDL.
+
 ## 简体中文
 
 Rustium 的版本化配置模型、校验、环境变量插值、语义指纹，以及 PostgreSQL、MySQL、SQL Server、sink、格式和 runtime 的 Debezium 兼容 `.properties` 解析。
@@ -17,3 +19,5 @@ Rustium 的版本化配置模型、校验、环境变量插值、语义指纹，
 `snapshot.include.collection.list` 映射为原生 `snapshot.include_collections`，采用 anchored、连接器限定且仅作用于快照的匹配语义。
 
 PostgreSQL `publication.autocreate.mode` 支持 `disabled`、`all_tables`、`filtered` 和 `no_tables`。Debezium properties 默认使用 `all_tables`；原生 `source.publication_autocreate_mode` 默认使用 `disabled`，以保持向后兼容的所有权和 fingerprint。
+
+PostgreSQL `replica.identity.autoset.values` 映射为带 `table`、`identity` 和可选 `index` 的结构化原生规则。非空规则会进入 fingerprint，因为 validation 会执行事务化表 DDL。

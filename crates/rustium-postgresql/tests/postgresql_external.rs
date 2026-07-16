@@ -15,8 +15,8 @@ use rdkafka::{
     util::Timeout,
 };
 use rustium_config::{
-    PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode,
-    TableSelection,
+    PostgresReplicaIdentity, PostgresReplicaIdentityRule, PostgresSourceConfig,
+    PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode, TableSelection,
 };
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
@@ -69,6 +69,7 @@ impl TestSettings {
             password: self.password.clone(),
             publication: publication.into(),
             publication_autocreate_mode: PublicationAutoCreateMode::Disabled,
+            replica_identity_autoset_values: Vec::new(),
             slot_name: slot_name.into(),
             slot_ownership: SlotOwnership::Managed,
             tables: TableSelection {
@@ -716,6 +717,231 @@ async fn manages_debezium_publication_autocreate_modes() -> TestResult {
         (Ok(()), Ok(()), Ok(())) => Ok(()),
         (Err(error), _, _) => Err(error),
         (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn applies_debezium_replica_identity_autoset_values_atomically() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let default_table = format!("rustium_pg_identity_default_{}", &suffix[..8]);
+    let full_table = format!("rustium_pg_identity_full_{}", &suffix[..8]);
+    let nothing_table = format!("rustium_pg_identity_nothing_{}", &suffix[..8]);
+    let index_table = format!("rustium_pg_identity_index_{}", &suffix[..8]);
+    let index_name = format!("rustium_pg_identity_key_{}", &suffix[..8]);
+    let publication = format!("rustium_pg_identity_pub_{}", &suffix[..8]);
+    let slot_name = format!("rustium_pg_identity_slot_{}", &suffix[..8]);
+    let connector_name = format!("postgresql-identity-{}", &suffix[..8]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{default_table} (id BIGINT PRIMARY KEY, value TEXT NOT NULL); \
+                 ALTER TABLE public.{default_table} REPLICA IDENTITY FULL; \
+                 CREATE TABLE public.{full_table} (id BIGINT PRIMARY KEY, value TEXT NOT NULL); \
+                 CREATE TABLE public.{nothing_table} (id BIGINT PRIMARY KEY, value TEXT NOT NULL); \
+                 CREATE TABLE public.{index_table} (id BIGINT PRIMARY KEY, value TEXT NOT NULL); \
+                 CREATE UNIQUE INDEX {index_name} ON public.{index_table} (value);"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &full_table);
+        config.publication_autocreate_mode = PublicationAutoCreateMode::Filtered;
+        config.tables = TableSelection {
+            include: vec![format!(
+                r"public\.(?:{default_table}|{full_table}|{nothing_table}|{index_table})"
+            )],
+            exclude: Vec::new(),
+        };
+        config.replica_identity_autoset_values = vec![
+            PostgresReplicaIdentityRule {
+                table: format!(r"public\.{default_table}"),
+                identity: PostgresReplicaIdentity::Default,
+                index: None,
+            },
+            PostgresReplicaIdentityRule {
+                table: format!(r"public\.{full_table}"),
+                identity: PostgresReplicaIdentity::Full,
+                index: None,
+            },
+            PostgresReplicaIdentityRule {
+                table: format!(r"public\.{nothing_table}"),
+                identity: PostgresReplicaIdentity::Nothing,
+                index: None,
+            },
+            PostgresReplicaIdentityRule {
+                table: format!(r"public\.{index_table}"),
+                identity: PostgresReplicaIdentity::Index,
+                index: Some(index_name.clone()),
+            },
+        ];
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+
+        require(
+            replica_identity(&client, &default_table).await? == ("d".into(), None),
+            "DEFAULT replica identity was not applied",
+        )?;
+        require(
+            replica_identity(&client, &full_table).await? == ("f".into(), None),
+            "FULL replica identity was not applied",
+        )?;
+        require(
+            replica_identity(&client, &nothing_table).await? == ("n".into(), None),
+            "NOTHING replica identity was not applied",
+        )?;
+        require(
+            replica_identity(&client, &index_table).await?
+                == ("i".into(), Some(index_name.clone())),
+            "INDEX replica identity was not applied",
+        )?;
+
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let capture_result: TestResult = async {
+            let completion = receive(&mut output).await?;
+            require(
+                completion.boundary == RecordBoundary::SnapshotComplete,
+                "empty replica identity fixture emitted unexpected snapshot data",
+            )?;
+            wait_for_active_slot(&client, &slot_name).await?;
+            client
+                .batch_execute(&format!(
+                    "BEGIN; \
+                     INSERT INTO public.{full_table} VALUES (1, 'full-old'); \
+                     INSERT INTO public.{index_table} VALUES (1, 'index-old'); \
+                     UPDATE public.{full_table} SET value = 'full-new' WHERE id = 1; \
+                     UPDATE public.{index_table} SET value = 'index-new' WHERE id = 1; \
+                     COMMIT;"
+                ))
+                .await?;
+
+            let mut full_before = None;
+            let mut index_before = None;
+            loop {
+                let record = receive(&mut output).await?;
+                if record.boundary == RecordBoundary::TransactionCommit {
+                    break;
+                }
+                let Some(event) = record.event else {
+                    continue;
+                };
+                if event.operation != Operation::Update {
+                    continue;
+                }
+                match event.source.table.as_deref() {
+                    Some(table) if table == full_table => full_before = event.before,
+                    Some(table) if table == index_table => index_before = event.before,
+                    _ => {}
+                }
+            }
+            let full_before = full_before
+                .ok_or_else(|| test_error("FULL replica identity update has no before image"))?;
+            require(
+                full_before.get("id") == Some(&DataValue::Int64(1))
+                    && full_before.get("value") == Some(&DataValue::String("full-old".into())),
+                "FULL replica identity did not emit the complete old row",
+            )?;
+            let index_before = index_before
+                .ok_or_else(|| test_error("INDEX replica identity update has no before image"))?;
+            require(
+                index_before.get("id") == Some(&DataValue::Null)
+                    && index_before.get("value") == Some(&DataValue::String("index-old".into())),
+                "INDEX replica identity did not emit its old key with null non-key placeholders",
+            )
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)?;
+
+        let mut invalid_index_config = config.clone();
+        invalid_index_config.replica_identity_autoset_values = vec![
+            PostgresReplicaIdentityRule {
+                table: format!(r"public\.{default_table}"),
+                identity: PostgresReplicaIdentity::Full,
+                index: None,
+            },
+            PostgresReplicaIdentityRule {
+                table: format!(r"public\.{index_table}"),
+                identity: PostgresReplicaIdentity::Index,
+                index: Some(format!("missing_replica_index_{}", &suffix[..8])),
+            },
+        ];
+        let mut invalid_index_source = PostgresSource::new(
+            format!("{connector_name}-invalid-index"),
+            invalid_index_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                ..SnapshotConfig::default()
+            },
+        );
+        let invalid_index_error = invalid_index_source.validate().await.unwrap_err();
+        require(
+            invalid_index_error.to_string().contains("failed to set")
+                && invalid_index_error.to_string().contains(&index_table),
+            "invalid replica identity index did not fail validation",
+        )?;
+        require(
+            replica_identity(&client, &default_table).await? == ("d".into(), None)
+                && replica_identity(&client, &index_table).await?
+                    == ("i".into(), Some(index_name.clone())),
+            "replica identity SQL failure did not roll back the complete DDL transaction",
+        )?;
+
+        config.replica_identity_autoset_values = vec![
+            PostgresReplicaIdentityRule {
+                table: format!(r"public\.{full_table}"),
+                identity: PostgresReplicaIdentity::Full,
+                index: None,
+            },
+            PostgresReplicaIdentityRule {
+                table: r"public\.rustium_pg_identity_.*".into(),
+                identity: PostgresReplicaIdentity::Nothing,
+                index: None,
+            },
+        ];
+        let mut conflicting_source = PostgresSource::new(
+            format!("{connector_name}-conflict"),
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                ..SnapshotConfig::default()
+            },
+        );
+        let error = conflicting_source.validate().await.unwrap_err();
+        require(
+            error.to_string().contains("more than one") && error.to_string().contains(&full_table),
+            "overlapping replica identity rules were not rejected",
+        )?;
+        require(
+            replica_identity(&client, &default_table).await? == ("d".into(), None)
+                && replica_identity(&client, &full_table).await? == ("f".into(), None),
+            "overlapping replica identity rules applied a partial update",
+        )
+    }
+    .await;
+
+    let cleanup_result = cleanup(
+        &client,
+        &publication,
+        &slot_name,
+        &[&default_table, &full_table, &nothing_table, &index_table],
+    )
+    .await;
+    connection_task.abort();
+    match (outcome, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
     }
 }
 
@@ -3732,6 +3958,21 @@ async fn publication_tables(client: &Client, publication: &str) -> TestResult<Ve
         .into_iter()
         .map(|row| row.get(0))
         .collect())
+}
+
+async fn replica_identity(client: &Client, table: &str) -> TestResult<(String, Option<String>)> {
+    let row = client
+        .query_one(
+            "SELECT c.relreplident::text, i.relname \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             LEFT JOIN pg_catalog.pg_index x ON x.indrelid = c.oid AND x.indisreplident \
+             LEFT JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid \
+             WHERE n.nspname = 'public' AND c.relname = $1",
+            &[&table],
+        )
+        .await?;
+    Ok((row.get(0), row.get(1)))
 }
 
 fn qualified_name(schema: &str, name: &str) -> String {

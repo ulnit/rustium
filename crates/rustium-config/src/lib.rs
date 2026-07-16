@@ -204,6 +204,15 @@ impl SourceConfig {
                             serde_json::json!(config.publication_autocreate_mode),
                         );
                 }
+                if !config.replica_identity_autoset_values.is_empty() {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "replica_identity_autoset_values".into(),
+                            serde_json::json!(config.replica_identity_autoset_values),
+                        );
+                }
                 add_heartbeat_semantics(
                     &mut semantic,
                     config.heartbeat_interval,
@@ -360,6 +369,8 @@ pub struct PostgresSourceConfig {
     pub publication: String,
     #[serde(default)]
     pub publication_autocreate_mode: PublicationAutoCreateMode,
+    #[serde(default)]
+    pub replica_identity_autoset_values: Vec<PostgresReplicaIdentityRule>,
     #[serde(default = "default_slot_name")]
     pub slot_name: String,
     #[serde(default)]
@@ -434,6 +445,30 @@ impl PostgresSourceConfig {
                 return Err(Error::Configuration(format!(
                     "table selector {pattern:?} is not a valid regular expression"
                 )));
+            }
+        }
+        for rule in &self.replica_identity_autoset_values {
+            if rule.table.trim().is_empty() || Regex::new(&rule.table).is_err() {
+                return Err(Error::Configuration(format!(
+                    "PostgreSQL replica identity table selector {:?} is not a valid regular expression",
+                    rule.table
+                )));
+            }
+            match (&rule.identity, rule.index.as_deref()) {
+                (PostgresReplicaIdentity::Index, Some(index)) if !index.trim().is_empty() => {}
+                (PostgresReplicaIdentity::Index, _) => {
+                    return Err(Error::Configuration(
+                        "PostgreSQL replica identity index mode requires a non-empty index name"
+                            .into(),
+                    ));
+                }
+                (_, Some(_)) => {
+                    return Err(Error::Configuration(
+                        "PostgreSQL replica identity index is valid only with identity=index"
+                            .into(),
+                    ));
+                }
+                (_, None) => {}
             }
         }
         validate_heartbeat(
@@ -1086,6 +1121,24 @@ pub enum PublicationAutoCreateMode {
     AllTables,
     Filtered,
     NoTables,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresReplicaIdentityRule {
+    pub table: String,
+    pub identity: PostgresReplicaIdentity,
+    #[serde(default)]
+    pub index: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostgresReplicaIdentity {
+    Default,
+    Full,
+    Nothing,
+    Index,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1869,6 +1922,49 @@ sink:
             config.source.semantic_config()["publication_autocreate_mode"].is_null(),
             "the native default must preserve the pre-autocreate fingerprint shape"
         );
+        assert!(
+            config.source.semantic_config()["replica_identity_autoset_values"].is_null(),
+            "empty replica identity rules must preserve the old fingerprint shape"
+        );
+    }
+
+    #[test]
+    fn validates_native_postgresql_replica_identity_rules() {
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  replica_identity_autoset_values:\n    - table: public\\.orders\n      identity: full\n    - table: public\\.customers\n      identity: index\n      index: customers_replica_key\n",
+        ))
+        .unwrap();
+        let rules = &configured
+            .source
+            .as_postgresql()
+            .unwrap()
+            .replica_identity_autoset_values;
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].identity, PostgresReplicaIdentity::Full);
+        assert_eq!(rules[1].index.as_deref(), Some("customers_replica_key"));
+        assert_ne!(
+            Config::from_yaml(CONFIG).unwrap().fingerprint(),
+            configured.fingerprint()
+        );
+
+        let missing_index = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  replica_identity_autoset_values:\n    - table: public\\.orders\n      identity: index\n",
+        ))
+        .unwrap_err();
+        assert!(
+            missing_index
+                .to_string()
+                .contains("requires a non-empty index")
+        );
+
+        let unexpected_index = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  replica_identity_autoset_values:\n    - table: public\\.orders\n      identity: full\n      index: orders_key\n",
+        ))
+        .unwrap_err();
+        assert!(unexpected_index.to_string().contains("valid only"));
     }
 
     #[test]

@@ -13,6 +13,12 @@ source:
   password: ${POSTGRES_PASSWORD}
   publication: rustium_publication
   publication_autocreate_mode: disabled
+  # replica_identity_autoset_values:
+  #   - table: public\.orders
+  #     identity: full
+  #   - table: public\.customers
+  #     identity: index
+  #     index: customers_replica_key
   slot_name: rustium_inventory
   slot_ownership: managed
   tables:

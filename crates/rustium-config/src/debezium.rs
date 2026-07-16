@@ -116,6 +116,9 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                     .get("publication.autocreate.mode")
                     .map_or("all_tables", String::as_str),
             )?,
+            replica_identity_autoset_values: postgres_replica_identity_rules(
+                properties.get("replica.identity.autoset.values"),
+            )?,
             slot_name: properties
                 .get("slot.name")
                 .cloned()
@@ -1065,6 +1068,73 @@ fn publication_autocreate_mode(mode: &str) -> Result<PublicationAutoCreateMode> 
     }
 }
 
+fn postgres_replica_identity_rules(
+    value: Option<&String>,
+) -> Result<Vec<PostgresReplicaIdentityRule>> {
+    value.map_or_else(
+        || Ok(Vec::new()),
+        |value| {
+            if value.trim().is_empty() {
+                return Err(Error::Configuration(
+                    "replica.identity.autoset.values must not be empty when configured".into(),
+                ));
+            }
+            value
+                .split(',')
+                .map(|entry| {
+                    let entry = entry.trim();
+                    let (table, identity) = entry.split_once(':').ok_or_else(|| {
+                        Error::Configuration(format!(
+                            "replica.identity.autoset.values entry {entry:?} must use <table-regex>:<identity>"
+                        ))
+                    })?;
+                    if table.trim().is_empty()
+                        || table.chars().any(char::is_whitespace)
+                        || table.contains(':')
+                        || Regex::new(table).is_err()
+                    {
+                        return Err(Error::Configuration(format!(
+                            "replica.identity.autoset.values table selector {table:?} is invalid"
+                        )));
+                    }
+                    let mut identity_parts = identity.split_whitespace();
+                    let mode = identity_parts.next().unwrap_or_default();
+                    let (identity, index) = match mode.to_ascii_uppercase().as_str() {
+                        "DEFAULT" if identity_parts.next().is_none() => {
+                            (PostgresReplicaIdentity::Default, None)
+                        }
+                        "FULL" if identity_parts.next().is_none() => {
+                            (PostgresReplicaIdentity::Full, None)
+                        }
+                        "NOTHING" if identity_parts.next().is_none() => {
+                            (PostgresReplicaIdentity::Nothing, None)
+                        }
+                        "INDEX" => {
+                            let index = identity_parts.next().filter(|index| !index.is_empty());
+                            if index.is_none() || identity_parts.next().is_some() {
+                                return Err(Error::Configuration(format!(
+                                    "replica.identity.autoset.values entry {entry:?} requires INDEX <index-name>"
+                                )));
+                            }
+                            (PostgresReplicaIdentity::Index, index.map(str::to_string))
+                        }
+                        _ => {
+                            return Err(Error::Configuration(format!(
+                                "replica.identity.autoset.values entry {entry:?} must use DEFAULT, FULL, NOTHING, or INDEX <index-name>"
+                            )));
+                        }
+                    };
+                    Ok(PostgresReplicaIdentityRule {
+                        table: table.to_string(),
+                        identity,
+                        index,
+                    })
+                })
+                .collect()
+        },
+    )
+}
+
 fn csv_property(value: Option<&String>) -> Vec<String> {
     value.map_or_else(Vec::new, |value| split_csv(value))
 }
@@ -1140,6 +1210,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "slot.name",
         "publication.name",
         "publication.autocreate.mode",
+        "replica.identity.autoset.values",
         "snapshot.mode",
         "snapshot.fetch.size",
         "snapshot.include.collection.list",
@@ -1272,6 +1343,7 @@ plugin.name=pgoutput
 slot.name=orders_slot
 publication.name=orders_pub
 publication.autocreate.mode=filtered
+replica.identity.autoset.values=public\\.orders:FULL,public\\.customers:INDEX customers_replica_key
 table.include.list=public\\.(orders|customers)
 snapshot.mode=initial
 snapshot.include.collection.list=public\\.orders
@@ -1350,6 +1422,19 @@ max.batch.size=1000
             source.publication_autocreate_mode,
             PublicationAutoCreateMode::Filtered
         );
+        assert_eq!(source.replica_identity_autoset_values.len(), 2);
+        assert_eq!(
+            source.replica_identity_autoset_values[0].table,
+            r"public\.orders"
+        );
+        assert_eq!(
+            source.replica_identity_autoset_values[0].identity,
+            PostgresReplicaIdentity::Full
+        );
+        assert_eq!(
+            source.replica_identity_autoset_values[1].index.as_deref(),
+            Some("customers_replica_key")
+        );
         assert_eq!(config.snapshot.include_collections, [r"public\.orders"]);
         assert!(!config.format.tombstones_on_delete);
         assert!(
@@ -1426,6 +1511,31 @@ topic.prefix=app
                 .publication_autocreate_mode,
             PublicationAutoCreateMode::AllTables
         );
+    }
+
+    #[test]
+    fn validates_postgres_replica_identity_autoset_values() {
+        let rules = postgres_replica_identity_rules(Some(&
+            "public\\.orders:default,public\\.customers:Full,public\\.audit:NOTHING,public\\.accounts:INDEX accounts_key".into(),
+        ))
+        .unwrap();
+        assert_eq!(rules.len(), 4);
+        assert_eq!(rules[0].identity, PostgresReplicaIdentity::Default);
+        assert_eq!(rules[1].identity, PostgresReplicaIdentity::Full);
+        assert_eq!(rules[2].identity, PostgresReplicaIdentity::Nothing);
+        assert_eq!(rules[3].identity, PostgresReplicaIdentity::Index);
+        assert_eq!(rules[3].index.as_deref(), Some("accounts_key"));
+
+        for invalid in [
+            "",
+            "public\\.orders",
+            "public\\.orders:unknown",
+            "public\\.orders:INDEX",
+            "public orders:FULL",
+            "[invalid:FULL",
+        ] {
+            assert!(postgres_replica_identity_rules(Some(&invalid.into())).is_err());
+        }
     }
 
     #[test]

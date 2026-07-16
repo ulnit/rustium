@@ -12,8 +12,10 @@ use pg_walstream::{
     RetryConfig, RowData, StreamingMode, parse_lsn,
     sql_builder::{quote_ident, quote_literal},
 };
+use regex::Regex;
 use rustium_config::{
-    PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode,
+    PostgresReplicaIdentity, PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership,
+    SnapshotConfig, SnapshotMode,
 };
 use rustium_core::{
     ChangeEvent, DataValue, Error, EventId, EventSchema, FieldSchema, Operation, PostgresPosition,
@@ -98,6 +100,7 @@ impl PostgresSource {
                 )));
             }
             ensure_publication(&mut connection, &config)?;
+            apply_replica_identity(&mut connection, &config)?;
             validate_signal_table(&mut connection, &config)?;
 
             let slot = quote_literal(&config.slot_name).map_err(pg_error)?;
@@ -1730,6 +1733,129 @@ fn ensure_publication(
     Ok(())
 }
 
+fn apply_replica_identity(
+    connection: &mut PgReplicationConnection,
+    config: &PostgresSourceConfig,
+) -> Result<()> {
+    if config.replica_identity_autoset_values.is_empty() {
+        return Ok(());
+    }
+
+    let publication = quote_literal(&config.publication).map_err(pg_error)?;
+    let result = connection
+        .exec(&format!(
+            "SELECT p.schemaname, p.tablename, c.relreplident::text, COALESCE(i.relname, '') \
+             FROM pg_catalog.pg_publication_tables p \
+             JOIN pg_catalog.pg_namespace n ON n.nspname = p.schemaname \
+             JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = p.tablename \
+             LEFT JOIN pg_catalog.pg_index x ON x.indrelid = c.oid AND x.indisreplident \
+             LEFT JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid \
+             WHERE p.pubname = {publication} \
+             ORDER BY p.schemaname, p.tablename"
+        ))
+        .map_err(pg_error)?;
+    let mut changes = Vec::new();
+    for row in 0..result.ntuples() {
+        let schema = required_value(&result, row, 0, "replica identity table schema")?;
+        let table = required_value(&result, row, 1, "replica identity table name")?;
+        if !config.tables.includes(&schema, &table) || is_signal_table(config, &schema, &table) {
+            continue;
+        }
+        let qualified = format!("{schema}.{table}");
+        let mut matched = Vec::new();
+        for rule in &config.replica_identity_autoset_values {
+            let selector = Regex::new(&format!("^(?:{})$", rule.table)).map_err(|error| {
+                Error::Configuration(format!(
+                    "PostgreSQL replica identity table selector {:?} is invalid: {error}",
+                    rule.table
+                ))
+            })?;
+            if selector.is_match(&qualified) {
+                matched.push(rule);
+            }
+        }
+        if matched.len() > 1 {
+            return Err(Error::Configuration(format!(
+                "more than one replica.identity.autoset.values rule matches PostgreSQL table {qualified}"
+            )));
+        }
+        let Some(rule) = matched.first() else {
+            continue;
+        };
+        let current = required_value(&result, row, 2, "replica identity mode")?;
+        let current_index = required_value(&result, row, 3, "replica identity index")?;
+        let unchanged = match rule.identity {
+            PostgresReplicaIdentity::Default => current == "d",
+            PostgresReplicaIdentity::Full => current == "f",
+            PostgresReplicaIdentity::Nothing => current == "n",
+            PostgresReplicaIdentity::Index => {
+                current == "i" && rule.index.as_deref() == Some(current_index.as_str())
+            }
+        };
+        if !unchanged {
+            changes.push((
+                schema,
+                table,
+                rule.identity,
+                rule.index.as_deref().map(str::to_string),
+            ));
+        }
+    }
+
+    if changes.is_empty() {
+        return Ok(());
+    }
+    connection.exec("BEGIN").map_err(pg_error)?;
+    let applied = (|| -> Result<()> {
+        for (schema, table, identity, index) in &changes {
+            let qualified = format!(
+                "{}.{}",
+                quote_ident(schema).map_err(pg_error)?,
+                quote_ident(table).map_err(pg_error)?
+            );
+            let identity = match identity {
+                PostgresReplicaIdentity::Default => "DEFAULT".into(),
+                PostgresReplicaIdentity::Full => "FULL".into(),
+                PostgresReplicaIdentity::Nothing => "NOTHING".into(),
+                PostgresReplicaIdentity::Index => format!(
+                    "USING INDEX {}",
+                    quote_ident(index.as_deref().ok_or_else(|| {
+                        Error::Configuration(format!(
+                            "PostgreSQL replica identity index is missing for {schema}.{table}"
+                        ))
+                    })?)
+                    .map_err(pg_error)?
+                ),
+            };
+            connection
+                .exec(&format!(
+                    "ALTER TABLE {qualified} REPLICA IDENTITY {identity}"
+                ))
+                .map_err(|error| {
+                    Error::Configuration(format!(
+                        "failed to set PostgreSQL replica identity for {schema}.{table}: {error}"
+                    ))
+                })?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = applied {
+        let _ = connection.exec("ROLLBACK");
+        return Err(error);
+    }
+    connection.exec("COMMIT").map_err(pg_error)?;
+    for (schema, table, identity, index) in changes {
+        info!(
+            schema = %schema,
+            table = %table,
+            ?identity,
+            ?index,
+            "PostgreSQL replica identity updated"
+        );
+    }
+    Ok(())
+}
+
 fn selected_publication_tables(
     connection: &mut PgReplicationConnection,
     config: &PostgresSourceConfig,
@@ -2743,6 +2869,7 @@ mod tests {
             password: "secret".into(),
             publication: "orders_publication".into(),
             publication_autocreate_mode: PublicationAutoCreateMode::Disabled,
+            replica_identity_autoset_values: Vec::new(),
             slot_name: "orders_slot".into(),
             slot_ownership: SlotOwnership::Managed,
             tables: TableSelection::default(),

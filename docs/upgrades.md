@@ -35,6 +35,8 @@ The additive `snapshot.include_collections` field defaults to an empty list and 
 
 The additive native PostgreSQL `source.publication_autocreate_mode` field defaults to `disabled` and is omitted from semantic fingerprint material at that value, preserving older native fingerprints and publication ownership. Debezium properties intentionally default `publication.autocreate.mode` to `all_tables`, matching Debezium rather than the native compatibility default. Any non-`disabled` mode changes the fingerprint. Before enabling it on an existing connector, validate database `CREATE`, table ownership, and superuser requirements, and review whether `filtered` may replace the current table-scoped publication set.
 
+The additive PostgreSQL `source.replica_identity_autoset_values` list defaults to empty and is omitted from semantic fingerprint material when empty. A non-empty list changes the fingerprint and causes source validation to apply transactional table DDL. Before introducing or changing rules, stop the connector, verify table ownership and any replica-index constraints, review UPDATE/DELETE key and before-image compatibility with downstream consumers, and run validation in a controlled change window. Overlapping rules fail before mutation; SQL or privilege failures roll back the full rule set.
+
 ### Checkpoint migration
 
 Checkpoint JSON version 2 adds an optional connector-state envelope. Version 1 JSON without that field remains readable. PostgreSQL and MySQL cannot safely resume a completed version 1 checkpoint without persistent schema history, so they fail closed and require a backup, reset, and new initial snapshot. SQL Server's tested resume path does not depend on connector state and can read version 1 when the source cursor and CDC retention remain valid.
@@ -110,6 +112,8 @@ SQLite storage version 与 JSON checkpoint version 相互独立。Storage migrat
 新增的 `snapshot.include_collections` 字段默认是空列表；为空时不会进入 semantic fingerprint 材料，从而保持该字段出现前生成的 fingerprint。非空列表会改变 initial 和 `when_needed` 恢复快照行为，因此必须计入 fingerprint，并通过正常的配置变更审查流程引入。
 
 新增的 PostgreSQL 原生字段 `source.publication_autocreate_mode` 默认值为 `disabled`，该值不会进入 semantic fingerprint 材料，从而保持旧原生配置的 fingerprint 和 publication 所有权。Debezium properties 的 `publication.autocreate.mode` 有意默认到 `all_tables`，与 Debezium 一致，而不是使用原生兼容默认值。任何非 `disabled` 模式都会改变 fingerprint。在已有 connector 上启用前，需要校验数据库 `CREATE`、表 ownership 和 superuser 要求，并审查 `filtered` 是否可能替换当前表级 publication 集合。
+
+新增的 PostgreSQL `source.replica_identity_autoset_values` 列表默认为空，空列表不会进入 semantic fingerprint 材料。非空列表会改变 fingerprint，并让 source validation 执行事务化表 DDL。引入或修改规则前，应停止 connector，确认 table ownership 和 replica index 约束，审查下游 consumer 对 UPDATE/DELETE key 与 before image 的兼容性，并在受控变更窗口执行 validation。重叠规则会在修改前失败；SQL 或权限失败会回滚整组规则。
 
 ### Checkpoint 迁移
 
