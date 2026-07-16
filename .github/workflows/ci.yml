@@ -55,3 +55,28 @@ jobs:
             pkg-config
       - name: Test PostgreSQL extension types
         run: bash scripts/test-postgresql-extensions.sh
+
+  sqlserver-cdc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            libcurl4-openssl-dev \
+            libsasl2-dev \
+            libssl-dev \
+            pkg-config
+      - name: Pull SQL Server 2022
+        run: docker pull mcr.microsoft.com/mssql/server:2022-latest
+      - name: Test SQL Server CDC portability
+        run: >-
+          cargo test -p rustium-sqlserver --test sqlserver_docker --locked --
+          snapshots_and_streams_cdc_changes --ignored --exact --nocapture
