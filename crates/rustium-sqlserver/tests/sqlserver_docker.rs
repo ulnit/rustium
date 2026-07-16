@@ -147,7 +147,6 @@ async fn snapshots_and_streams_cdc_changes() {
                 geometry_value geometry NOT NULL, \
                 geography_value geography NOT NULL\
              ); \
-             EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'orders', @role_name=NULL, @supports_net_changes=0; \
              INSERT INTO dbo.orders VALUES \
                 (1, N'Alice', 12.30, CONVERT(xml, N'<root><value>Rustium</value></root>'), \
                  hierarchyid::Parse('/1/2/'), geometry::STGeomFromText('POINT (1 2)', 4326), \
@@ -155,6 +154,10 @@ async fn snapshots_and_streams_cdc_changes() {
                 (2, N'Bob', 45.60, CONVERT(xml, N'<root><value>Rustium</value></root>'), \
                  hierarchyid::Parse('/1/2/'), geometry::STGeomFromText('POINT (1 2)', 4326), \
                  geography::STGeomFromText('POINT (1 2)', 4326)); \
+             EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'orders', @role_name=NULL, @supports_net_changes=0; \
+             CREATE TABLE dbo.cdc_probe (id int NOT NULL PRIMARY KEY); \
+             EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'cdc_probe', @role_name=NULL, @supports_net_changes=0; \
+             INSERT INTO dbo.cdc_probe VALUES (1); \
              CREATE USER rustium FOR LOGIN rustium; \
              GRANT SELECT TO rustium; \
              GRANT VIEW DATABASE STATE TO rustium;",
