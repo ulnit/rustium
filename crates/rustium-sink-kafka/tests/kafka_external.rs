@@ -487,8 +487,10 @@ async fn registers_evolves_and_delivers_avro_records() -> TestResult {
         let second_decoded = framed_avro(second_value, &registered_v2.schema)?;
         let delete_decoded = framed_avro(delete_value, &registered_v2.schema)?;
         require(
-            avro_field(avro_union(avro_field(&first_decoded, "after")?)?, "id")?
-                == &AvroValue::Long(11),
+            avro_union(avro_field(
+                avro_union(avro_field(&first_decoded, "after")?)?,
+                "id",
+            )?)? == &AvroValue::Long(11),
             "first framed Avro value changed",
         )?;
         require(

@@ -1051,6 +1051,7 @@ mod tests {
         assert_eq!(field(&key, "customer_id"), &Value::Long(7));
         let payload = decode(encoded.payload.as_ref().unwrap(), payload_schema);
         let after = union(field(&payload, "after"));
+        assert_eq!(union(field(after, "customer_id")), &Value::Long(7));
         assert_eq!(field(after, "name"), &Value::String("Alice".into()));
         assert_eq!(field(after, "amount"), &Value::String("12.30".into()));
         assert_eq!(union(field(after, "score")), &Value::String("NaN".into()));
