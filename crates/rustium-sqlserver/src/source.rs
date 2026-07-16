@@ -70,6 +70,11 @@ impl CdcCursor {
             Some(SourcePosition::SqlServer(position.clone())),
         ))
     }
+
+    fn commit_complete(&self) -> bool {
+        self.raw_operation == i32::try_from(COMMIT_SERIAL).unwrap_or(i32::MAX)
+            && self.change_lsn == max_lsn_bytes()
+    }
 }
 
 #[derive(Debug)]
@@ -311,7 +316,9 @@ impl SourceConnector for SqlServerSource {
                 }
                 _ = interval.tick() => {
                     let max_lsn = current_max_lsn(&mut client).await?;
-                    if max_lsn <= state.cursor.commit_lsn {
+                    if max_lsn < state.cursor.commit_lsn
+                        || (max_lsn == state.cursor.commit_lsn && state.cursor.commit_complete())
+                    {
                         continue;
                     }
                     validate_retention(&mut client, &self.captures, &state.cursor.commit_lsn).await?;
@@ -863,8 +870,28 @@ async fn snapshot_table(
     ordinal: &mut u64,
     output: &tokio::sync::mpsc::Sender<Result<SourceRecord>>,
 ) -> Result<()> {
+    let values = capture
+        .event_schema
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| change_value_expression(index, field))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let primary_key = capture
+        .event_schema
+        .fields
+        .iter()
+        .filter(|field| field.primary_key)
+        .map(|field| format!("ct.{}", quote_identifier(&field.name)))
+        .collect::<Vec<_>>();
+    let ordering = if primary_key.is_empty() {
+        String::new()
+    } else {
+        format!(" ORDER BY {}", primary_key.join(", "))
+    };
     let query = format!(
-        "SELECT * FROM {}.{}",
+        "SELECT {values} FROM {}.{} AS ct{ordering}",
         quote_identifier(&capture.schema),
         quote_identifier(&capture.table)
     );
@@ -1104,7 +1131,7 @@ fn convert_tds_value(row: &TdsRow, index: usize, type_name: &str) -> Result<Data
             .try_get::<NaiveDateTime, _>(index)
             .map_err(sqlserver_error)?
             .map_or(DataValue::Null, |value| {
-                DataValue::Timestamp(value.to_string())
+                DataValue::Timestamp(sqlserver_datetime(value))
             }),
         ColumnData::Time(Some(_)) => row
             .try_get::<NaiveTime, _>(index)
@@ -1122,6 +1149,10 @@ fn convert_tds_value(row: &TdsRow, index: usize, type_name: &str) -> Result<Data
             }),
     };
     Ok(value)
+}
+
+fn sqlserver_datetime(value: NaiveDateTime) -> String {
+    value.to_string().replacen(' ', "T", 1)
 }
 
 fn source_metadata(
@@ -1274,6 +1305,19 @@ mod tests {
     }
 
     #[test]
+    fn distinguishes_complete_and_mid_transaction_cursors() {
+        let complete = CdcCursor::at_snapshot(vec![1; LSN_SIZE]);
+        assert!(complete.commit_complete());
+
+        let incomplete = CdcCursor {
+            commit_lsn: vec![1; LSN_SIZE],
+            change_lsn: vec![2; LSN_SIZE],
+            raw_operation: RAW_UPDATE_BEFORE,
+        };
+        assert!(!incomplete.commit_complete());
+    }
+
+    #[test]
     fn converts_sqlserver_values() {
         assert_eq!(
             convert_sqlserver_text("12.30", "decimal(10,2)"),
@@ -1283,6 +1327,15 @@ mod tests {
         assert_eq!(
             convert_sqlserver_text("00FF", "varbinary(2)"),
             DataValue::Bytes(vec![0, 255])
+        );
+        assert_eq!(
+            sqlserver_datetime(
+                NaiveDate::from_ymd_opt(2026, 7, 16)
+                    .unwrap()
+                    .and_hms_micro_opt(9, 30, 45, 123_400)
+                    .unwrap()
+            ),
+            "2026-07-16T09:30:45.123400"
         );
     }
 

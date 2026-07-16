@@ -446,10 +446,11 @@ Implemented behavior:
 - insert/delete conversion and update operation 3/4 before/after pairing
 - transaction ordering, mid-transaction replay, and checkpoint recovery
 - explicit failure when CDC cleanup removes the required checkpoint LSN
-- bounded CDC queries controlled by `streaming.fetch.size`
+- bounded CDC queries controlled by `streaming.fetch.size`, including continuation inside one commit LSN
 - periodic heartbeat records from the latest safe CDC position, with optional `heartbeat.action.query` on a separate SQL connection
+- shared snapshot/CDC SQL projections for consistent core numeric, binary, UUID, temporal, and text conversion
 
-The current implementation requires exactly one entry in `database.names`, one active capture instance per selected table, and `data.query.mode=direct`. Snapshot, streaming, transaction ordering, checkpoint restart, and cleanup have been externally integration-tested against SQL Server 2022 Developer RTM-CU25. See [examples/sqlserver.properties](examples/sqlserver.properties).
+The current implementation requires exactly one entry in `database.names`, one active capture instance per selected table, and `data.query.mode=direct`. The SQL Server 2022 Developer RTM-CU25 external gate verifies snapshot handoff, fetch-size-one continuation through update before/after pairs, mid-transaction checkpoint restart with preserved transaction ordinals, concurrent transactions ordered by commit LSN, retention fail-closed behavior, heartbeat/action-query, core snapshot/CDC type equality, and cleanup. See [examples/sqlserver.properties](examples/sqlserver.properties).
 
 The database must have CDC enabled, SQL Server Agent must run the capture job, and the connector user needs source-table reads plus direct read access to the `cdc` schema. The separate Docker portability test remains runnable with:
 
@@ -1027,9 +1028,11 @@ SQL Server 连接器基于原生 SQL Server CDC change table 实现。
 - insert/delete 转换，以及 update operation 3/4 的 before/after 配对
 - 事务顺序、事务中间重放和 checkpoint 恢复
 - CDC cleanup 删除所需 checkpoint LSN 时明确失败
-- 由 `streaming.fetch.size` 控制的有界 CDC 查询
+- 由 `streaming.fetch.size` 控制的有界 CDC 查询，包括同一 commit LSN 内的继续读取
+- 从最新安全 CDC 位点发送周期 heartbeat，并可通过独立 SQL 连接执行 `heartbeat.action.query`
+- 快照和 CDC 共用 SQL 投影，保证核心 numeric、binary、UUID、temporal 和 text 转换一致
 
-当前实现要求 `database.names` 只有一个数据库、每张选表只有一个活动 capture instance，并使用 `data.query.mode=direct`。快照、流式捕获、事务顺序、checkpoint 重启和清理已在 SQL Server 2022 Developer RTM-CU25 上通过外部集成测试。示例见 [examples/sqlserver.properties](examples/sqlserver.properties)。
+当前实现要求 `database.names` 只有一个数据库、每张选表只有一个活动 capture instance，并使用 `data.query.mode=direct`。SQL Server 2022 Developer RTM-CU25 外部门槛已验证快照切换、fetch size 为 1 时跨 update before/after 的继续读取、保持事务序号的事务中间 checkpoint 重启、按 commit LSN 排序的并发事务、retention fail-closed、heartbeat/action-query、核心快照/CDC 类型一致性和资源清理。示例见 [examples/sqlserver.properties](examples/sqlserver.properties)。
 
 数据库必须启用 CDC，SQL Server Agent 必须运行 capture job，连接器用户需要读取源表，并能直接读取 `cdc` schema。独立的 Docker 可移植性测试仍可通过以下命令运行：
 

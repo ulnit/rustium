@@ -6,8 +6,8 @@ use std::{
 
 use rustium_config::{SnapshotConfig, SnapshotMode, SqlServerSourceConfig, TableSelection};
 use rustium_core::{
-    Checkpoint, Operation, RecordBoundary, SourceConnector, SourceContext, SourcePosition,
-    SourceRecord,
+    Checkpoint, DataValue, Operation, RecordBoundary, SourceConnector, SourceContext,
+    SourcePosition, SourceRecord, SqlServerPosition,
 };
 use rustium_sqlserver::SqlServerSource;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
@@ -100,15 +100,16 @@ async fn snapshots_streams_and_resumes_from_checkpoint() -> TestResult {
         .await?;
         wait_for_capture_instance(&mut client, &capture_instance).await?;
 
-        let config = settings.source_config(&table_name);
-        let commit_position =
+        let mut config = settings.source_config(&table_name);
+        config.streaming_fetch_size = 1;
+        let checkpoint_position =
             run_initial_capture(&mut client, &connector_name, &table_name, config.clone()).await?;
 
         let checkpoint = Checkpoint {
             schema_version: 1,
             connector_name: connector_name.clone(),
             generation: uuid::Uuid::new_v4(),
-            source_position: commit_position,
+            source_position: checkpoint_position,
             snapshot_completed: true,
             config_fingerprint: "sqlserver-external-test".into(),
             updated_at: SystemTime::now(),
@@ -136,6 +137,487 @@ async fn snapshots_streams_and_resumes_from_checkpoint() -> TestResult {
             }
             if let Err(close_error) = close {
                 eprintln!("SQL Server test connection close also failed: {close_error}");
+            }
+            Err(error)
+        }
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external SQL Server 2017+ instance with CDC and SQL Server Agent enabled"]
+async fn emits_heartbeat_and_executes_action_query() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_heartbeat_{}", &suffix[..12]);
+    let action_table = format!("rustium_hb_action_{}", &suffix[..12]);
+    let capture_instance = format!("rustium_hb_cap_{}", &suffix[..12]);
+    let connector_name = format!("sqlserver-heartbeat-{}", &suffix[..12]);
+    let mut client = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        execute_batch(
+            &mut client,
+            &format!(
+                "CREATE TABLE dbo.{table_name} (id bigint NOT NULL PRIMARY KEY); \
+                 CREATE TABLE dbo.{action_table} (id int NOT NULL PRIMARY KEY, executions int NOT NULL); \
+                 INSERT INTO dbo.{action_table} VALUES (1, 0); \
+                 EXEC sys.sp_cdc_enable_table \
+                    @source_schema=N'dbo', \
+                    @source_name=N'{table_name}', \
+                    @capture_instance=N'{capture_instance}', \
+                    @role_name=NULL, \
+                    @supports_net_changes=0;"
+            ),
+        )
+        .await?;
+        wait_for_capture_instance(&mut client, &capture_instance).await?;
+
+        let mut config = settings.source_config(&table_name);
+        config.heartbeat_interval = Duration::from_millis(100);
+        config.heartbeat_action_query = Some(format!(
+            "UPDATE dbo.{action_table} SET executions = executions + 1 WHERE id = 1"
+        ));
+        let mut source = SqlServerSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let capture_result: TestResult = async {
+            loop {
+                let record = receive(&mut output).await?;
+                let Some(event) = record.event else {
+                    continue;
+                };
+                if event.operation != Operation::Message {
+                    continue;
+                }
+                require(
+                    record.boundary == RecordBoundary::Heartbeat,
+                    "SQL Server heartbeat has the wrong boundary",
+                )?;
+                require(
+                    event.source.table.is_none() && event.source.schema.is_none(),
+                    "SQL Server heartbeat was exposed as a table event",
+                )?;
+                require(
+                    event.source.attributes.get("rustium.heartbeat") == Some(&true.into()),
+                    "SQL Server heartbeat marker is missing",
+                )?;
+                require(
+                    matches!(
+                        event.after.as_ref().and_then(|row| row.get("ts_ms")),
+                        Some(DataValue::Int64(_))
+                    ),
+                    "SQL Server heartbeat timestamp is missing",
+                )?;
+                require(
+                    matches!(
+                        record.position,
+                        SourcePosition::SqlServer(ref position) if !position.snapshot
+                    ),
+                    "SQL Server heartbeat does not carry a streaming CDC position",
+                )?;
+                break Ok(());
+            }
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)?;
+
+        let row = client
+            .simple_query(format!(
+                "SELECT executions FROM dbo.{action_table} WHERE id = 1"
+            ))
+            .await?
+            .into_row()
+            .await?
+            .ok_or_else(|| test_error("SQL Server heartbeat action returned no row"))?;
+        require(
+            row.get::<i32, _>("executions").unwrap_or_default() > 0,
+            "SQL Server heartbeat.action.query did not update the action table",
+        )
+    }
+    .await;
+
+    let cleanup_result = async {
+        cleanup(&mut client, &table_name, &capture_instance).await?;
+        execute_batch(
+            &mut client,
+            &format!(
+                "IF OBJECT_ID(N'dbo.{action_table}', N'U') IS NOT NULL \
+                    DROP TABLE dbo.{action_table}"
+            ),
+        )
+        .await
+    }
+    .await;
+    let close_result = client.close().await.map_err(boxed_error);
+    match (outcome, cleanup_result, close_result) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), cleanup, close) => {
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("SQL Server heartbeat cleanup also failed: {cleanup_error}");
+            }
+            if let Err(close_error) = close {
+                eprintln!("SQL Server heartbeat close also failed: {close_error}");
+            }
+            Err(error)
+        }
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external SQL Server 2017+ instance with CDC and SQL Server Agent enabled"]
+async fn rejects_checkpoint_older_than_cdc_retention() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_retention_{}", &suffix[..12]);
+    let capture_instance = format!("rustium_ret_cap_{}", &suffix[..12]);
+    let connector_name = format!("sqlserver-retention-{}", &suffix[..12]);
+    let mut client = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        execute_batch(
+            &mut client,
+            &format!(
+                "CREATE TABLE dbo.{table_name} (id bigint NOT NULL PRIMARY KEY); \
+                 INSERT INTO dbo.{table_name} VALUES (1); \
+                 EXEC sys.sp_cdc_enable_table \
+                    @source_schema=N'dbo', \
+                    @source_name=N'{table_name}', \
+                    @capture_instance=N'{capture_instance}', \
+                    @role_name=NULL, \
+                    @supports_net_changes=0;"
+            ),
+        )
+        .await?;
+        wait_for_capture_instance(&mut client, &capture_instance).await?;
+        let min_lsn = client
+            .query(
+                "SELECT sys.fn_cdc_get_min_lsn(@P1) AS min_lsn",
+                &[&capture_instance],
+            )
+            .await?
+            .into_row()
+            .await?
+            .and_then(|row| row.get::<&[u8], _>("min_lsn").map(<[u8]>::to_vec))
+            .ok_or_else(|| test_error("SQL Server retention test has no minimum LSN"))?;
+        require(
+            min_lsn.iter().any(|byte| *byte != 0),
+            "SQL Server retention test minimum LSN is not initialized",
+        )?;
+
+        let config = settings.source_config(&table_name);
+        let mut source = SqlServerSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let checkpoint = Checkpoint {
+            schema_version: 1,
+            connector_name: connector_name.clone(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: SourcePosition::SqlServer(SqlServerPosition {
+                database: settings.database.clone(),
+                commit_lsn: "0x00000000000000000001".into(),
+                change_lsn: "0xFFFFFFFFFFFFFFFFFFFF".into(),
+                event_serial: 5,
+                snapshot: false,
+            }),
+            snapshot_completed: true,
+            config_fingerprint: "sqlserver-retention-test".into(),
+            updated_at: SystemTime::now(),
+            connector_state: None,
+        };
+        let (output_tx, _output_rx) = mpsc::channel(1);
+        let (_ack_tx, ack_rx) = watch::channel(None);
+        let error = source
+            .run(SourceContext {
+                output: output_tx,
+                acknowledged: ack_rx,
+                initial_checkpoint: Some(checkpoint),
+                signals: rustium_core::signal_channel(1).1,
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect_err("SQL Server accepted a checkpoint older than CDC retention");
+        require(
+            matches!(error, rustium_core::Error::State(ref message) if message.contains("no longer available")),
+            "SQL Server retention failure did not return a state error",
+        )
+    }
+    .await;
+
+    let cleanup_result = cleanup(&mut client, &table_name, &capture_instance).await;
+    let close_result = client.close().await.map_err(boxed_error);
+    match (outcome, cleanup_result, close_result) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), cleanup, close) => {
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("SQL Server retention cleanup also failed: {cleanup_error}");
+            }
+            if let Err(close_error) = close {
+                eprintln!("SQL Server retention close also failed: {close_error}");
+            }
+            Err(error)
+        }
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external SQL Server 2017+ instance with CDC and SQL Server Agent enabled"]
+async fn keeps_snapshot_and_cdc_type_conversion_identical() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_types_{}", &suffix[..12]);
+    let capture_instance = format!("rustium_types_cap_{}", &suffix[..12]);
+    let connector_name = format!("sqlserver-types-{}", &suffix[..12]);
+    let mut client = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        execute_batch(
+            &mut client,
+            &format!(
+                "CREATE TABLE dbo.{table_name} (\
+                    id bigint NOT NULL PRIMARY KEY, \
+                    flag bit NOT NULL, \
+                    tiny_value tinyint NOT NULL, \
+                    small_value smallint NOT NULL, \
+                    int_value int NOT NULL, \
+                    bigint_value bigint NOT NULL, \
+                    decimal_value decimal(20,4) NOT NULL, \
+                    money_value money NOT NULL, \
+                    real_value real NOT NULL, \
+                    float_value float NOT NULL, \
+                    guid_value uniqueidentifier NOT NULL, \
+                    binary_value varbinary(4) NOT NULL, \
+                    date_value date NOT NULL, \
+                    time_value time(4) NOT NULL, \
+                    datetime2_value datetime2(4) NOT NULL, \
+                    offset_value datetimeoffset(4) NOT NULL, \
+                    text_value nvarchar(100) NULL\
+                 ); \
+                 INSERT INTO dbo.{table_name} VALUES (\
+                    1, 1, 255, -1234, 123456, 9876543210, 12345.6789, 42.5000, \
+                    1.25, 9.5, '550e8400-e29b-41d4-a716-446655440000', 0x00FF10AA, \
+                    '2026-07-16', '09:30:45.1234', '2026-07-16T09:30:45.1234', \
+                    '2026-07-16T09:30:45.1234+08:00', N'Rustium type matrix'\
+                 ); \
+                 EXEC sys.sp_cdc_enable_table \
+                    @source_schema=N'dbo', \
+                    @source_name=N'{table_name}', \
+                    @capture_instance=N'{capture_instance}', \
+                    @role_name=NULL, \
+                    @supports_net_changes=0;"
+            ),
+        )
+        .await?;
+        wait_for_capture_instance(&mut client, &capture_instance).await?;
+
+        let config = settings.source_config(&table_name);
+        let mut source = SqlServerSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let capture_result: TestResult = async {
+            let snapshot_row = loop {
+                let record = receive(&mut output).await?;
+                if let Some(event) = record.event
+                    && event.operation == Operation::Read
+                {
+                    break event.after.ok_or_else(|| {
+                        test_error("SQL Server type snapshot row has no after image")
+                    })?;
+                }
+            };
+            loop {
+                if receive(&mut output).await?.boundary == RecordBoundary::SnapshotComplete {
+                    break;
+                }
+            }
+            execute_batch(
+                &mut client,
+                &format!(
+                    "INSERT INTO dbo.{table_name} VALUES (\
+                        2, 1, 255, -1234, 123456, 9876543210, 12345.6789, 42.5000, \
+                        1.25, 9.5, '550e8400-e29b-41d4-a716-446655440000', 0x00FF10AA, \
+                        '2026-07-16', '09:30:45.1234', '2026-07-16T09:30:45.1234', \
+                        '2026-07-16T09:30:45.1234+08:00', N'Rustium type matrix'\
+                     )"
+                ),
+            )
+            .await?;
+            let cdc_row = loop {
+                let record = receive(&mut output).await?;
+                let Some(event) = record.event else {
+                    continue;
+                };
+                if event.operation == Operation::Create {
+                    break event.after.ok_or_else(|| {
+                        test_error("SQL Server type CDC row has no after image")
+                    })?;
+                }
+            };
+            let mut snapshot_values = snapshot_row;
+            let mut cdc_values = cdc_row;
+            snapshot_values.shift_remove("id");
+            cdc_values.shift_remove("id");
+            require(
+                snapshot_values == cdc_values,
+                &format!(
+                    "SQL Server snapshot/CDC type conversion differs: snapshot={snapshot_values:?}, cdc={cdc_values:?}"
+                ),
+            )
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)
+    }
+    .await;
+
+    let cleanup_result = cleanup(&mut client, &table_name, &capture_instance).await;
+    let close_result = client.close().await.map_err(boxed_error);
+    match (outcome, cleanup_result, close_result) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), cleanup, close) => {
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("SQL Server type cleanup also failed: {cleanup_error}");
+            }
+            if let Err(close_error) = close {
+                eprintln!("SQL Server type close also failed: {close_error}");
+            }
+            Err(error)
+        }
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an external SQL Server 2017+ instance with CDC and SQL Server Agent enabled"]
+async fn orders_concurrent_transactions_by_commit_lsn() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_concurrent_{}", &suffix[..12]);
+    let capture_instance = format!("rustium_con_cap_{}", &suffix[..12]);
+    let connector_name = format!("sqlserver-concurrent-{}", &suffix[..12]);
+    let mut client = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        execute_batch(
+            &mut client,
+            &format!(
+                "CREATE TABLE dbo.{table_name} (id bigint NOT NULL PRIMARY KEY); \
+                 EXEC sys.sp_cdc_enable_table \
+                    @source_schema=N'dbo', \
+                    @source_name=N'{table_name}', \
+                    @capture_instance=N'{capture_instance}', \
+                    @role_name=NULL, \
+                    @supports_net_changes=0;"
+            ),
+        )
+        .await?;
+        wait_for_capture_instance(&mut client, &capture_instance).await?;
+
+        let config = settings.source_config(&table_name);
+        let mut source = SqlServerSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+
+        let mut slow_client = connect(&settings).await?;
+        let slow_table = table_name.clone();
+        let slow_task = tokio::spawn(async move {
+            let result = execute_batch(
+                &mut slow_client,
+                &format!(
+                    "BEGIN TRANSACTION; \
+                     INSERT INTO dbo.{slow_table} VALUES (1); \
+                     WAITFOR DELAY '00:00:01'; \
+                     COMMIT TRANSACTION;"
+                ),
+            )
+            .await;
+            let close = slow_client.close().await.map_err(boxed_error);
+            match (result, close) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut fast_client = connect(&settings).await?;
+        execute_batch(
+            &mut fast_client,
+            &format!("INSERT INTO dbo.{table_name} VALUES (2)"),
+        )
+        .await?;
+        fast_client.close().await.map_err(boxed_error)?;
+        slow_task.await??;
+
+        let capture_result: TestResult = async {
+            let mut ids = Vec::new();
+            while ids.len() < 2 {
+                let record = receive(&mut output).await?;
+                let Some(event) = record.event else {
+                    continue;
+                };
+                if event.operation != Operation::Create {
+                    continue;
+                }
+                let id = event
+                    .after
+                    .as_ref()
+                    .and_then(|row| row.get("id"))
+                    .and_then(sqlserver_integer)
+                    .ok_or_else(|| test_error("SQL Server concurrent event has no integer id"))?;
+                ids.push(id);
+            }
+            require(
+                ids == [2, 1],
+                &format!(
+                    "SQL Server concurrent transactions were not ordered by commit LSN: {ids:?}"
+                ),
+            )
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)
+    }
+    .await;
+
+    let cleanup_result = cleanup(&mut client, &table_name, &capture_instance).await;
+    let close_result = client.close().await.map_err(boxed_error);
+    match (outcome, cleanup_result, close_result) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), cleanup, close) => {
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("SQL Server concurrency cleanup also failed: {cleanup_error}");
+            }
+            if let Err(close_error) = close {
+                eprintln!("SQL Server concurrency close also failed: {close_error}");
             }
             Err(error)
         }
@@ -197,17 +679,31 @@ async fn run_initial_capture(
         )
         .await?;
 
-        let (operations, transaction_orders, commit_position) =
-            receive_transaction(&mut output).await?;
-        require(
-            operations == [Operation::Create, Operation::Update, Operation::Delete],
-            "SQL Server transaction operations are incomplete or out of order",
-        )?;
-        require(
-            transaction_orders == [1, 2, 3],
-            "SQL Server transaction total_order values are incorrect",
-        )?;
-        Ok(commit_position)
+        loop {
+            let record = receive(&mut output).await?;
+            if record.boundary == RecordBoundary::Heartbeat {
+                continue;
+            }
+            require(
+                record.boundary == RecordBoundary::Data,
+                "SQL Server did not expose the first transaction row before checkpoint",
+            )?;
+            let event = record
+                .event
+                .ok_or_else(|| test_error("SQL Server checkpoint row has no event"))?;
+            require(
+                event.operation == Operation::Create,
+                "SQL Server first transaction row is not the create event",
+            )?;
+            require(
+                event
+                    .transaction
+                    .and_then(|transaction| transaction.total_order)
+                    == Some(1),
+                "SQL Server first transaction row has the wrong total_order",
+            )?;
+            break Ok(record.position);
+        }
     }
     .await;
 
@@ -234,6 +730,16 @@ async fn run_resumed_capture(
 
     let (mut output, cancellation, source_task) = start_source(source, Some(checkpoint));
     let capture_result: TestResult = async {
+        let (operations, transaction_orders, _) = receive_transaction(&mut output).await?;
+        require(
+            operations == [Operation::Update, Operation::Delete],
+            "SQL Server mid-transaction resume did not emit only the remaining rows",
+        )?;
+        require(
+            transaction_orders == [2, 3],
+            "SQL Server mid-transaction resume did not preserve transaction order",
+        )?;
+
         execute_batch(
             client,
             &format!(
@@ -461,6 +967,15 @@ fn require(condition: bool, message: &str) -> TestResult {
         Ok(())
     } else {
         Err(test_error(message))
+    }
+}
+
+fn sqlserver_integer(value: &DataValue) -> Option<i128> {
+    match value {
+        DataValue::Int32(value) => Some(i128::from(*value)),
+        DataValue::Int64(value) => Some(i128::from(*value)),
+        DataValue::UInt64(value) => Some(i128::from(*value)),
+        _ => None,
     }
 }
 
