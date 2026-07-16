@@ -1291,7 +1291,7 @@ async fn wait_for_sqlserver_retry(
     error: &Error,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<bool> {
-    if source.retry_policy.max_retries >= 0 && retries >= source.retry_policy.max_retries as u64 {
+    if !sqlserver_retry_allowed(&source.retry_policy, retries) {
         return Ok(false);
     }
     warn!(
@@ -1309,6 +1309,10 @@ async fn wait_for_sqlserver_retry(
     }
     *delay = delay.saturating_mul(2).min(source.retry_policy.max_delay);
     Ok(true)
+}
+
+fn sqlserver_retry_allowed(policy: &RetryPolicy, retries: u64) -> bool {
+    policy.max_retries < 0 || retries < policy.max_retries as u64
 }
 
 async fn poll_change_batch_once(
@@ -2795,6 +2799,29 @@ mod tests {
             sqlserver_error(tiberius::error::Error::Protocol("invalid token".into())),
             Error::Source(message) if message.contains("invalid token")
         ));
+    }
+
+    #[test]
+    fn enforces_sqlserver_retry_policy_boundaries() {
+        let disabled = RetryPolicy {
+            max_retries: 0,
+            ..RetryPolicy::default()
+        };
+        assert!(!sqlserver_retry_allowed(&disabled, 0));
+
+        let finite = RetryPolicy {
+            max_retries: 2,
+            ..RetryPolicy::default()
+        };
+        assert!(sqlserver_retry_allowed(&finite, 0));
+        assert!(sqlserver_retry_allowed(&finite, 1));
+        assert!(!sqlserver_retry_allowed(&finite, 2));
+
+        let unbounded = RetryPolicy {
+            max_retries: -1,
+            ..RetryPolicy::default()
+        };
+        assert!(sqlserver_retry_allowed(&unbounded, u64::MAX));
     }
 
     #[test]

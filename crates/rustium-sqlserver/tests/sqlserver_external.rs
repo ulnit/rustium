@@ -17,8 +17,8 @@ use rdkafka::{
 use rustium_config::{SnapshotConfig, SnapshotMode, SqlServerSourceConfig, TableSelection};
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
-    RecordBoundary, SignalRecord, SignalSender, SourceConnector, SourceContext, SourcePosition,
-    SourceRecord, SqlServerPosition,
+    RecordBoundary, RetryPolicy, SignalRecord, SignalSender, SourceConnector, SourceContext,
+    SourcePosition, SourceRecord, SqlServerPosition,
 };
 use rustium_signal_kafka::KafkaSignalChannel;
 use rustium_sqlserver::SqlServerSource;
@@ -469,6 +469,53 @@ async fn snapshots_streams_and_resumes_from_checkpoint() -> TestResult {
             }
             if let Err(close_error) = close {
                 eprintln!("SQL Server test connection close also failed: {close_error}");
+            }
+            Err(error)
+        }
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external SQL Server 2017+ instance with CDC and SQL Server Agent enabled"]
+async fn reconnects_after_polling_session_termination() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_reconnect_{}", &suffix[..12]);
+    let capture_instance = format!("rustium_reconnect_cap_{}", &suffix[..12]);
+    let connector_name = format!("sqlserver-reconnect-{}", &suffix[..12]);
+    let mut client = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        execute_batch(
+            &mut client,
+            &format!(
+                "CREATE TABLE dbo.{table_name} (id bigint NOT NULL PRIMARY KEY, value nvarchar(50) NOT NULL); \
+                 EXEC sys.sp_cdc_enable_table \
+                    @source_schema=N'dbo', \
+                    @source_name=N'{table_name}', \
+                    @capture_instance=N'{capture_instance}', \
+                    @role_name=NULL, \
+                    @supports_net_changes=0;"
+            ),
+        )
+        .await?;
+        wait_for_capture_instance(&mut client, &capture_instance).await?;
+        run_forced_polling_recovery(&mut client, &settings, &connector_name, &table_name).await
+    }
+    .await;
+
+    let cleanup_result = cleanup(&mut client, &table_name, &capture_instance).await;
+    let close_result = client.close().await.map_err(boxed_error);
+
+    match (outcome, cleanup_result, close_result) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), cleanup, close) => {
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("SQL Server reconnect test cleanup also failed: {cleanup_error}");
+            }
+            if let Err(close_error) = close {
+                eprintln!("SQL Server reconnect test connection close also failed: {close_error}");
             }
             Err(error)
         }
@@ -1506,6 +1553,65 @@ async fn runs_incremental_snapshot_from_source_signal_table() -> TestResult {
     }
 }
 
+async fn run_forced_polling_recovery(
+    client: &mut SqlClient,
+    settings: &TestSettings,
+    connector_name: &str,
+    table_name: &str,
+) -> TestResult {
+    let mut config = settings.source_config(table_name);
+    config.poll_interval = Duration::from_millis(100);
+    let mut source = SqlServerSource::new(
+        connector_name,
+        config,
+        SnapshotConfig {
+            mode: SnapshotMode::Never,
+            fetch_size: 1,
+        },
+    )
+    .with_retry_policy(RetryPolicy {
+        max_retries: 10,
+        initial_delay: Duration::from_millis(50),
+        max_delay: Duration::from_millis(250),
+    });
+    source.validate().await?;
+    let (mut output, cancellation, source_task) = start_source(source, None);
+
+    let capture_result: TestResult = async {
+        let (session_id, original_connection_id) =
+            wait_for_source_connection(client, &settings.user, None).await?;
+        execute_batch(client, &format!("KILL {session_id}")).await?;
+        execute_batch(
+            client,
+            &format!("INSERT INTO dbo.{table_name} (id, value) VALUES (1, N'after-reconnect')"),
+        )
+        .await?;
+
+        let (operations, transaction_orders, _) = receive_transaction(&mut output).await?;
+        require(
+            operations == [Operation::Create],
+            "SQL Server reconnect did not emit the captured create event",
+        )?;
+        require(
+            transaction_orders == [1],
+            "SQL Server reconnect did not preserve transaction ordering",
+        )?;
+
+        let (_, reconnected_connection_id) =
+            wait_for_source_connection(client, &settings.user, Some(&original_connection_id))
+                .await?;
+        require(
+            reconnected_connection_id != original_connection_id,
+            "SQL Server polling connection identity did not change after KILL",
+        )?;
+        Ok(())
+    }
+    .await;
+
+    let stop_result = stop_source(cancellation, source_task).await;
+    combine_capture_and_stop(capture_result, stop_result)
+}
+
 async fn run_initial_capture(
     client: &mut SqlClient,
     connector_name: &str,
@@ -1823,6 +1929,46 @@ async fn wait_for_capture_instance(client: &mut SqlClient, capture_instance: &st
     }
     Err(test_error(
         "SQL Server CDC capture instance did not finish initialization",
+    ))
+}
+
+async fn wait_for_source_connection(
+    client: &mut SqlClient,
+    login_name: &str,
+    excluded_connection_id: Option<&str>,
+) -> TestResult<(i32, String)> {
+    for _ in 0..300 {
+        let row = client
+            .query(
+                "SELECT TOP (1) CAST(s.session_id AS int) AS session_id, \
+                        CONVERT(nvarchar(36), c.connection_id) AS connection_id \
+                 FROM sys.dm_exec_sessions s \
+                 JOIN sys.dm_exec_connections c ON c.session_id = s.session_id \
+                 WHERE s.program_name = N'rustium' \
+                   AND s.login_name = @P1 \
+                   AND s.database_id = DB_ID() \
+                 ORDER BY s.login_time DESC",
+                &[&login_name],
+            )
+            .await?
+            .into_row()
+            .await?;
+        if let Some(row) = row {
+            let session_id = row
+                .get::<i32, _>("session_id")
+                .ok_or_else(|| test_error("SQL Server source session has no session ID"))?;
+            let connection_id = row
+                .get::<&str, _>("connection_id")
+                .ok_or_else(|| test_error("SQL Server source session has no connection ID"))?
+                .to_owned();
+            if excluded_connection_id.is_none_or(|excluded| excluded != connection_id) {
+                return Ok((session_id, connection_id));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(test_error(
+        "SQL Server source polling connection did not become available",
     ))
 }
 
