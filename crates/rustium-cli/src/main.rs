@@ -271,11 +271,14 @@ fn build_source(config: &Config) -> Result<Box<dyn SourceConnector>> {
             )
             .with_retry_policy(config.runtime.retry_policy()),
         )),
-        SourceConfig::Mysql(source) => Ok(Box::new(MySqlSource::new(
-            &config.metadata.name,
-            source.clone(),
-            config.snapshot.clone(),
-        ))),
+        SourceConfig::Mysql(source) => Ok(Box::new(
+            MySqlSource::new(
+                &config.metadata.name,
+                source.clone(),
+                config.snapshot.clone(),
+            )
+            .with_retry_policy(config.runtime.retry_policy()),
+        )),
         SourceConfig::Sqlserver(source) => Ok(Box::new(
             SqlServerSource::new(
                 &config.metadata.name,

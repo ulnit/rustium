@@ -17,7 +17,7 @@ use regex::RegexBuilder;
 use rustium_config::{MySqlSourceConfig, SnapshotConfig, SnapshotMode};
 use rustium_core::{
     ChangeEvent, DataValue, Error, EventId, EventSchema, FieldSchema, MySqlPosition, Operation,
-    RecordBoundary, Result, Row, SignalAcknowledgement, SignalRecord, SourceConnector,
+    RecordBoundary, Result, RetryPolicy, Row, SignalAcknowledgement, SignalRecord, SourceConnector,
     SourceContext, SourceMetadata, SourcePosition, SourceRecord, TransactionMetadata,
 };
 use tracing::{debug, info, warn};
@@ -563,6 +563,7 @@ pub struct MySqlSource {
     schemas: HashMap<(String, String), TableSchema>,
     source_server_id: u32,
     gtid_source_filter: Option<GtidSourceFilter>,
+    retry_policy: RetryPolicy,
 }
 
 impl MySqlSource {
@@ -572,6 +573,11 @@ impl MySqlSource {
         config: MySqlSourceConfig,
         snapshot: SnapshotConfig,
     ) -> Self {
+        let retry_policy = RetryPolicy {
+            max_retries: i32::try_from(config.reconnect_max_attempts).unwrap_or(i32::MAX),
+            initial_delay: config.connect_keep_alive_interval,
+            max_delay: config.connect_keep_alive_interval,
+        };
         Self {
             connector_name: connector_name.into(),
             config,
@@ -579,7 +585,14 @@ impl MySqlSource {
             schemas: HashMap::new(),
             source_server_id: 0,
             gtid_source_filter: None,
+            retry_policy,
         }
+    }
+
+    #[must_use]
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
     }
 
     async fn validate_source(&mut self) -> Result<()> {
@@ -1140,7 +1153,8 @@ impl MySqlSource {
         incremental: &mut MySqlIncrementalSnapshot,
         context: &mut SourceContext,
         last_safe_position: &mut Option<SourcePosition>,
-        reconnect_attempts: &mut u32,
+        reconnect_attempts: &mut u64,
+        reconnect_delay: &mut std::time::Duration,
         heartbeat_connection: &mut Option<Conn>,
         stream_cursor: &mut BinlogCursor,
     ) -> Result<Option<Error>> {
@@ -1223,6 +1237,7 @@ impl MySqlSource {
                     {
                         *last_safe_position = Some(position);
                         *reconnect_attempts = 0;
+                        *reconnect_delay = self.retry_policy.initial_delay;
                     }
                     if state.current_filename != event_filename {
                         stream_cursor.filename.clone_from(&state.current_filename);
@@ -1391,7 +1406,8 @@ impl SourceConnector for MySqlSource {
                     )
                 }),
         );
-        let mut reconnect_attempts = 0_u32;
+        let mut reconnect_attempts = 0_u64;
+        let mut reconnect_delay = self.retry_policy.initial_delay;
 
         loop {
             let open_result = tokio::select! {
@@ -1403,8 +1419,10 @@ impl SourceConnector for MySqlSource {
                 Err(error) => {
                     if !wait_for_reconnect(
                         &self.config,
+                        &self.retry_policy,
                         &mut context,
                         &mut reconnect_attempts,
+                        &mut reconnect_delay,
                         error,
                     )
                     .await?
@@ -1425,6 +1443,9 @@ impl SourceConnector for MySqlSource {
                 file = %stream_coordinates.filename,
                 position = stream_coordinates.position,
                 reconnect_attempts,
+                max_retries = self.retry_policy.max_retries,
+                initial_retry_delay_ms = self.retry_policy.initial_delay.as_millis(),
+                max_retry_delay_ms = self.retry_policy.max_delay.as_millis(),
                 "MySQL streaming started"
             );
 
@@ -1437,6 +1458,7 @@ impl SourceConnector for MySqlSource {
                     &mut context,
                     &mut last_safe_position,
                     &mut reconnect_attempts,
+                    &mut reconnect_delay,
                     &mut heartbeat_connection,
                     &mut stream_cursor,
                 )
@@ -1451,8 +1473,15 @@ impl SourceConnector for MySqlSource {
                 debug!(%error, "failed to close disconnected MySQL binlog stream");
             }
             incremental.discard_window();
-            if !wait_for_reconnect(&self.config, &mut context, &mut reconnect_attempts, failure)
-                .await?
+            if !wait_for_reconnect(
+                &self.config,
+                &self.retry_policy,
+                &mut context,
+                &mut reconnect_attempts,
+                &mut reconnect_delay,
+                failure,
+            )
+            .await?
             {
                 return Ok(());
             }
@@ -2190,30 +2219,31 @@ fn binlog_coordinates_from_position(position: &SourcePosition) -> Option<BinlogC
 
 async fn wait_for_reconnect(
     config: &MySqlSourceConfig,
+    retry_policy: &RetryPolicy,
     context: &mut SourceContext,
-    attempts: &mut u32,
+    attempts: &mut u64,
+    delay: &mut std::time::Duration,
     error: Error,
 ) -> Result<bool> {
     if !config.connect_keep_alive {
         return Err(error);
     }
-    if *attempts >= config.reconnect_max_attempts {
+    if !mysql_retry_allowed(retry_policy, *attempts) {
         return Err(Error::Source(format!(
-            "MySQL reconnect budget exhausted after {} attempts; last error: {error}",
-            config.reconnect_max_attempts
+            "MySQL reconnect budget exhausted after {attempts} retries; last error: {error}"
         )));
     }
     *attempts += 1;
     warn!(
         attempt = *attempts,
-        max_attempts = config.reconnect_max_attempts,
-        delay_ms = config.connect_keep_alive_interval.as_millis(),
+        max_retries = retry_policy.max_retries,
+        delay_ms = delay.as_millis(),
         %error,
         "MySQL binlog stream disconnected; scheduling reconnect"
     );
 
-    let delay = tokio::time::sleep(config.connect_keep_alive_interval);
-    tokio::pin!(delay);
+    let sleep = tokio::time::sleep(*delay);
+    tokio::pin!(sleep);
     loop {
         tokio::select! {
             _ = context.cancellation.cancelled() => return Ok(false),
@@ -2222,9 +2252,16 @@ async fn wait_for_reconnect(
                     return Err(Error::Cancelled);
                 }
             }
-            () = &mut delay => return Ok(true),
+            () = &mut sleep => {
+                *delay = delay.saturating_mul(2).min(retry_policy.max_delay);
+                return Ok(true);
+            },
         }
     }
+}
+
+fn mysql_retry_allowed(policy: &RetryPolicy, retries: u64) -> bool {
+    policy.max_retries < 0 || retries < policy.max_retries as u64
 }
 
 async fn connect(config: &MySqlSourceConfig) -> Result<Conn> {
@@ -3067,7 +3104,7 @@ fn mysql_error(error: impl std::fmt::Display) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
     use mysql_async::binlog::events::GtidEvent;
     use rustium_config::TableSelection;
@@ -3147,6 +3184,38 @@ mod tests {
             event.after.unwrap().get("ts_ms"),
             Some(DataValue::Int64(_))
         ));
+    }
+
+    #[test]
+    fn maps_legacy_mysql_reconnect_defaults_and_shared_retry_boundaries() {
+        let source = MySqlSource::new(
+            "inventory-mysql",
+            test_mysql_config(),
+            SnapshotConfig::default(),
+        );
+        assert_eq!(source.retry_policy.max_retries, 1);
+        assert_eq!(source.retry_policy.initial_delay, Duration::from_secs(1));
+        assert_eq!(source.retry_policy.max_delay, Duration::from_secs(1));
+
+        let disabled = RetryPolicy {
+            max_retries: 0,
+            ..RetryPolicy::default()
+        };
+        assert!(!mysql_retry_allowed(&disabled, 0));
+
+        let finite = RetryPolicy {
+            max_retries: 2,
+            ..RetryPolicy::default()
+        };
+        assert!(mysql_retry_allowed(&finite, 0));
+        assert!(mysql_retry_allowed(&finite, 1));
+        assert!(!mysql_retry_allowed(&finite, 2));
+
+        let unbounded = RetryPolicy {
+            max_retries: -1,
+            ..RetryPolicy::default()
+        };
+        assert!(mysql_retry_allowed(&unbounded, u64::MAX));
     }
 
     #[test]

@@ -1,13 +1,15 @@
 use std::{
-    process::Command,
-    time::{Duration, SystemTime},
+    collections::BTreeMap,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant, SystemTime},
 };
 
 use mysql_async::{Conn, OptsBuilder, prelude::Queryable};
 use rustium_config::{MySqlSourceConfig, SnapshotConfig, SnapshotMode, TableSelection};
 use rustium_core::{
-    CHECKPOINT_SCHEMA_VERSION, Checkpoint, DataValue, Operation, RecordBoundary, SourceConnector,
-    SourceContext,
+    CHECKPOINT_SCHEMA_VERSION, Checkpoint, DataValue, Operation, RecordBoundary, RetryPolicy,
+    SourceConnector, SourceContext,
 };
 use rustium_mysql::MySqlSource;
 use tokio::sync::{mpsc, watch};
@@ -17,8 +19,48 @@ struct DockerContainer(String);
 
 impl Drop for DockerContainer {
     fn drop(&mut self) {
-        let _ = Command::new("docker").args(["rm", "-f", &self.0]).output();
+        let Ok(mut child) = Command::new("docker")
+            .args(["rm", "-f", &self.0])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    break;
+                }
+            }
+        }
     }
+}
+
+fn mapped_port(container: &str) -> u16 {
+    let output = Command::new("docker")
+        .args(["port", container, "3306/tcp"])
+        .output()
+        .expect("inspect MySQL Docker port");
+    assert!(
+        output.status.success(),
+        "docker port failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("MySQL Docker port is UTF-8")
+        .trim()
+        .rsplit(':')
+        .next()
+        .expect("MySQL Docker port mapping has a port")
+        .parse()
+        .expect("MySQL Docker port is numeric")
 }
 
 async fn replication_connection_id(root: &mut Conn) -> u64 {
@@ -38,13 +80,64 @@ async fn replication_connection_id(root: &mut Conn) -> u64 {
     panic!("MySQL replication connection did not become visible");
 }
 
+async fn different_replication_connection_id(root: &mut Conn, previous: u64) -> u64 {
+    for _ in 0..300 {
+        let connection_id = root
+            .query_first::<u64, _>(
+                "SELECT ID FROM information_schema.PROCESSLIST \
+                 WHERE USER = 'rustium' AND COMMAND LIKE 'Binlog Dump%'",
+            )
+            .await
+            .unwrap();
+        if let Some(connection_id) = connection_id
+            && connection_id != previous
+        {
+            return connection_id;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("MySQL replication connection ID did not change after recovery");
+}
+
+fn reconnect_soak_cycles() -> u32 {
+    let cycles = std::env::var("RUSTIUM_MYSQL_RECONNECT_SOAK_CYCLES")
+        .unwrap_or_else(|_| "3".into())
+        .parse::<u32>()
+        .expect("RUSTIUM_MYSQL_RECONNECT_SOAK_CYCLES is numeric");
+    assert!(
+        (1..=1_000).contains(&cycles),
+        "RUSTIUM_MYSQL_RECONNECT_SOAK_CYCLES must be between 1 and 1000"
+    );
+    cycles
+}
+
+async fn wait_for_output_backpressure(
+    output: &mpsc::Receiver<rustium_core::Result<rustium_core::SourceRecord>>,
+) {
+    for _ in 0..100 {
+        if output.capacity() == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("MySQL source output did not reach bounded backpressure");
+}
+
+fn integer_value(value: Option<&DataValue>) -> Option<i64> {
+    match value {
+        Some(DataValue::Int32(value)) => Some(i64::from(*value)),
+        Some(DataValue::Int64(value)) => Some(*value),
+        Some(DataValue::UInt64(value)) => i64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker and the mysql:8.4 image"]
 async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
+    let soak_cycles = reconnect_soak_cycles();
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let name = format!("rustium-mysql-{suffix}");
-    let port = 34_000 + u16::try_from(std::process::id() % 1_000).unwrap();
-    let port_mapping = format!("{port}:3306");
     let output = Command::new("docker")
         .args([
             "run",
@@ -52,7 +145,7 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
             "--name",
             &name,
             "-p",
-            &port_mapping,
+            "127.0.0.1::3306",
             "-e",
             "MYSQL_ROOT_PASSWORD=root",
             "-e",
@@ -75,6 +168,7 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
         String::from_utf8_lossy(&output.stderr)
     );
     let _container = DockerContainer(name);
+    let port = mapped_port(&_container.0);
 
     let root_opts = OptsBuilder::default()
         .ip_or_hostname("127.0.0.1")
@@ -153,10 +247,15 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
             mode: SnapshotMode::Initial,
             fetch_size: 1,
         },
-    );
+    )
+    .with_retry_policy(RetryPolicy {
+        max_retries: 20,
+        initial_delay: Duration::from_millis(25),
+        max_delay: Duration::from_millis(250),
+    });
     source.validate().await.unwrap();
 
-    let (output_tx, mut output_rx) = mpsc::channel(32);
+    let (output_tx, mut output_rx) = mpsc::channel(1);
     let (_ack_tx, ack_rx) = watch::channel(None);
     let cancellation = CancellationToken::new();
     let source_cancel = cancellation.clone();
@@ -227,33 +326,68 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
     );
     assert_eq!(orders, [1, 2, 3, 4, 5]);
 
-    let replication_connection = replication_connection_id(&mut root).await;
-    root.query_drop(format!("KILL CONNECTION {replication_connection}"))
+    let mut checkpoint_position = None;
+    for cycle in 0..soak_cycles {
+        let first_id = 5_i64 + i64::from(cycle) * 3;
+        let expected_ids = [first_id, first_id + 1, first_id + 2];
+        let replication_connection = replication_connection_id(&mut root).await;
+        root.query_drop("START TRANSACTION").await.unwrap();
+        root.query_drop(format!(
+            "INSERT INTO inventory.orders (id, customer, amount) VALUES \
+                ({first_id}, 'Backpressure {cycle} A', 10.00), \
+                ({}, 'Backpressure {cycle} B', 20.00)",
+            first_id + 1
+        ))
         .await
         .unwrap();
-    root.query_drop(
-        "INSERT INTO inventory.orders (id, customer, amount) VALUES (5, 'Erin', 89.10)",
-    )
-    .await
-    .unwrap();
-
-    let mut operations = Vec::new();
-    let mut orders = Vec::new();
-    let checkpoint_position = loop {
-        let record = tokio::time::timeout(Duration::from_secs(20), output_rx.recv())
+        root.query_drop("COMMIT").await.unwrap();
+        wait_for_output_backpressure(&output_rx).await;
+        root.query_drop(format!("KILL CONNECTION {replication_connection}"))
             .await
-            .unwrap()
-            .unwrap()
             .unwrap();
-        if record.boundary == RecordBoundary::TransactionCommit {
-            break record.position;
+        root.query_drop(format!(
+            "INSERT INTO inventory.orders (id, customer, amount) VALUES \
+                ({}, 'After reconnect {cycle}', 30.00)",
+            first_id + 2
+        ))
+        .await
+        .unwrap();
+
+        let mut first_seen = Vec::new();
+        let mut seen = BTreeMap::<i64, usize>::new();
+        loop {
+            let record = tokio::time::timeout(Duration::from_secs(20), output_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if record.boundary == RecordBoundary::Data {
+                let event = record.event.unwrap();
+                if event.operation == Operation::Create
+                    && let Some(id) =
+                        integer_value(event.after.as_ref().and_then(|row| row.get("id")))
+                    && expected_ids.contains(&id)
+                {
+                    if !seen.contains_key(&id) {
+                        first_seen.push(id);
+                    }
+                    *seen.entry(id).or_default() += 1;
+                }
+            }
+            if record.boundary == RecordBoundary::TransactionCommit
+                && expected_ids.iter().all(|id| seen.contains_key(id))
+            {
+                checkpoint_position = Some(record.position);
+                break;
+            }
         }
-        let event = record.event.unwrap();
-        operations.push(event.operation);
-        orders.push(event.transaction.unwrap().total_order.unwrap());
-    };
-    assert_eq!(operations, [Operation::Create]);
-    assert_eq!(orders, [1]);
+        assert_eq!(first_seen, expected_ids);
+        assert_ne!(
+            different_replication_connection_id(&mut root, replication_connection).await,
+            replication_connection
+        );
+    }
+    let checkpoint_position = checkpoint_position.expect("MySQL reconnect checkpoint position");
 
     cancellation.cancel();
     source_task.await.unwrap().unwrap();
@@ -269,9 +403,12 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
         connector_state: Some(snapshot_schema_history),
     };
 
-    root.query_drop(
-        "INSERT INTO inventory.orders (id, customer, amount) VALUES (6, 'Finn', 32.10)",
-    )
+    let old_schema_id = 5_i64 + i64::from(soak_cycles) * 3;
+    let new_schema_id = old_schema_id + 1;
+    root.query_drop(format!(
+        "INSERT INTO inventory.orders (id, customer, amount) VALUES \
+            ({old_schema_id}, 'Finn', 32.10)"
+    ))
     .await
     .unwrap();
     root.query_drop(
@@ -279,9 +416,12 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
     )
     .await
     .unwrap();
-    root.query_drop("INSERT INTO inventory.orders (id, amount, status) VALUES (7, 64.20, 'ready')")
-        .await
-        .unwrap();
+    root.query_drop(format!(
+        "INSERT INTO inventory.orders (id, amount, status) VALUES \
+            ({new_schema_id}, 64.20, 'ready')"
+    ))
+    .await
+    .unwrap();
 
     let mut resumed_source = MySqlSource::new(
         "inventory-mysql",

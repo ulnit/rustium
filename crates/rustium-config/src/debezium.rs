@@ -584,6 +584,48 @@ fn assemble_config(
     let topic_prefix = required(properties, "topic.prefix")?.to_string();
     let sink = sink_config(properties, &topic_prefix)?;
     warnings.extend(unsupported_warnings(properties));
+    let mysql_source = matches!(&source, SourceConfig::Mysql(_));
+    let errors_max_retries = if properties.contains_key("errors.max.retries") {
+        i32_value(
+            properties,
+            "errors.max.retries",
+            default_errors_max_retries(),
+        )?
+    } else if mysql_source && properties.contains_key("rustium.source.reconnect.max.attempts") {
+        i32_value(
+            properties,
+            "rustium.source.reconnect.max.attempts",
+            default_errors_max_retries(),
+        )?
+    } else {
+        default_errors_max_retries()
+    };
+    let errors_retry_delay_initial = if properties.contains_key("errors.retry.delay.initial.ms") {
+        duration_ms(
+            properties,
+            "errors.retry.delay.initial.ms",
+            default_errors_retry_delay_initial(),
+        )?
+    } else if mysql_source && properties.contains_key("connect.keep.alive.interval.ms") {
+        duration_ms(
+            properties,
+            "connect.keep.alive.interval.ms",
+            default_errors_retry_delay_initial(),
+        )?
+    } else {
+        default_errors_retry_delay_initial()
+    };
+    let errors_retry_delay_max = if properties.contains_key("errors.retry.delay.max.ms") {
+        duration_ms(
+            properties,
+            "errors.retry.delay.max.ms",
+            default_errors_retry_delay_max(),
+        )?
+    } else if mysql_source && properties.contains_key("connect.keep.alive.interval.ms") {
+        errors_retry_delay_initial
+    } else {
+        default_errors_retry_delay_max()
+    };
 
     let config = Config {
         api_version: API_VERSION.into(),
@@ -620,21 +662,9 @@ fn assemble_config(
             max_batch_size: usize_value(properties, "max.batch.size", default_batch_size())?,
             flush_interval: duration_ms(properties, "poll.interval.ms", default_flush_interval())?,
             shutdown_timeout: default_shutdown_timeout(),
-            errors_max_retries: i32_value(
-                properties,
-                "errors.max.retries",
-                default_errors_max_retries(),
-            )?,
-            errors_retry_delay_initial: duration_ms(
-                properties,
-                "errors.retry.delay.initial.ms",
-                default_errors_retry_delay_initial(),
-            )?,
-            errors_retry_delay_max: duration_ms(
-                properties,
-                "errors.retry.delay.max.ms",
-                default_errors_retry_delay_max(),
-            )?,
+            errors_max_retries,
+            errors_retry_delay_initial,
+            errors_retry_delay_max,
         },
         server: ServerConfig {
             bind: properties
@@ -1258,6 +1288,15 @@ topic.heartbeat.name=shared-heartbeat
             Duration::from_millis(250)
         );
         assert_eq!(source.reconnect_max_attempts, 3);
+        assert_eq!(config.runtime.errors_max_retries, 3);
+        assert_eq!(
+            config.runtime.errors_retry_delay_initial,
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            config.runtime.errors_retry_delay_max,
+            Duration::from_millis(250)
+        );
         assert!(source.schema_history_skip_unparseable_ddl);
         assert_eq!(
             source.gtid_source_includes,

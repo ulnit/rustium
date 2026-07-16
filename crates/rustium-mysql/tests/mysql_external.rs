@@ -18,8 +18,8 @@ use rdkafka::{
 use rustium_config::{MySqlSourceConfig, SnapshotConfig, SnapshotMode, TableSelection};
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
-    RecordBoundary, SignalRecord, SignalSender, SourceConnector, SourceContext, SourcePosition,
-    SourceRecord,
+    RecordBoundary, RetryPolicy, SignalRecord, SignalSender, SourceConnector, SourceContext,
+    SourcePosition, SourceRecord,
 };
 use rustium_mysql::MySqlSource;
 use rustium_signal_kafka::KafkaSignalChannel;
@@ -816,6 +816,152 @@ impl TestSettings {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an external MySQL 8.0+ server with row binlog and GTID enabled"]
+async fn reconnects_under_bounded_output_backpressure() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let soak_cycles = reconnect_soak_cycles()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_reconnect_{}", &suffix[..12]);
+    let connector_name = format!("mysql-reconnect-{}", &suffix[..12]);
+    let qualified_table = format!(
+        "{}.{}",
+        quote_identifier(&settings.database),
+        quote_identifier(&table_name)
+    );
+    let mut admin = connect_admin(&settings).await?;
+
+    let outcome: TestResult = async {
+        admin
+            .query_drop(format!(
+                "CREATE TABLE {qualified_table} (id BIGINT PRIMARY KEY, value VARCHAR(100) NOT NULL); \
+                 INSERT INTO {qualified_table} VALUES (1, 'snapshot')"
+            ))
+            .await?;
+        let mut source = MySqlSource::new(
+            &connector_name,
+            settings.source_config(&table_name),
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+            },
+        )
+        .with_retry_policy(RetryPolicy {
+            max_retries: 20,
+            initial_delay: Duration::from_millis(25),
+            max_delay: Duration::from_millis(250),
+        });
+        source.validate().await?;
+        let (mut output, cancellation, source_task) =
+            start_source_with_output_capacity(source, None, None, 1);
+        let capture_result: TestResult = async {
+            loop {
+                if receive(&mut output).await?.boundary == RecordBoundary::SnapshotComplete {
+                    break;
+                }
+            }
+
+            for cycle in 0..soak_cycles {
+                let first_id = 2_i128 + i128::from(cycle) * 3;
+                let expected_ids = [first_id, first_id + 1, first_id + 2];
+                let connection_id = wait_for_replication_connection(
+                    &mut admin,
+                    &settings.cdc_user,
+                    None,
+                )
+                .await?;
+                admin.query_drop("START TRANSACTION").await?;
+                admin
+                    .query_drop(format!(
+                        "INSERT INTO {qualified_table} VALUES \
+                            ({first_id}, 'backpressure-{cycle}-a'), \
+                            ({}, 'backpressure-{cycle}-b')",
+                        first_id + 1
+                    ))
+                    .await?;
+                admin.query_drop("COMMIT").await?;
+                wait_for_output_backpressure(&output).await?;
+                admin
+                    .query_drop(format!("KILL CONNECTION {connection_id}"))
+                    .await?;
+                admin
+                    .query_drop(format!(
+                        "INSERT INTO {qualified_table} VALUES \
+                            ({}, 'after-reconnect-{cycle}')",
+                        first_id + 2
+                    ))
+                    .await?;
+
+                let mut first_seen = Vec::new();
+                let mut seen = BTreeMap::<i128, usize>::new();
+                loop {
+                    let record = receive(&mut output).await?;
+                    if record.boundary == RecordBoundary::Data {
+                        let event = record
+                            .event
+                            .ok_or_else(|| test_error("MySQL reconnect record has no event"))?;
+                        if event.operation == Operation::Create
+                            && let Some(id) = event
+                                .after
+                                .as_ref()
+                                .and_then(|row| row.get("id"))
+                                .and_then(mysql_integer)
+                            && expected_ids.contains(&id)
+                        {
+                            if !seen.contains_key(&id) {
+                                first_seen.push(id);
+                            }
+                            *seen.entry(id).or_default() += 1;
+                        }
+                    }
+                    if record.boundary == RecordBoundary::TransactionCommit
+                        && expected_ids.iter().all(|id| seen.contains_key(id))
+                    {
+                        break;
+                    }
+                }
+                require(
+                    first_seen == expected_ids,
+                    "MySQL reconnect soak did not preserve first-seen source order",
+                )?;
+                let reconnected_id = wait_for_replication_connection(
+                    &mut admin,
+                    &settings.cdc_user,
+                    Some(connection_id),
+                )
+                .await?;
+                require(
+                    reconnected_id != connection_id,
+                    "MySQL binlog connection identity did not change after KILL",
+                )?;
+            }
+            Ok(())
+        }
+        .await;
+        finish_source(cancellation, source_task, capture_result).await
+    }
+    .await;
+
+    let cleanup_result = admin
+        .query_drop(format!("DROP TABLE IF EXISTS {qualified_table}"))
+        .await
+        .map_err(boxed_error);
+    let close_result = admin.disconnect().await.map_err(boxed_error);
+    match (outcome, cleanup_result, close_result) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), cleanup, close) => {
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("MySQL reconnect cleanup also failed: {cleanup_error}");
+            }
+            if let Err(close_error) = close {
+                eprintln!("MySQL reconnect connection close also failed: {close_error}");
+            }
+            Err(error)
+        }
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external MySQL 8.0+ server with row binlog and GTID enabled"]
 async fn emits_periodic_heartbeat_from_safe_binlog_position() -> TestResult {
     let settings = TestSettings::from_env()?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -1512,7 +1658,20 @@ fn start_source(
     CancellationToken,
     JoinHandle<rustium_core::Result<()>>,
 ) {
-    let (output_tx, output_rx) = mpsc::channel(64);
+    start_source_with_output_capacity(source, initial_checkpoint, acknowledged_position, 64)
+}
+
+fn start_source_with_output_capacity(
+    source: MySqlSource,
+    initial_checkpoint: Option<Checkpoint>,
+    acknowledged_position: Option<SourcePosition>,
+    output_capacity: usize,
+) -> (
+    mpsc::Receiver<rustium_core::Result<SourceRecord>>,
+    CancellationToken,
+    JoinHandle<rustium_core::Result<()>>,
+) {
+    let (output_tx, output_rx) = mpsc::channel(output_capacity);
     let (ack_tx, ack_rx) = watch::channel(acknowledged_position);
     let cancellation = CancellationToken::new();
     let source_cancel = cancellation.clone();
@@ -1565,11 +1724,19 @@ fn start_source_with_signals(
 
 async fn finish_source<T>(
     cancellation: CancellationToken,
-    source_task: JoinHandle<rustium_core::Result<()>>,
+    mut source_task: JoinHandle<rustium_core::Result<()>>,
     capture_result: TestResult<T>,
 ) -> TestResult<T> {
     cancellation.cancel();
-    let source_result = source_task.await.map_err(boxed_error)?;
+    let source_result = match tokio::time::timeout(Duration::from_secs(15), &mut source_task).await
+    {
+        Ok(result) => result.map_err(boxed_error)?,
+        Err(_) => {
+            source_task.abort();
+            let _ = source_task.await;
+            return Err(test_error("MySQL source did not stop after cancellation"));
+        }
+    };
     match (capture_result, source_result) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(capture_error), Ok(())) => Err(capture_error),
@@ -1588,6 +1755,56 @@ async fn receive(
         .map_err(|_| test_error("timed out waiting for a MySQL source record"))?
         .ok_or_else(|| test_error("MySQL source closed before the test completed"))?
         .map_err(boxed_error)
+}
+
+fn reconnect_soak_cycles() -> TestResult<u32> {
+    let cycles = std::env::var("RUSTIUM_MYSQL_RECONNECT_SOAK_CYCLES")
+        .unwrap_or_else(|_| "3".into())
+        .parse::<u32>()?;
+    require(
+        (1..=1_000).contains(&cycles),
+        "RUSTIUM_MYSQL_RECONNECT_SOAK_CYCLES must be between 1 and 1000",
+    )?;
+    Ok(cycles)
+}
+
+async fn wait_for_output_backpressure(
+    output: &mpsc::Receiver<rustium_core::Result<SourceRecord>>,
+) -> TestResult {
+    for _ in 0..100 {
+        if output.capacity() == 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(test_error(
+        "MySQL source output did not reach bounded backpressure",
+    ))
+}
+
+async fn wait_for_replication_connection(
+    admin: &mut Conn,
+    user: &str,
+    excluded_connection_id: Option<u64>,
+) -> TestResult<u64> {
+    for _ in 0..300 {
+        let connection_id = admin
+            .exec_first::<u64, _, _>(
+                "SELECT ID FROM information_schema.PROCESSLIST \
+                 WHERE USER = ? AND COMMAND LIKE 'Binlog Dump%'",
+                (user,),
+            )
+            .await?;
+        if let Some(connection_id) = connection_id
+            && excluded_connection_id != Some(connection_id)
+        {
+            return Ok(connection_id);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(test_error(
+        "MySQL binlog replication connection did not become available",
+    ))
 }
 
 async fn wait_for_kafka_offset(

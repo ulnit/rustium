@@ -56,6 +56,34 @@ jobs:
       - name: Test PostgreSQL CDC recovery and extension types
         run: bash scripts/test-postgresql-extensions.sh
 
+  mysql-cdc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            libcurl4-openssl-dev \
+            libsasl2-dev \
+            libssl-dev \
+            pkg-config
+      - name: Pull MySQL 8.4
+        run: docker pull mysql:8.4
+      - name: Test MySQL CDC recovery and schema history
+        env:
+          RUSTIUM_MYSQL_RECONNECT_SOAK_CYCLES: "3"
+        run: >-
+          cargo test -p rustium-mysql --test mysql_docker --locked --
+          snapshots_streams_reconnects_and_preserves_transaction_order
+          --ignored --exact --nocapture
+
   sqlserver-cdc:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
