@@ -338,11 +338,7 @@ impl SqlServerIncrementalSnapshot {
         if progress.paused {
             return Ok(());
         }
-        let window_id = format!(
-            "rustium-window-{}-{}",
-            progress.chunk_sequence,
-            uuid::Uuid::new_v4().simple()
-        );
+        let window_id = uuid::Uuid::new_v4().to_string();
         source
             .emit_incremental_watermark(&format!("{window_id}-open"), WINDOW_OPEN_SIGNAL)
             .await?;
@@ -673,6 +669,7 @@ impl SqlServerSource {
                     ))
                 })?;
             validate_signal_schema(capture)?;
+            validate_signal_insert_permission(&mut client, capture).await?;
         }
         current_max_lsn(&mut client).await?;
         client.close().await.map_err(sqlserver_error)?;
@@ -765,11 +762,7 @@ impl SqlServerSource {
             quote_identifier(&capture.schema),
             quote_identifier(&capture.table)
         );
-        let data = serde_json::json!({
-            "connector": self.connector_name,
-            "watermark": signal_type,
-        })
-        .to_string();
+        let data = "{}";
         let mut client = connect(&self.config, self.database()).await?;
         client
             .execute(
@@ -1293,6 +1286,57 @@ fn validate_signal_schema(capture: &CaptureTable) -> Result<()> {
     {
         return Err(Error::Configuration(format!(
             "SQL Server signal table {}.{} must contain exactly text-compatible id, type, and data columns in that order",
+            capture.schema, capture.table
+        )));
+    }
+    let minimum_lengths = [
+        uuid::Uuid::nil().to_string().len() + "-close".len(),
+        WINDOW_OPEN_SIGNAL.len().max(WINDOW_CLOSE_SIGNAL.len()),
+        2,
+    ];
+    for (field, minimum) in capture.event_schema.fields.iter().zip(minimum_lengths) {
+        if signal_text_capacity(&field.type_name).is_some_and(|capacity| capacity < minimum) {
+            return Err(Error::Configuration(format!(
+                "SQL Server signal table column {:?} must hold at least {minimum} characters for incremental snapshot watermarks; found {}",
+                field.name, field.type_name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn signal_text_capacity(type_name: &str) -> Option<usize> {
+    let normalized = type_name.trim().to_ascii_lowercase();
+    if matches!(base_type(&normalized), "text" | "ntext") || normalized.ends_with("(max)") {
+        return None;
+    }
+    normalized
+        .split_once('(')
+        .and_then(|(_, length)| length.strip_suffix(')'))
+        .and_then(|length| length.parse().ok())
+}
+
+async fn validate_signal_insert_permission(
+    client: &mut SqlClient,
+    capture: &CaptureTable,
+) -> Result<()> {
+    let object_name = format!("{}.{}", capture.schema, capture.table);
+    let row = client
+        .query(
+            "SELECT CAST(HAS_PERMS_BY_NAME(@P1, 'OBJECT', 'INSERT') AS int) AS can_insert",
+            &[&object_name],
+        )
+        .await
+        .map_err(sqlserver_error)?
+        .into_row()
+        .await
+        .map_err(sqlserver_error)?
+        .ok_or_else(|| {
+            Error::Source("SQL Server did not return signal-table permissions".into())
+        })?;
+    if required::<i32>(&row, "can_insert")? != 1 {
+        return Err(Error::Configuration(format!(
+            "SQL Server connector user requires INSERT on signal table {}.{} for incremental snapshot watermarks",
             capture.schema, capture.table
         )));
     }
@@ -2657,7 +2701,7 @@ mod tests {
 
     #[test]
     fn validates_sqlserver_signal_table_layout() {
-        let capture = CaptureTable {
+        let mut capture = CaptureTable {
             schema: "dbo".into(),
             table: "rustium_signal".into(),
             capture_instance: "dbo_rustium_signal".into(),
@@ -2677,6 +2721,11 @@ mod tests {
             },
         };
         assert!(validate_signal_schema(&capture).is_ok());
+        capture.event_schema.fields[0].type_name = "nvarchar(20)".into();
+        assert!(matches!(
+            validate_signal_schema(&capture),
+            Err(Error::Configuration(message)) if message.contains("at least 42 characters")
+        ));
     }
 
     #[test]
