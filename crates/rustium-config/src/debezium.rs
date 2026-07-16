@@ -119,6 +119,11 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
             replica_identity_autoset_values: postgres_replica_identity_rules(
                 properties.get("replica.identity.autoset.values"),
             )?,
+            publish_via_partition_root: bool_value(
+                &properties,
+                "publish.via.partition.root",
+                false,
+            )?,
             slot_name: properties
                 .get("slot.name")
                 .cloned()
@@ -1211,6 +1216,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "publication.name",
         "publication.autocreate.mode",
         "replica.identity.autoset.values",
+        "publish.via.partition.root",
         "snapshot.mode",
         "snapshot.fetch.size",
         "snapshot.include.collection.list",
@@ -1344,6 +1350,7 @@ slot.name=orders_slot
 publication.name=orders_pub
 publication.autocreate.mode=filtered
 replica.identity.autoset.values=public\\.orders:FULL,public\\.customers:INDEX customers_replica_key
+publish.via.partition.root=true
 table.include.list=public\\.(orders|customers)
 snapshot.mode=initial
 snapshot.include.collection.list=public\\.orders
@@ -1423,6 +1430,7 @@ max.batch.size=1000
             PublicationAutoCreateMode::Filtered
         );
         assert_eq!(source.replica_identity_autoset_values.len(), 2);
+        assert!(source.publish_via_partition_root);
         assert_eq!(
             source.replica_identity_autoset_values[0].table,
             r"public\.orders"

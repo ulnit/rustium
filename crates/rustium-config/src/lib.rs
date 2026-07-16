@@ -213,6 +213,12 @@ impl SourceConfig {
                             serde_json::json!(config.replica_identity_autoset_values),
                         );
                 }
+                if config.publish_via_partition_root {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert("publish_via_partition_root".into(), true.into());
+                }
                 add_heartbeat_semantics(
                     &mut semantic,
                     config.heartbeat_interval,
@@ -371,6 +377,8 @@ pub struct PostgresSourceConfig {
     pub publication_autocreate_mode: PublicationAutoCreateMode,
     #[serde(default)]
     pub replica_identity_autoset_values: Vec<PostgresReplicaIdentityRule>,
+    #[serde(default)]
+    pub publish_via_partition_root: bool,
     #[serde(default = "default_slot_name")]
     pub slot_name: String,
     #[serde(default)]
@@ -1926,6 +1934,10 @@ sink:
             config.source.semantic_config()["replica_identity_autoset_values"].is_null(),
             "empty replica identity rules must preserve the old fingerprint shape"
         );
+        assert!(
+            config.source.semantic_config()["publish_via_partition_root"].is_null(),
+            "disabled partition-root publication must preserve the old fingerprint shape"
+        );
     }
 
     #[test]
@@ -1965,6 +1977,26 @@ sink:
         ))
         .unwrap_err();
         assert!(unexpected_index.to_string().contains("valid only"));
+    }
+
+    #[test]
+    fn parses_native_postgresql_partition_root_publication() {
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  publication: rustium_pub\n",
+            "  publication: rustium_pub\n  publish_via_partition_root: true\n",
+        ))
+        .unwrap();
+        assert!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .publish_via_partition_root
+        );
+        assert_ne!(
+            Config::from_yaml(CONFIG).unwrap().fingerprint(),
+            configured.fingerprint()
+        );
     }
 
     #[test]

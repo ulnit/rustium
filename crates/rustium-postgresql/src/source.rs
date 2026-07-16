@@ -1684,11 +1684,17 @@ fn ensure_publication(
     let publication_identifier = quote_ident(&config.publication).map_err(pg_error)?;
     let result = connection
         .exec(&format!(
-            "SELECT puballtables::text FROM pg_catalog.pg_publication WHERE pubname = {publication_literal}"
+            "SELECT puballtables::text, pubviaroot::text \
+             FROM pg_catalog.pg_publication WHERE pubname = {publication_literal}"
         ))
         .map_err(pg_error)?;
 
     if result.ntuples() == 0 {
+        let options = if config.publish_via_partition_root {
+            " WITH (publish_via_partition_root = true)"
+        } else {
+            ""
+        };
         let statement = match config.publication_autocreate_mode {
             PublicationAutoCreateMode::Disabled => {
                 return Err(Error::Configuration(format!(
@@ -1697,21 +1703,30 @@ fn ensure_publication(
                 )));
             }
             PublicationAutoCreateMode::AllTables => {
-                format!("CREATE PUBLICATION {publication_identifier} FOR ALL TABLES")
+                format!("CREATE PUBLICATION {publication_identifier} FOR ALL TABLES{options}")
             }
             PublicationAutoCreateMode::Filtered => {
                 let tables = selected_publication_tables(connection, config)?;
                 format!(
-                    "CREATE PUBLICATION {publication_identifier} FOR TABLE {}",
-                    qualified_publication_tables(&tables)?
+                    "CREATE PUBLICATION {publication_identifier} FOR TABLE {}{options}",
+                    qualified_publication_tables(&tables)?,
                 )
             }
             PublicationAutoCreateMode::NoTables => {
-                format!("CREATE PUBLICATION {publication_identifier}")
+                format!("CREATE PUBLICATION {publication_identifier}{options}")
             }
         };
         connection.exec(&statement).map_err(pg_error)?;
         return Ok(());
+    }
+
+    let publish_via_root = required_value(&result, 0, 1, "publication partition-root state")?;
+    let publish_via_root = publish_via_root == "true" || publish_via_root == "t";
+    if publish_via_root != config.publish_via_partition_root {
+        return Err(Error::Configuration(format!(
+            "publication {:?} has publish_via_partition_root={publish_via_root}, but source.publish_via_partition_root={}; alter or recreate the publication so they match",
+            config.publication, config.publish_via_partition_root
+        )));
     }
 
     if config.publication_autocreate_mode == PublicationAutoCreateMode::Filtered {
@@ -2870,6 +2885,7 @@ mod tests {
             publication: "orders_publication".into(),
             publication_autocreate_mode: PublicationAutoCreateMode::Disabled,
             replica_identity_autoset_values: Vec::new(),
+            publish_via_partition_root: false,
             slot_name: "orders_slot".into(),
             slot_ownership: SlotOwnership::Managed,
             tables: TableSelection::default(),

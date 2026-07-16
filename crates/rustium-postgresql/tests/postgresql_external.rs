@@ -70,6 +70,7 @@ impl TestSettings {
             publication: publication.into(),
             publication_autocreate_mode: PublicationAutoCreateMode::Disabled,
             replica_identity_autoset_values: Vec::new(),
+            publish_via_partition_root: false,
             slot_name: slot_name.into(),
             slot_ownership: SlotOwnership::Managed,
             tables: TableSelection {
@@ -935,6 +936,140 @@ async fn applies_debezium_replica_identity_autoset_values_atomically() -> TestRe
         &publication,
         &slot_name,
         &[&default_table, &full_table, &nothing_table, &index_table],
+    )
+    .await;
+    connection_task.abort();
+    match (outcome, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn publishes_partition_changes_via_the_partition_root() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let root_table = format!("rustium_pg_partition_root_{}", &suffix[..8]);
+    let first_partition = format!("rustium_pg_partition_first_{}", &suffix[..8]);
+    let second_partition = format!("rustium_pg_partition_second_{}", &suffix[..8]);
+    let publication = format!("rustium_pg_partition_pub_{}", &suffix[..8]);
+    let slot_name = format!("rustium_pg_partition_slot_{}", &suffix[..8]);
+    let connector_name = format!("postgresql-partition-root-{}", &suffix[..8]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{root_table} (\
+                    id BIGINT NOT NULL, \
+                    value TEXT NOT NULL, \
+                    PRIMARY KEY (id)\
+                 ) PARTITION BY RANGE (id); \
+                 CREATE TABLE public.{first_partition} PARTITION OF public.{root_table} \
+                    FOR VALUES FROM (0) TO (100); \
+                 CREATE TABLE public.{second_partition} PARTITION OF public.{root_table} \
+                    FOR VALUES FROM (100) TO (200); \
+                 INSERT INTO public.{root_table} VALUES (1, 'snapshot-root');"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &root_table);
+        config.publication_autocreate_mode = PublicationAutoCreateMode::Filtered;
+        config.publish_via_partition_root = true;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let via_root = client
+            .query_one(
+                "SELECT pubviaroot FROM pg_catalog.pg_publication WHERE pubname = $1",
+                &[&publication],
+            )
+            .await?
+            .get::<_, bool>(0);
+        require(
+            via_root,
+            "publication was not configured via the partition root",
+        )?;
+
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let capture_result: TestResult = async {
+            let snapshot = receive(&mut output).await?;
+            let snapshot_event = snapshot
+                .event
+                .ok_or_else(|| test_error("partition snapshot record has no event"))?;
+            require(
+                snapshot_event.operation == Operation::Read
+                    && snapshot_event.source.table.as_deref() == Some(root_table.as_str()),
+                "partition snapshot was not attributed to the root table",
+            )?;
+            let completion = receive(&mut output).await?;
+            require(
+                completion.boundary == RecordBoundary::SnapshotComplete,
+                "partition snapshot did not complete after its root row",
+            )?;
+            wait_for_active_slot(&client, &slot_name).await?;
+            client
+                .execute(
+                    &format!("INSERT INTO public.{root_table} VALUES (150, 'stream-root')"),
+                    &[],
+                )
+                .await?;
+            loop {
+                let record = receive(&mut output).await?;
+                let Some(event) = record.event else {
+                    continue;
+                };
+                require(
+                    event.operation == Operation::Create
+                        && event.source.table.as_deref() == Some(root_table.as_str())
+                        && event.after.as_ref().and_then(|row| row.get("value"))
+                            == Some(&DataValue::String("stream-root".into())),
+                    "partition WAL event was not attributed to the root table",
+                )?;
+                break;
+            }
+            Ok(())
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)?;
+
+        config.publish_via_partition_root = false;
+        let mut mismatched_source = PostgresSource::new(
+            format!("{connector_name}-mismatch"),
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                ..SnapshotConfig::default()
+            },
+        );
+        let mismatch = mismatched_source.validate().await.unwrap_err();
+        require(
+            mismatch
+                .to_string()
+                .contains("publish_via_partition_root=true")
+                && mismatch
+                    .to_string()
+                    .contains("source.publish_via_partition_root=false"),
+            "existing publication partition-root mismatch was not rejected",
+        )
+    }
+    .await;
+
+    let cleanup_result = cleanup(
+        &client,
+        &publication,
+        &slot_name,
+        &[&first_partition, &second_partition, &root_table],
     )
     .await;
     connection_task.abort();
