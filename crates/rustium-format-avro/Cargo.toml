@@ -1,0 +1,23 @@
+[package]
+name = "rustium-format-avro"
+description = "Rustium Debezium-compatible Avro encoder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+apache-avro.workspace = true
+bytes.workspace = true
+hex.workspace = true
+rustium-core = { path = "../rustium-core" }
+serde_json.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+indexmap.workspace = true
+
+[lints]
+workspace = true

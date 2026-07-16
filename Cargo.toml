@@ -4,6 +4,7 @@ members = [
     "crates/rustium-cli",
     "crates/rustium-config",
     "crates/rustium-core",
+    "crates/rustium-format-avro",
     "crates/rustium-format-json",
     "crates/rustium-mysql",
     "crates/rustium-postgresql",
@@ -24,6 +25,7 @@ repository = "https://github.com/ulnit/rustium"
 authors = ["Rustium Contributors"]
 
 [workspace.dependencies]
+apache-avro = "0.21.0"
 async-trait = "0.1.88"
 axum = "0.8.4"
 base64 = "0.22.1"

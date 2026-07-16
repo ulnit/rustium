@@ -1161,19 +1161,23 @@ impl Default for FormatConfig {
 impl FormatConfig {
     fn validate(&self, sink: &SinkConfig) -> Result<()> {
         match (self.kind, &self.schema_registry) {
-            (FormatType::DebeziumJsonSchema, Some(registry)) => {
+            (FormatType::DebeziumJsonSchema | FormatType::DebeziumAvro, Some(registry)) => {
                 if !matches!(sink, SinkConfig::Kafka { .. }) {
-                    return Err(Error::Configuration(
-                        "format.type=debezium_json_schema requires sink.type=kafka".into(),
-                    ));
+                    return Err(Error::Configuration(format!(
+                        "format.type={} requires sink.type=kafka",
+                        self.kind.as_str()
+                    )));
                 }
                 registry.validate()
             }
-            (FormatType::DebeziumJsonSchema, None) => Err(Error::Configuration(
-                "format.type=debezium_json_schema requires format.schema_registry".into(),
-            )),
+            (FormatType::DebeziumJsonSchema | FormatType::DebeziumAvro, None) => {
+                Err(Error::Configuration(format!(
+                    "format.type={} requires format.schema_registry",
+                    self.kind.as_str()
+                )))
+            }
             (_, Some(_)) => Err(Error::Configuration(
-                "format.schema_registry is only valid with format.type=debezium_json_schema".into(),
+                "format.schema_registry is only valid with a schema-registry format".into(),
             )),
             (_, None) => Ok(()),
         }
@@ -1196,6 +1200,18 @@ pub enum FormatType {
     #[default]
     DebeziumJson,
     DebeziumJsonSchema,
+    DebeziumAvro,
+}
+
+impl FormatType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RustiumJson => "rustium_json",
+            Self::DebeziumJson => "debezium_json",
+            Self::DebeziumJsonSchema => "debezium_json_schema",
+            Self::DebeziumAvro => "debezium_avro",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1770,7 +1786,7 @@ sink:
     }
 
     #[test]
-    fn validates_native_json_schema_registry_format() {
+    fn validates_native_schema_registry_formats() {
         let config = Config::from_yaml(
             r#"
 api_version: rustium.io/v1alpha1
@@ -1817,6 +1833,35 @@ sink:
         )
         .unwrap_err();
         assert!(error.to_string().contains("requires sink.type=kafka"));
+
+        let avro = Config::from_yaml(
+            r#"
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: orders-avro
+source:
+  type: mysql
+  databases: [app]
+  username: rustium
+  password: secret
+format:
+  type: debezium_avro
+  schema_registry:
+    urls: [http://registry:8081]
+    cache_capacity: 32
+sink:
+  type: kafka
+  bootstrap_servers: [kafka:9092]
+  topic_prefix: app
+"#,
+        )
+        .unwrap();
+        assert_eq!(avro.format.kind, FormatType::DebeziumAvro);
+        assert_eq!(
+            avro.format.schema_registry.as_ref().unwrap().cache_capacity,
+            32
+        );
     }
 
     #[test]

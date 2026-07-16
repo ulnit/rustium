@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, env, io, time::Duration};
 
+use apache_avro::{Schema, from_avro_datum, types::Value as AvroValue};
 use chrono::Utc;
 use rdkafka::{
     ClientConfig, Message,
@@ -12,6 +13,7 @@ use rustium_core::{
     ChangeEvent, DataValue, DeliveryBatch, EncodedEvent, EventEncoder, EventId, EventSchema,
     FieldSchema, MySqlPosition, Operation, Sink, SourceMetadata, SourcePosition,
 };
+use rustium_format_avro::{AvroEncoderConfig, DebeziumAvroEncoder};
 use rustium_format_json::{DebeziumJsonSchemaEncoder, JsonEncoderConfig};
 use rustium_sink_kafka::{KafkaSink, SchemaRegistrySettings};
 use schema_registry_converter::{
@@ -338,6 +340,198 @@ async fn registers_evolves_and_delivers_json_schema_records() -> TestResult {
     outcome
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external Kafka-compatible broker and Schema Registry"]
+async fn registers_evolves_and_delivers_avro_records() -> TestResult {
+    let bootstrap_servers = required_env("RUSTIUM_KAFKA_TEST_BOOTSTRAP_SERVERS")?;
+    let registry_url = required_env("RUSTIUM_SCHEMA_REGISTRY_TEST_URL")?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let topic_prefix = format!("rustium-avro-{}", &suffix[..12]);
+    let topic = format!("{topic_prefix}.app.customers");
+    let group_id = format!("rustium-avro-observer-{}", &suffix[..12]);
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap_servers)
+        .create()?;
+    let topic_spec = NewTopic::new(&topic, 1, TopicReplication::Fixed(1));
+    let created = admin
+        .create_topics(
+            [&topic_spec],
+            &AdminOptions::new().operation_timeout(Some(Duration::from_secs(10))),
+        )
+        .await?;
+    require(
+        matches!(created.as_slice(), [Ok(created)] if created == &topic),
+        "Avro test topic was not created",
+    )?;
+
+    let outcome = async {
+        let properties = BTreeMap::from([("allow.auto.create.topics".into(), "false".into())]);
+        let mut sink = KafkaSink::new(
+            &[bootstrap_servers.clone()],
+            "all",
+            "none",
+            Duration::from_secs(5),
+            &properties,
+        )?
+        .with_schema_registry(SchemaRegistrySettings {
+            urls: vec![registry_url.clone()],
+            username: None,
+            password: None,
+            request_timeout: Duration::from_secs(5),
+            cache_capacity: 128,
+        })?;
+        sink.validate().await?;
+
+        let encoder = DebeziumAvroEncoder::new(AvroEncoderConfig {
+            topic_prefix: topic_prefix.clone(),
+            unavailable_value: "__debezium_unavailable_value".into(),
+            tombstones_on_delete: true,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
+            schema_cache_capacity: 128,
+        })?;
+        let first = encoder.encode(&schema_change_event(&topic_prefix, 1, 11, None))?;
+        let second = encoder.encode(&schema_change_event(
+            &topic_prefix,
+            2,
+            12,
+            Some("bob@example.com"),
+        ))?;
+        let mut deleted_event = schema_change_event(&topic_prefix, 2, 13, Some("bob@example.com"));
+        deleted_event.operation = Operation::Delete;
+        deleted_event.before = deleted_event.after.take();
+        let deleted = encoder.encode_batch(&deleted_event)?;
+        require(
+            deleted.len() == 2,
+            "Avro delete did not produce envelope plus tombstone",
+        )?;
+        let mut events = vec![first, second];
+        events.extend(deleted);
+        sink.write(&DeliveryBatch {
+            events,
+            highest_position: position(14),
+        })
+        .await?;
+        sink.flush().await?;
+
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &bootstrap_servers)
+            .set("group.id", &group_id)
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()?;
+        consumer.subscribe(&[&topic])?;
+        let mut messages = Vec::new();
+        for _ in 0..4 {
+            messages.push(
+                tokio::time::timeout(Duration::from_secs(10), consumer.recv())
+                    .await??
+                    .detach(),
+            );
+        }
+
+        let first_key = messages[0]
+            .key()
+            .ok_or_else(|| test_error("first Avro record lost its key"))?;
+        let second_key = messages[1]
+            .key()
+            .ok_or_else(|| test_error("second Avro record lost its key"))?;
+        let first_value = messages[0]
+            .payload()
+            .ok_or_else(|| test_error("first Avro record lost its payload"))?;
+        let second_value = messages[1]
+            .payload()
+            .ok_or_else(|| test_error("second Avro record lost its payload"))?;
+        let delete_key = messages[2]
+            .key()
+            .ok_or_else(|| test_error("Avro delete envelope lost its key"))?;
+        let tombstone_key = messages[3]
+            .key()
+            .ok_or_else(|| test_error("Avro tombstone lost its key"))?;
+        require(
+            messages[3].payload().is_none(),
+            "Avro tombstone is not null",
+        )?;
+        let key_id = framed_schema_id(first_key)?;
+        require(
+            framed_schema_id(second_key)? == key_id
+                && framed_schema_id(delete_key)? == key_id
+                && framed_schema_id(tombstone_key)? == key_id,
+            "stable Avro key schema did not reuse its registry ID",
+        )?;
+        let value_v1_id = framed_schema_id(first_value)?;
+        let value_v2_id = framed_schema_id(second_value)?;
+        let delete_value = messages[2]
+            .payload()
+            .ok_or_else(|| test_error("Avro delete envelope lost its payload"))?;
+        require(
+            value_v1_id != value_v2_id,
+            "evolved Avro value schema did not receive a new registry ID",
+        )?;
+        require(
+            framed_schema_id(delete_value)? == value_v2_id,
+            "Avro delete envelope did not reuse the latest value schema",
+        )?;
+
+        let settings = SrSettings::new(registry_url.clone());
+        let registered_key = get_schema_by_id(key_id, &settings).await?;
+        let registered_v1 = get_schema_by_id(value_v1_id, &settings).await?;
+        let registered_v2 = get_schema_by_id(value_v2_id, &settings).await?;
+        require(
+            registered_key.schema_type == SchemaType::Avro
+                && registered_v1.schema_type == SchemaType::Avro
+                && registered_v2.schema_type == SchemaType::Avro,
+            "registry did not preserve Avro schema types",
+        )?;
+        let first_decoded = framed_avro(first_value, &registered_v1.schema)?;
+        let second_decoded = framed_avro(second_value, &registered_v2.schema)?;
+        let delete_decoded = framed_avro(delete_value, &registered_v2.schema)?;
+        require(
+            avro_field(avro_union(avro_field(&first_decoded, "after")?)?, "id")?
+                == &AvroValue::Long(11),
+            "first framed Avro value changed",
+        )?;
+        require(
+            avro_union(avro_field(
+                avro_union(avro_field(&second_decoded, "after")?)?,
+                "email",
+            )?)? == &AvroValue::String("bob@example.com".into()),
+            "evolved framed Avro value changed",
+        )?;
+        require(
+            avro_field(&delete_decoded, "op")? == &AvroValue::String("d".into()),
+            "Avro delete envelope operation changed",
+        )?;
+        let latest = get_schema_by_subject(
+            &settings,
+            &SubjectNameStrategy::TopicNameStrategy(topic.clone(), false),
+        )
+        .await?;
+        require(
+            latest.id == value_v2_id,
+            "latest Avro value subject does not point at the evolved schema",
+        )?;
+        sink.shutdown().await?;
+        TestResult::Ok(())
+    }
+    .await;
+
+    let deleted = admin
+        .delete_topics(
+            &[&topic],
+            &AdminOptions::new().operation_timeout(Some(Duration::from_secs(10))),
+        )
+        .await;
+    if outcome.is_ok() {
+        let deleted = deleted?;
+        require(
+            matches!(deleted.as_slice(), [Ok(deleted)] if deleted == &topic),
+            "Avro test topic was not deleted",
+        )?;
+    }
+    outcome
+}
+
 fn encoded_event(id: &str, destination: &str, payload: Option<&'static [u8]>) -> EncodedEvent {
     EncodedEvent {
         id: EventId(id.into()),
@@ -432,6 +626,29 @@ fn schema_change_event(
 fn framed_json(value: &[u8]) -> TestResult<serde_json::Value> {
     framed_schema_id(value)?;
     Ok(serde_json::from_slice(&value[5..])?)
+}
+
+fn framed_avro(value: &[u8], definition: &str) -> TestResult<AvroValue> {
+    framed_schema_id(value)?;
+    let schema = Schema::parse_str(definition)?;
+    Ok(from_avro_datum(&schema, &mut &value[5..], None)?)
+}
+
+fn avro_field<'a>(value: &'a AvroValue, name: &str) -> TestResult<&'a AvroValue> {
+    let AvroValue::Record(fields) = value else {
+        return Err(test_error("decoded Avro value is not a record"));
+    };
+    fields
+        .iter()
+        .find_map(|(field, value)| (field == name).then_some(value))
+        .ok_or_else(|| test_error(&format!("decoded Avro record has no {name:?} field")))
+}
+
+fn avro_union(value: &AvroValue) -> TestResult<&AvroValue> {
+    let AvroValue::Union(_, value) = value else {
+        return Err(test_error("decoded Avro value is not a union"));
+    };
+    Ok(value)
 }
 
 fn position(event_serial: u64) -> SourcePosition {

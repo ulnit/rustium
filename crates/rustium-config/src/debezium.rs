@@ -695,6 +695,7 @@ fn assemble_config(
 fn format_config(properties: &BTreeMap<String, String>) -> Result<FormatConfig> {
     const JSON_CONVERTER: &str = "org.apache.kafka.connect.json.JsonConverter";
     const JSON_SCHEMA_CONVERTER: &str = "io.confluent.connect.json.JsonSchemaConverter";
+    const AVRO_CONVERTER: &str = "io.confluent.connect.avro.AvroConverter";
 
     let key_converter = properties
         .get("key.converter")
@@ -716,10 +717,27 @@ fn format_config(properties: &BTreeMap<String, String>) -> Result<FormatConfig> 
             schema_registry: None,
         });
     }
-    if key_converter != JSON_SCHEMA_CONVERTER || value_converter != JSON_SCHEMA_CONVERTER {
+    let kind = if key_converter == JSON_SCHEMA_CONVERTER && value_converter == JSON_SCHEMA_CONVERTER
+    {
+        FormatType::DebeziumJsonSchema
+    } else if key_converter == AVRO_CONVERTER && value_converter == AVRO_CONVERTER {
+        FormatType::DebeziumAvro
+    } else {
         return Err(Error::Configuration(format!(
-            "Rustium requires matching key.converter and value.converter values; supported pairs are {JSON_CONVERTER:?} and {JSON_SCHEMA_CONVERTER:?}, got {key_converter:?} and {value_converter:?}"
+            "Rustium requires matching key.converter and value.converter values; supported pairs are {JSON_CONVERTER:?}, {JSON_SCHEMA_CONVERTER:?}, and {AVRO_CONVERTER:?}, got {key_converter:?} and {value_converter:?}"
         )));
+    };
+
+    if kind == FormatType::DebeziumAvro {
+        for property in ["schema.name.adjustment.mode", "field.name.adjustment.mode"] {
+            if let Some(mode) = properties.get(property)
+                && mode != "avro"
+            {
+                return Err(Error::Configuration(format!(
+                    "{property}={mode:?} is not implemented for Avro; Rustium uses deterministic avro adjustment"
+                )));
+            }
+        }
     }
 
     let key_urls = required(properties, "key.converter.schema.registry.url")?;
@@ -787,7 +805,7 @@ fn format_config(properties: &BTreeMap<String, String>) -> Result<FormatConfig> 
     };
 
     Ok(FormatConfig {
-        kind: FormatType::DebeziumJsonSchema,
+        kind,
         unavailable_value,
         tombstones_on_delete,
         schema_registry: Some(SchemaRegistryConfig {
@@ -1103,6 +1121,8 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "value.converter.basic.auth.credentials.source",
         "key.converter.basic.auth.user.info",
         "value.converter.basic.auth.user.info",
+        "schema.name.adjustment.mode",
+        "field.name.adjustment.mode",
         "heartbeat.interval.ms",
         "heartbeat.action.query",
         "heartbeat.topics.prefix",
@@ -1779,6 +1799,58 @@ rustium.schema.registry.cache.capacity=64
         assert!(!config.compatibility_warnings.iter().any(|warning| {
             warning.contains("converter") || warning.contains("schema.registry")
         }));
+    }
+
+    #[test]
+    fn maps_confluent_avro_converters_and_rejects_unsafe_adjustment() {
+        let config = parse(
+            r#"
+name=inventory
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+rustium.sink.type=kafka
+rustium.kafka.bootstrap.servers=kafka:9092
+key.converter=io.confluent.connect.avro.AvroConverter
+key.converter.schema.registry.url=http://registry:8081
+key.converter.auto.register.schemas=true
+value.converter=io.confluent.connect.avro.AvroConverter
+value.converter.schema.registry.url=http://registry:8081
+value.converter.auto.register.schemas=true
+schema.name.adjustment.mode=avro
+field.name.adjustment.mode=avro
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.format.kind, FormatType::DebeziumAvro);
+        assert_eq!(
+            config.format.schema_registry.as_ref().unwrap().urls,
+            ["http://registry:8081"]
+        );
+        assert!(!config.compatibility_warnings.iter().any(|warning| {
+            warning.contains("converter") || warning.contains("name.adjustment.mode")
+        }));
+
+        let error = parse(
+            r#"
+name=inventory
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+key.converter=io.confluent.connect.avro.AvroConverter
+key.converter.schema.registry.url=http://registry:8081
+value.converter=io.confluent.connect.avro.AvroConverter
+value.converter.schema.registry.url=http://registry:8081
+field.name.adjustment.mode=none
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("field.name.adjustment.mode"));
     }
 
     #[test]

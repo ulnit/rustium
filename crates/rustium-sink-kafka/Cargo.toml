@@ -18,8 +18,10 @@ tokio.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+apache-avro.workspace = true
 chrono.workspace = true
 mockito.workspace = true
+rustium-format-avro = { path = "../rustium-format-avro" }
 rustium-format-json = { path = "../rustium-format-json" }
 serde_json.workspace = true
 uuid.workspace = true

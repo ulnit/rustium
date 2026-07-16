@@ -6,6 +6,7 @@ use rustium_core::{
     CheckpointStore, ConnectorIdentity, ConnectorRuntime, EventEncoder, Result, RuntimeConfig,
     RuntimeStatus, Sink, SourceConnector,
 };
+use rustium_format_avro::{AvroEncoderConfig, DebeziumAvroEncoder};
 use rustium_format_json::{
     DebeziumJsonEncoder, DebeziumJsonSchemaEncoder, JsonEncoderConfig, RustiumJsonEncoder,
 };
@@ -238,7 +239,7 @@ async fn reset_state(config: Config, confirm: bool) -> Result<()> {
 async fn build_runtime(config: &Config, status: RuntimeStatus) -> Result<ConnectorRuntime> {
     let identity = ConnectorIdentity::new(&config.metadata.name);
     let source = build_source(config)?;
-    let encoder = build_encoder(config);
+    let encoder = build_encoder(config)?;
     let sink = build_sink(config)?;
     let checkpoint_store: Arc<dyn CheckpointStore> =
         Arc::new(SqliteCheckpointStore::open(&config.state.path).await?);
@@ -292,7 +293,7 @@ fn build_source(config: &Config) -> Result<Box<dyn SourceConnector>> {
     }
 }
 
-fn build_encoder(config: &Config) -> Arc<dyn EventEncoder> {
+fn build_encoder(config: &Config) -> Result<Arc<dyn EventEncoder>> {
     let (heartbeat_topics_prefix, heartbeat_topic_name) = match &config.source {
         SourceConfig::Postgresql(source) => (
             source.heartbeat_topics_prefix.clone(),
@@ -311,14 +312,26 @@ fn build_encoder(config: &Config) -> Arc<dyn EventEncoder> {
         topic_prefix: config.sink.topic_prefix().into(),
         unavailable_value: config.format.unavailable_value.clone(),
         tombstones_on_delete: config.format.tombstones_on_delete,
-        heartbeat_topics_prefix,
-        heartbeat_topic_name,
+        heartbeat_topics_prefix: heartbeat_topics_prefix.clone(),
+        heartbeat_topic_name: heartbeat_topic_name.clone(),
     };
-    match config.format.kind {
+    Ok(match config.format.kind {
         FormatType::RustiumJson => Arc::new(RustiumJsonEncoder::new(encoder_config)),
         FormatType::DebeziumJson => Arc::new(DebeziumJsonEncoder::new(encoder_config)),
         FormatType::DebeziumJsonSchema => Arc::new(DebeziumJsonSchemaEncoder::new(encoder_config)),
-    }
+        FormatType::DebeziumAvro => Arc::new(DebeziumAvroEncoder::new(AvroEncoderConfig {
+            topic_prefix: config.sink.topic_prefix().into(),
+            unavailable_value: config.format.unavailable_value.clone(),
+            tombstones_on_delete: config.format.tombstones_on_delete,
+            heartbeat_topics_prefix,
+            heartbeat_topic_name,
+            schema_cache_capacity: config
+                .format
+                .schema_registry
+                .as_ref()
+                .map_or(1_000, |registry| registry.cache_capacity),
+        })?),
+    })
 }
 
 fn build_sink(config: &Config) -> Result<Box<dyn Sink>> {
