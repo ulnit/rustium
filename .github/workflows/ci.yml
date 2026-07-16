@@ -80,3 +80,24 @@ jobs:
         run: >-
           cargo test -p rustium-sqlserver --test sqlserver_docker --locked --
           snapshots_and_streams_cdc_changes --ignored --exact --nocapture
+
+  kafka-sink:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            libcurl4-openssl-dev \
+            libsasl2-dev \
+            libssl-dev \
+            pkg-config
+      - name: Test Kafka Sink against a real broker
+        run: bash scripts/test-kafka-sink.sh

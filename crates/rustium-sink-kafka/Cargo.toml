@@ -14,5 +14,12 @@ rdkafka.workspace = true
 rustium-core = { path = "../rustium-core" }
 tokio.workspace = true
 
+[dev-dependencies]
+uuid.workspace = true
+
 [lints]
 workspace = true
+
+[[test]]
+name = "kafka_external"
+path = "tests/kafka_external.rs"

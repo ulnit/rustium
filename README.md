@@ -40,7 +40,7 @@ The repository contains a runnable alpha implementation.
 | SQLite checkpoint v2 with versioned connector state | Implemented and unit tested; v1 JSON remains readable |
 | Native JSON and Debezium-compatible JSON, including delete tombstones | Implemented |
 | stdout sink | Implemented |
-| Kafka sink with idempotent producer settings | Implemented; end-to-end Kafka test pending |
+| Kafka sink with idempotent producer settings | Implemented; real-broker delivery and failure gate enforced by CI |
 | PostgreSQL 14+ snapshot, `pgoutput`, persistent schema history, heartbeat records, multi-channel signaling, incremental snapshots, and core type matrix | Implemented; external gates pass with PostgreSQL 17 |
 | MySQL 8+ snapshot, row-binlog streaming, GTID source filters, persistent schema history, and heartbeat records | Implemented; Docker and external GTID recovery/heartbeat gates pass with MySQL 8.4 |
 | SQL Server CDC | Implemented; external integration test passes with SQL Server 2022 Developer CU25 |
@@ -135,6 +135,12 @@ Run the reproducible PostgreSQL 17 extension gate locally with Docker:
 
 ```bash
 bash scripts/test-postgresql-extensions.sh
+```
+
+Run the required Kafka Sink gate with Docker. It starts an isolated real broker, verifies ordered key/payload/header delivery and a true null tombstone, rejects delivery to a missing topic, and removes the broker afterward. Set `RUSTIUM_KAFKA_TEST_PORT` when port `19092` is already occupied.
+
+```bash
+bash scripts/test-kafka-sink.sh
 ```
 
 Run the WAL-retention fixture separately when the PostgreSQL test account is a superuser and the instance is isolated:
@@ -546,7 +552,9 @@ Available encoders:
 Available sinks:
 
 - `stdout`: development and protocol inspection
-- `kafka`: `librdkafka`, configurable acknowledgements/compression/properties, and idempotence when durable acknowledgements are selected
+- `kafka`: `librdkafka`, replicated acknowledgements, configurable compression/properties, and idempotent delivery
+
+The Kafka Sink accepts only `acks=all` or its `-1` alias because Rustium checkpoints immediately after a successful batch. Allowing `acks=0/1` would acknowledge source progress before Kafka replication and could lose already-checkpointed records. Rustium always enables producer idempotence and owns `bootstrap.servers`, acknowledgement, compression, idempotence, and delivery-timeout properties; those keys cannot be replaced through `sink.properties` or `rustium.kafka.property.*`. Security, batching, and other non-conflicting librdkafka properties remain pass-through. The required real-broker CI gate verifies ordered keys, payloads, headers, true null tombstones, topic cleanup, and an explicit error when broker delivery cannot complete.
 
 ### Management API
 
@@ -604,7 +612,7 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 | 带版本化连接器状态的 SQLite checkpoint v2 | 已实现并通过单元测试；仍可读取 v1 JSON |
 | 原生 JSON 与 Debezium 兼容 JSON，包括 delete tombstone | 已实现 |
 | stdout Sink | 已实现 |
-| 带幂等 Producer 设置的 Kafka Sink | 已实现；Kafka 端到端测试待补 |
+| 带幂等 Producer 设置的 Kafka Sink | 已实现；CI 强制运行真实 broker 投递与失败门槛 |
 | PostgreSQL 14+ 快照、`pgoutput`、持久 schema history、heartbeat record、多 channel 信号、增量快照和核心类型矩阵 | 已实现；PostgreSQL 17 外部门槛通过 |
 | MySQL 8+ 快照、行级 binlog、GTID source 过滤、持久 schema history 和 heartbeat record | 已实现；MySQL 8.4 Docker、外部 GTID 恢复和 heartbeat 门槛通过 |
 | SQL Server CDC | 已实现；SQL Server 2022 Developer CU25 外部集成测试通过 |
@@ -699,6 +707,12 @@ cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocap
 
 ```bash
 bash scripts/test-postgresql-extensions.sh
+```
+
+使用 Docker 运行必须通过的 Kafka Sink 门槛。它会启动隔离的真实 broker，验证 key/payload/header 有序投递与真正的 null tombstone，验证不存在 topic 的投递失败，最后删除 broker。端口 `19092` 已被占用时设置 `RUSTIUM_KAFKA_TEST_PORT`。
+
+```bash
+bash scripts/test-kafka-sink.sh
 ```
 
 可对可访问的明文 Kafka-compatible endpoint 运行可选的真实 broker 信号门槛。测试会创建并删除唯一命名的单 partition topic：
@@ -1102,7 +1116,9 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 可用 Sink：
 
 - `stdout`：用于开发和协议检查
-- `kafka`：基于 `librdkafka`，支持可配置确认、压缩和属性；选择持久确认时启用幂等能力
+- `kafka`：基于 `librdkafka`，使用副本确认，支持可配置压缩/属性和幂等投递
+
+Kafka Sink 只接受 `acks=all` 或等价别名 `-1`，因为 Rustium 会在 batch 成功后立即 checkpoint。允许 `acks=0/1` 会在 Kafka 完成副本写入前确认源端进度，可能丢失已 checkpoint 的 record。Rustium 始终启用 Producer 幂等，并拥有 `bootstrap.servers`、确认、压缩、幂等和投递超时参数；不能通过 `sink.properties` 或 `rustium.kafka.property.*` 覆盖这些 key。安全、batch 和其他不冲突的 librdkafka 属性仍可透传。必须通过的真实 broker CI 门槛会验证有序 key、payload、header、真正的 null tombstone、topic 清理，以及 broker 无法完成投递时的显式错误。
 
 ### 管理 API
 

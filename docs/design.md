@@ -61,7 +61,7 @@ The workspace contains a runnable alpha service.
 | Bounded Tokio runtime | Implemented |
 | SQLite checkpoint v2 and connector state | Implemented; version 1 JSON remains readable |
 | Native and Debezium JSON | Implemented |
-| stdout and Kafka sinks | Implemented |
+| stdout and Kafka sinks | Implemented; Kafka real-broker delivery/failure gate enforced by CI |
 | PostgreSQL source | Implemented; recovery, heartbeat/action-query, writable/read-only incremental-snapshot, and core type-matrix gates pass with PostgreSQL 17 |
 | MySQL source | Implemented; Docker and external GTID/destructive-DDL restart gates pass with MySQL 8.4 |
 | SQL Server source | Implemented and externally integration-tested with SQL Server 2022 Developer CU25 |
@@ -379,7 +379,7 @@ The native JSON encoder exposes the full typed source position and event schema.
 
 With `tombstones.on.delete=true`, which is the Debezium-compatible default, encoding one delete produces an ordered pair in the same delivery batch: the delete envelope followed by the same key with a null payload. The tombstone has its own deterministic derived event ID. Sink success, checkpoint persistence, and source acknowledgement cover both records together. Native YAML exposes the same setting as `format.tombstones_on_delete`; the native Rustium JSON format does not emit tombstones.
 
-stdout is best-effort and intended for development; it prints tombstones as a `null` line. Kafka uses `librdkafka`, sends tombstones as a true null value, supports configurable producer properties and durable acknowledgements, and enables idempotence when acknowledgement settings allow it. Producer idempotence does not make source-to-Kafka delivery exactly-once.
+stdout is best-effort and intended for development; it prints tombstones as a `null` line. Kafka uses `librdkafka`, sends tombstones as a true null value, and requires `acks=all` or `-1` so `write` returns only after replica acknowledgement. Producer idempotence is always enabled. Rustium owns bootstrap, acknowledgement, compression, idempotence, and delivery-timeout properties; pass-through properties cannot replace these durability settings. Producer idempotence does not make source-to-Kafka delivery exactly-once.
 
 ### 13. Control Plane and Observability
 
@@ -470,6 +470,12 @@ RUSTIUM_KAFKA_TEST_BOOTSTRAP_SERVERS=kafka.example.com:9092 \
 cargo test -p rustium-signal-kafka --test kafka_external -- --ignored --nocapture
 ```
 
+The required Kafka Sink gate starts an isolated Redpanda broker, creates a unique single-partition topic, and verifies ordered keys, payloads, headers, a true null tombstone, successful flush, topic cleanup, and an explicit delivery error for a missing topic with automatic creation disabled:
+
+```bash
+bash scripts/test-kafka-sink.sh
+```
+
 The ignored external SQL Server test reads connection settings from the environment and does not contain repository credentials:
 
 ```bash
@@ -492,9 +498,9 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. Roadmap
 
-1. Add real-broker Kafka Sink delivery and failure-path gates.
-2. Only then consider additional databases.
-3. Add Schema Registry formats, packaging, security policy, operational runbooks, and stable upgrade migrations before `1.0`.
+1. Add general bounded Source/Sink retry orchestration and long-running backpressure/reconnect gates.
+2. Add Schema Registry formats, packaging, security policy, operational runbooks, and stable upgrade migrations before `1.0`.
+3. Consider additional databases only after the current three connectors and shared runtime pass the `1.0` gates.
 
 ---
 
@@ -547,7 +553,7 @@ Workspace 已包含可运行的 alpha 服务。
 | 有界 Tokio 运行时 | 已实现 |
 | SQLite checkpoint v2 与连接器状态 | 已实现；仍可读取 version 1 JSON |
 | 原生和 Debezium JSON | 已实现 |
-| stdout 和 Kafka Sink | 已实现 |
+| stdout 和 Kafka Sink | 已实现；CI 强制运行 Kafka 真实 broker 投递/失败门槛 |
 | PostgreSQL Source | 已实现；PostgreSQL 17 恢复、heartbeat/action-query、可写/只读增量快照和核心类型矩阵门槛通过 |
 | MySQL Source | 已实现；MySQL 8.4 Docker 和外部 GTID/破坏性 DDL 重启门槛通过 |
 | SQL Server Source | 已实现并通过 SQL Server 2022 Developer CU25 外部集成测试 |
@@ -865,7 +871,7 @@ SQL Server 支持 Debezium 兼容的 source table、file、有界 in-process 和
 
 `tombstones.on.delete=true` 是 Debezium 兼容默认值。此时一条 delete 会在同一投递批次中编码为有序的两条记录：先发送 delete envelope，再发送 key 相同、payload 为 null 的 tombstone。tombstone 使用独立的确定性派生事件 ID；两条记录共同受 Sink 成功、checkpoint 持久化和 Source 确认约束。原生 YAML 使用 `format.tombstones_on_delete`；原生 Rustium JSON 格式不产生 tombstone。
 
-stdout 是 best-effort，仅用于开发，并将 tombstone 输出为一行 `null`。Kafka 使用 `librdkafka`，将 tombstone 发送为真正的 null value，支持可配置 Producer 属性和持久确认，并在确认设置允许时启用幂等。Producer 幂等并不会把 Source 到 Kafka 变为 exactly-once。
+stdout 是 best-effort，仅用于开发，并将 tombstone 输出为一行 `null`。Kafka 使用 `librdkafka`，将 tombstone 发送为真正的 null value，并要求 `acks=all` 或 `-1`，使 `write` 只在副本确认后返回。Producer 幂等始终启用。Rustium 拥有 bootstrap、确认、压缩、幂等和投递超时参数，透传属性不能替换这些持久性设置。Producer 幂等并不会把 Source 到 Kafka 变为 exactly-once。
 
 ### 13. 控制平面与可观测性
 
@@ -956,6 +962,12 @@ RUSTIUM_KAFKA_TEST_BOOTSTRAP_SERVERS=kafka.example.com:9092 \
 cargo test -p rustium-signal-kafka --test kafka_external -- --ignored --nocapture
 ```
 
+必须通过的 Kafka Sink 门槛会启动隔离的 Redpanda broker，创建唯一命名的单 partition topic，并验证有序 key、payload、header、真正的 null tombstone、成功 flush、topic 清理，以及关闭自动建 topic 时向不存在 topic 投递产生的显式错误：
+
+```bash
+bash scripts/test-kafka-sink.sh
+```
+
 被忽略的 SQL Server 外部测试从环境变量读取连接配置，仓库中不包含测试凭据：
 
 ```bash
@@ -978,6 +990,6 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. 路线图
 
-1. 补齐真实 broker Kafka Sink 投递与失败路径门槛。
-2. 只有完成前一项后才考虑其他数据库。
-3. 在 `1.0` 前补 Schema Registry 格式、打包、安全策略、运维手册和稳定升级迁移。
+1. 增加通用、有界的 Source/Sink 重试协调，以及长时间背压/重连门槛。
+2. 在 `1.0` 前补 Schema Registry 格式、打包、安全策略、运维手册和稳定升级迁移。
+3. 只有当当前三个连接器和共享运行时通过 `1.0` 门槛后，才考虑更多数据库。

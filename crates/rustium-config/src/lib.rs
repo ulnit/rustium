@@ -1171,6 +1171,8 @@ impl SinkConfig {
                 bootstrap_servers,
                 topic_prefix,
                 acks,
+                delivery_timeout,
+                properties,
                 ..
             } => {
                 if bootstrap_servers.is_empty()
@@ -1182,10 +1184,36 @@ impl SinkConfig {
                         "sink.bootstrap_servers must contain at least one server".into(),
                     ));
                 }
-                if !matches!(acks.as_str(), "all" | "-1" | "0" | "1") {
+                if !matches!(acks.as_str(), "all" | "-1") {
                     return Err(Error::Configuration(
-                        "sink.acks must be one of all, -1, 0, or 1".into(),
+                        "sink.acks must be all or -1 so Kafka replicates a batch before checkpointing"
+                            .into(),
                     ));
+                }
+                if delivery_timeout.is_zero() || delivery_timeout.as_millis() > i32::MAX as u128 {
+                    return Err(Error::Configuration(format!(
+                        "sink.delivery_timeout must be between 1 and {} milliseconds",
+                        i32::MAX
+                    )));
+                }
+                const RESERVED: &[&str] = &[
+                    "acks",
+                    "bootstrap.servers",
+                    "compression.codec",
+                    "compression.type",
+                    "delivery.timeout.ms",
+                    "enable.idempotence",
+                    "message.timeout.ms",
+                    "metadata.broker.list",
+                    "request.required.acks",
+                ];
+                if let Some(property) = properties
+                    .keys()
+                    .find(|property| RESERVED.contains(&property.as_str()))
+                {
+                    return Err(Error::Configuration(format!(
+                        "sink.properties key {property:?} is managed by Rustium and cannot be overridden"
+                    )));
                 }
                 validate_name(topic_prefix, "sink.topic_prefix")
             }
@@ -1601,6 +1629,34 @@ sink:
         )
         .unwrap();
         assert!(!config.format.tombstones_on_delete);
+    }
+
+    #[test]
+    fn rejects_non_durable_kafka_sink_settings() {
+        let kafka = CONFIG.replace(
+            "sink:\n  type: stdout\n  topic_prefix: app",
+            "sink:\n  type: kafka\n  bootstrap_servers: [127.0.0.1:9092]\n  topic_prefix: app\n  acks: all\n  delivery_timeout: 3s",
+        );
+        Config::from_yaml(&kafka).unwrap();
+
+        let acknowledgements = Config::from_yaml(&kafka.replace("acks: all", "acks: '1'"))
+            .expect_err("non-durable Kafka acknowledgements must fail");
+        assert!(acknowledgements.to_string().contains("sink.acks"));
+
+        let timeout =
+            Config::from_yaml(&kafka.replace("delivery_timeout: 3s", "delivery_timeout: 0s"))
+                .expect_err("zero Kafka delivery timeout must fail");
+        assert!(timeout.to_string().contains("sink.delivery_timeout"));
+
+        let override_property = Config::from_yaml(&format!(
+            "{kafka}\n  properties:\n    enable.idempotence: 'false'\n"
+        ))
+        .expect_err("managed Kafka producer property must fail");
+        assert!(
+            override_property
+                .to_string()
+                .contains("cannot be overridden")
+        );
     }
 
     #[test]
