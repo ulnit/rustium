@@ -10,6 +10,7 @@ use rustium_format_avro::{AvroEncoderConfig, DebeziumAvroEncoder};
 use rustium_format_json::{
     DebeziumJsonEncoder, DebeziumJsonSchemaEncoder, JsonEncoderConfig, RustiumJsonEncoder,
 };
+use rustium_format_protobuf::{DebeziumProtobufEncoder, ProtobufEncoderConfig};
 use rustium_mysql::MySqlSource;
 use rustium_postgresql::PostgresSource;
 use rustium_signal_kafka::KafkaSignalChannel;
@@ -331,6 +332,20 @@ fn build_encoder(config: &Config) -> Result<Arc<dyn EventEncoder>> {
                 .as_ref()
                 .map_or(1_000, |registry| registry.cache_capacity),
         })?),
+        FormatType::DebeziumProtobuf => {
+            Arc::new(DebeziumProtobufEncoder::new(ProtobufEncoderConfig {
+                topic_prefix: config.sink.topic_prefix().into(),
+                unavailable_value: config.format.unavailable_value.clone(),
+                tombstones_on_delete: config.format.tombstones_on_delete,
+                heartbeat_topics_prefix,
+                heartbeat_topic_name,
+                schema_cache_capacity: config
+                    .format
+                    .schema_registry
+                    .as_ref()
+                    .map_or(1_000, |registry| registry.cache_capacity),
+            })?)
+        }
     })
 }
 

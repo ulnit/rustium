@@ -60,7 +60,7 @@ The workspace contains a runnable alpha service.
 | Core event/position/runtime traits | Implemented |
 | Bounded Tokio runtime | Implemented; required 256-cycle backpressure/retry soak enforced by CI |
 | SQLite checkpoint v2 and connector state | Implemented; version 1 JSON remains readable |
-| Native JSON, Debezium JSON, Confluent-framed JSON Schema, and Avro | Implemented; real Registry/Kafka gates enforced by CI |
+| Native JSON, Debezium JSON, Confluent-framed JSON Schema, Avro, and Protobuf | Implemented; real Registry/Kafka gates enforced by CI |
 | stdout and Kafka sinks | Implemented; Kafka real-broker delivery/failure gate enforced by CI |
 | PostgreSQL source | Implemented; recovery, heartbeat/action-query, writable/read-only incremental-snapshot, and core type-matrix gates pass with PostgreSQL 17 |
 | MySQL source | Implemented; required Docker CI and external MySQL 8.4 recovery/soak gates pass |
@@ -95,6 +95,7 @@ crates/
 |-- rustium-sqlserver/     SQL Server CDC source
 |-- rustium-format-avro/   Debezium-compatible Avro schema and datum encoding
 |-- rustium-format-json/   native JSON, Debezium JSON, and JSON Schema descriptors
+|-- rustium-format-protobuf/ Debezium-compatible Protobuf schema and message encoding
 |-- rustium-sink-stdout/   development sink
 |-- rustium-sink-kafka/    durable Kafka producer sink
 |-- rustium-signal-kafka/  checkpoint-coupled Kafka signal input
@@ -199,7 +200,7 @@ Rustium supports:
 
 The native root schema is `api_version: rustium.io/v1alpha1`, `kind: Connector`.
 
-Debezium names are preferred for migration. Common mappings include `name`, `connector.class`, `topic.prefix`, `database.*`, `table.include.list`, `table.exclude.list`, `snapshot.mode`, `snapshot.fetch.size`, `tombstones.on.delete`, `max.queue.size`, `max.batch.size`, and `poll.interval.ms`. Matching Confluent `JsonSchemaConverter` and `AvroConverter` key/value settings map to `debezium_json_schema` and `debezium_avro`. Both use one shared `schema.registry.url` list, `USER_INFO` basic authentication, automatic registration, request timeout, and bounded ID caches. Avro schema/field adjustment is deterministic and adjusted-name collisions fail encoding. Unsupported converter asymmetry, adjustment mode, or subject/version selection fails validation.
+Debezium names are preferred for migration. Common mappings include `name`, `connector.class`, `topic.prefix`, `database.*`, `table.include.list`, `table.exclude.list`, `snapshot.mode`, `snapshot.fetch.size`, `tombstones.on.delete`, `max.queue.size`, `max.batch.size`, and `poll.interval.ms`. Matching Confluent `JsonSchemaConverter`, `AvroConverter`, and `ProtobufConverter` key/value settings map to `debezium_json_schema`, `debezium_avro`, and `debezium_protobuf`. All three use one shared `schema.registry.url` list, `USER_INFO` basic authentication, automatic registration, request timeout, and bounded ID caches. Avro schema/field adjustment is deterministic and adjusted-name collisions fail encoding. Protobuf always scrubs invalid names and rejects options that would select different nullable or union wire contracts. Unsupported converter asymmetry, adjustment mode, or subject/version selection fails validation.
 
 Rustium-only state, sink, server, logging, and producer extensions use `rustium.*` in properties files.
 
@@ -382,15 +383,17 @@ Multiple database names require explicit partition-aware ordering and checkpoint
 
 ### 12. Formats and Sinks
 
-The native JSON encoder exposes the full typed source position and event schema. The Debezium JSON encoder emits `before`, `after`, `source`, `op`, `ts_ms`, and transaction metadata, plus connector-specific position fields. `debezium_json_schema` emits the same JSON values while attaching immutable Draft-07 descriptors for each key and value schema. `debezium_avro` builds named key/envelope/source/transaction/row records, resolves each dynamic value against an Apache Avro schema, and emits raw binary datum. Table DDL changes alter the value descriptor through `EventSchema.version`; heartbeat records use stable dedicated schemas. Parsed Avro schemas and successful Registry IDs use separate bounded LRU caches.
+The native JSON encoder exposes the full typed source position and event schema. The Debezium JSON encoder emits `before`, `after`, `source`, `op`, `ts_ms`, and transaction metadata, plus connector-specific position fields. `debezium_json_schema` emits the same JSON values while attaching immutable Draft-07 descriptors for each key and value schema. `debezium_avro` builds named key/envelope/source/transaction/row records, resolves each dynamic value against an Apache Avro schema, and emits raw binary datum. `debezium_protobuf` builds one top-level `Key` or `Envelope` message per subject and uses generated typed oneof wrappers for row values. Table DDL changes alter the value descriptor through `EventSchema.version`; heartbeat records use stable dedicated schemas. Parsed Avro and Protobuf schemas and successful Registry IDs use separate bounded LRU caches.
 
 Avro names are adjusted to `[A-Za-z_][A-Za-z0-9_]*` deterministically. Two database columns that collapse to the same adjusted name are rejected before delivery. Signed integer, floating-point, boolean, binary, array, and hstore/map values retain native Avro categories. Unsigned 64-bit integers, decimals, temporal values, UUIDs, JSON, and otherwise unmodelled extension values use stable strings because the current typed event contract does not carry the precision/logical-type metadata required for lossless Avro logical types. Values outside Avro's signed `long` range fail instead of wrapping or saturating.
+
+Protobuf row wrappers distinguish native values, null through wrapper absence, unavailable placeholders, and textual conversion fallbacks. Arrays, multidimensional arrays, maps, binary values, and the full unsigned 64-bit range retain lossless Protobuf representations. Field numbers are deterministically derived from original database column names, remain stable across restart, reordering, and additive evolution, avoid Protobuf's reserved range, and fail on an active collision. Generated `.proto` definitions are parsed before delivery and dynamic messages are encoded with `prost-reflect`.
 
 With `tombstones.on.delete=true`, which is the Debezium-compatible default, encoding one delete produces an ordered pair in the same delivery batch: the delete envelope followed by the same key with a null payload. The tombstone has its own deterministic derived event ID. Sink success, checkpoint persistence, and source acknowledgement cover both records together. Native YAML exposes the same setting as `format.tombstones_on_delete`; the native Rustium JSON format does not emit tombstones.
 
 stdout is best-effort and intended for development; it prints tombstones as a `null` line. Kafka uses `librdkafka`, sends tombstones as a true null value, and requires `acks=all` or `-1` so `write` returns only after replica acknowledgement. Producer idempotence is always enabled. Rustium owns bootstrap, acknowledgement, compression, idempotence, and delivery-timeout properties; pass-through properties cannot replace these durability settings. Producer idempotence does not make source-to-Kafka delivery exactly-once.
 
-Schema-aware events are accepted only by Kafka. Before producing an event, the Sink registers its distinct `<topic>-key` and `<topic>-value` definitions through the Confluent Schema Registry API, caches only successful IDs in a configurable bounded LRU, and prefixes raw JSON or Avro datum with magic byte `0` plus the big-endian four-byte ID. Registration completes before broker delivery, so a registry failure cannot checkpoint or send that event. Network and temporary registry failures are retryable through the shared Sink policy; compatibility and schema rejections fail closed. This path interoperates with Confluent Schema Registry and Apicurio's Confluent compatibility API. Key/value registry endpoints and credentials must currently match, and only `TopicNameStrategy` with automatic registration is accepted.
+Schema-aware events are accepted only by Kafka. Before producing an event, the Sink registers its distinct `<topic>-key` and `<topic>-value` definitions through the Confluent Schema Registry API, caches only successful IDs in a configurable bounded LRU, and prefixes each datum with magic byte `0` plus the big-endian four-byte ID. Protobuf adds the Confluent optimized top-level message-index byte `0` before the encoded message. Registration completes before broker delivery, so a registry failure cannot checkpoint or send that event. Network and temporary registry failures are retryable through the shared Sink policy; compatibility and schema rejections fail closed. This path interoperates with Confluent Schema Registry and Apicurio's Confluent compatibility API. Key/value registry endpoints and credentials must currently match, and only `TopicNameStrategy` with automatic registration is accepted.
 
 The shared retry policy maps Debezium's `errors.max.retries`, `errors.retry.delay.initial.ms`, and `errors.retry.delay.max.ms`, with native equivalents under `runtime`; Rustium's finite defaults are 10 retries, 300 ms initial delay, and a 10 s ceiling. PostgreSQL consumes this policy for transient replication recovery, MySQL consumes it for failed binlog-stream recovery, SQL Server consumes it for transient direct-CDC polling recovery, and the runtime consumes it only for failures explicitly classified as retryable by a Sink. Backoff doubles after each attempt and cancellation interrupts the wait. Sink delivery holds and replays the same batch without checkpointing until success; cancellation during delivery backoff leaves that batch unacknowledged for restart and completes normal runtime cleanup without incrementing failed events. This provides at-least-once progress without source-position gaps, while a partially delivered Sink attempt can still produce duplicates. Each Source retains responsibility for reconnect and cursor reconstruction because recovery depends on connector-specific durable state.
 
@@ -484,7 +487,7 @@ RUSTIUM_KAFKA_TEST_BOOTSTRAP_SERVERS=kafka.example.com:9092 \
 cargo test -p rustium-signal-kafka --test kafka_external -- --ignored --nocapture
 ```
 
-The required Kafka Sink gate starts an isolated Redpanda broker and Confluent-compatible Schema Registry. It creates unique single-partition topics and verifies ordered keys, payloads, headers, JSON Schema and Avro key/value registration, additive schema evolution, Avro decoding against the schema fetched by ID, Confluent framing, lookup by ID and latest subject, true null tombstones, successful flush, topic cleanup, and an explicit delivery error for a missing topic with automatic creation disabled:
+The required Kafka Sink gate starts an isolated Redpanda broker and Confluent-compatible Schema Registry. It creates unique single-partition topics and verifies ordered keys, payloads, headers, JSON Schema, Avro, and Protobuf key/value registration, additive schema evolution, binary decoding against schemas fetched by ID, Confluent framing and Protobuf message indexes, lookup by ID and latest subject, true null tombstones, successful flush, topic cleanup, and an explicit delivery error for a missing topic with automatic creation disabled:
 
 ```bash
 bash scripts/test-kafka-sink.sh
@@ -521,7 +524,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. Roadmap
 
-1. Add Protobuf Schema Registry format, packaging, a security policy, operational runbooks, and stable upgrade migrations before `1.0`.
+1. Add packaging, a security policy, operational runbooks, and stable upgrade migrations before `1.0`.
 2. Freeze the public configuration, event, and persisted-state compatibility contracts after the remaining release gates pass.
 3. Consider additional databases only after the current three connectors and shared runtime pass the full `1.0` gates.
 
@@ -575,7 +578,7 @@ Workspace 已包含可运行的 alpha 服务。
 | 核心事件/位点/运行时 trait | 已实现 |
 | 有界 Tokio 运行时 | 已实现；CI 强制运行 256 轮背压/重试 soak |
 | SQLite checkpoint v2 与连接器状态 | 已实现；仍可读取 version 1 JSON |
-| 原生 JSON、Debezium JSON、Confluent framing JSON Schema 和 Avro | 已实现；CI 强制运行真实 Registry/Kafka 门槛 |
+| 原生 JSON、Debezium JSON、Confluent framing JSON Schema、Avro 和 Protobuf | 已实现；CI 强制运行真实 Registry/Kafka 门槛 |
 | stdout 和 Kafka Sink | 已实现；CI 强制运行 Kafka 真实 broker 投递/失败门槛 |
 | PostgreSQL Source | 已实现；PostgreSQL 17 恢复、heartbeat/action-query、可写/只读增量快照和核心类型矩阵门槛通过 |
 | MySQL Source | 已实现；必选 Docker CI 和外部 MySQL 8.4 恢复/soak 门槛通过 |
@@ -610,6 +613,7 @@ crates/
 |-- rustium-sqlserver/     SQL Server CDC Source
 |-- rustium-format-avro/   Debezium 兼容 Avro schema 与 datum 编码
 |-- rustium-format-json/   原生 JSON、Debezium JSON 和 JSON Schema descriptor
+|-- rustium-format-protobuf/ Debezium 兼容 Protobuf schema 与 message 编码
 |-- rustium-sink-stdout/   开发用 Sink
 |-- rustium-sink-kafka/    持久 Kafka Producer Sink
 |-- rustium-signal-kafka/  与 checkpoint 耦合的 Kafka 信号输入
@@ -714,7 +718,7 @@ Rustium 支持：
 
 原生根 schema 为 `api_version: rustium.io/v1alpha1`、`kind: Connector`。
 
-项目优先使用 Debezium 名称，包括 `name`、`connector.class`、`topic.prefix`、`database.*`、`table.include.list`、`table.exclude.list`、`snapshot.mode`、`snapshot.fetch.size`、`tombstones.on.delete`、`max.queue.size`、`max.batch.size` 和 `poll.interval.ms`。成对的 Confluent `JsonSchemaConverter` 与 `AvroConverter` key/value 设置分别映射到 `debezium_json_schema` 与 `debezium_avro`。两者都使用一个共享的 `schema.registry.url` 列表、`USER_INFO` 基本认证、自动注册、请求超时和有界 ID 缓存。Avro schema/field 名称执行确定性调整，调整后冲突会编码失败。不支持的 converter 不对称、调整模式或 subject/version 选择会直接校验失败。
+项目优先使用 Debezium 名称，包括 `name`、`connector.class`、`topic.prefix`、`database.*`、`table.include.list`、`table.exclude.list`、`snapshot.mode`、`snapshot.fetch.size`、`tombstones.on.delete`、`max.queue.size`、`max.batch.size` 和 `poll.interval.ms`。成对的 Confluent `JsonSchemaConverter`、`AvroConverter` 与 `ProtobufConverter` key/value 设置分别映射到 `debezium_json_schema`、`debezium_avro` 与 `debezium_protobuf`。三者都使用一个共享的 `schema.registry.url` 列表、`USER_INFO` 基本认证、自动注册、请求超时和有界 ID 缓存。Avro schema/field 名称执行确定性调整，调整后冲突会编码失败。Protobuf 始终清理非法名称，并拒绝会选择其他 nullable 或 union wire contract 的选项。不支持的 converter 不对称、调整模式或 subject/version 选择会直接校验失败。
 
 Properties 中 Rustium 自身的状态、Sink、Server、日志和 Producer 扩展使用 `rustium.*`。
 
@@ -897,15 +901,17 @@ SQL Server 支持 Debezium 兼容的 source table、file、有界 in-process 和
 
 ### 12. 格式与 Sink
 
-原生 JSON Encoder 暴露完整强类型源位点和事件 schema。Debezium JSON Encoder 输出 `before`、`after`、`source`、`op`、`ts_ms`、事务元数据和连接器特定位点字段。`debezium_json_schema` 输出相同 JSON 值，同时为每个 key/value schema 附加不可变 Draft-07 descriptor。`debezium_avro` 构造命名 key/envelope/source/transaction/row record，将动态值解析到 Apache Avro schema，并输出原始 binary datum。表 DDL 变化通过 `EventSchema.version` 改变 value descriptor；heartbeat record 使用稳定的独立 schema。已解析 Avro schema 和成功 Registry ID 分别使用独立的有界 LRU。
+原生 JSON Encoder 暴露完整强类型源位点和事件 schema。Debezium JSON Encoder 输出 `before`、`after`、`source`、`op`、`ts_ms`、事务元数据和连接器特定位点字段。`debezium_json_schema` 输出相同 JSON 值，同时为每个 key/value schema 附加不可变 Draft-07 descriptor。`debezium_avro` 构造命名 key/envelope/source/transaction/row record，将动态值解析到 Apache Avro schema，并输出原始 binary datum。`debezium_protobuf` 为每个 subject 构造一个 top-level `Key` 或 `Envelope` message，并为 row 值使用生成的带类型 oneof wrapper。表 DDL 变化通过 `EventSchema.version` 改变 value descriptor；heartbeat record 使用稳定的独立 schema。已解析 Avro/Protobuf schema 和成功 Registry ID 分别使用独立的有界 LRU。
 
 Avro 名称会被确定性调整为 `[A-Za-z_][A-Za-z0-9_]*`。两个数据库字段调整为相同名称时会在投递前拒绝。有符号整数、浮点、boolean、binary、array 和 hstore/map 保留原生 Avro category。无符号 64 位整数、decimal、时间值、UUID、JSON 和其他未建模扩展值使用稳定字符串，因为当前强类型事件契约不携带无损 Avro logical type 所需的 precision/元数据。超出 Avro 有符号 `long` 范围的值会失败，不会 wrap 或 saturate。
+
+Protobuf row wrapper 可区分原生值、通过 wrapper 缺失表达的 null、unavailable placeholder 和文本转换 fallback。Array、多维 array、map、binary 和完整无符号 64 位范围都保留无损 Protobuf 表示。Field number 从原始数据库字段名确定性派生，在重启、字段重排和增量演进后保持稳定、避开 Protobuf 保留区间，并在活动冲突时失败。生成的 `.proto` 会在投递前解析，dynamic message 使用 `prost-reflect` 编码。
 
 `tombstones.on.delete=true` 是 Debezium 兼容默认值。此时一条 delete 会在同一投递批次中编码为有序的两条记录：先发送 delete envelope，再发送 key 相同、payload 为 null 的 tombstone。tombstone 使用独立的确定性派生事件 ID；两条记录共同受 Sink 成功、checkpoint 持久化和 Source 确认约束。原生 YAML 使用 `format.tombstones_on_delete`；原生 Rustium JSON 格式不产生 tombstone。
 
 stdout 是 best-effort，仅用于开发，并将 tombstone 输出为一行 `null`。Kafka 使用 `librdkafka`，将 tombstone 发送为真正的 null value，并要求 `acks=all` 或 `-1`，使 `write` 只在副本确认后返回。Producer 幂等始终启用。Rustium 拥有 bootstrap、确认、压缩、幂等和投递超时参数，透传属性不能替换这些持久性设置。Producer 幂等并不会把 Source 到 Kafka 变为 exactly-once。
 
-带 schema 的事件只允许投递到 Kafka。发送事件前，Sink 会通过 Confluent Schema Registry API 注册不同的 `<topic>-key` 和 `<topic>-value` 定义，只把成功 ID 放入可配置的有界 LRU，并在原始 JSON 或 Avro datum 前加 magic byte `0` 和四字节大端 ID。注册在 broker 投递前完成，因此 registry 故障不会 checkpoint 或发送该事件。网络和暂时性 registry 故障使用共享 Sink 策略重试；兼容性与 schema 拒绝会 fail-closed。该路径兼容 Confluent Schema Registry 和 Apicurio 的 Confluent compatibility API。当前 key/value registry 端点与凭据必须一致，并且只接受自动注册的 `TopicNameStrategy`。
+带 schema 的事件只允许投递到 Kafka。发送事件前，Sink 会通过 Confluent Schema Registry API 注册不同的 `<topic>-key` 和 `<topic>-value` 定义，只把成功 ID 放入可配置的有界 LRU，并在每个 datum 前加 magic byte `0` 和四字节大端 ID。Protobuf 会在编码 message 前增加 Confluent 优化的 top-level message-index byte `0`。注册在 broker 投递前完成，因此 registry 故障不会 checkpoint 或发送该事件。网络和暂时性 registry 故障使用共享 Sink 策略重试；兼容性与 schema 拒绝会 fail-closed。该路径兼容 Confluent Schema Registry 和 Apicurio 的 Confluent compatibility API。当前 key/value registry 端点与凭据必须一致，并且只接受自动注册的 `TopicNameStrategy`。
 
 共享重试策略映射 Debezium 的 `errors.max.retries`、`errors.retry.delay.initial.ms` 和 `errors.retry.delay.max.ms`，原生等价项位于 `runtime` 下；Rustium 的有限默认值为重试 10 次、初始等待 300 ms、上限 10 s。PostgreSQL 使用该策略处理暂时性复制恢复，MySQL 使用它处理失败的 binlog stream 恢复，SQL Server 使用它处理暂时性 direct-CDC polling 恢复，runtime 只对 Sink 明确分类为可重试的失败使用它。每次尝试后的退避时间倍增，取消信号可以中断等待。Sink 投递会保留并重放同一批次，成功前不写 checkpoint；在投递退避期间取消会让该 batch 保持未确认以供重启，并完成正常 runtime 清理且不增加失败事件。这提供不会跳过源位点的 at-least-once 进度，但部分 Sink 投递成功的尝试仍可能产生重复。各 Source 继续负责重连和 cursor 重建，因为恢复依赖连接器特有的持久状态。
 
@@ -999,7 +1005,7 @@ RUSTIUM_KAFKA_TEST_BOOTSTRAP_SERVERS=kafka.example.com:9092 \
 cargo test -p rustium-signal-kafka --test kafka_external -- --ignored --nocapture
 ```
 
-必须通过的 Kafka Sink 门槛会启动隔离的 Redpanda broker 和 Confluent-compatible Schema Registry，创建唯一命名的单 partition topic，并验证有序 key、payload、header、JSON Schema 与 Avro key/value 注册、增量 schema 演进、使用按 ID 获取的 schema 解码 Avro、Confluent framing、按 ID 和最新 subject 查询、真正的 null tombstone、成功 flush、topic 清理，以及关闭自动建 topic 时向不存在 topic 投递产生的显式错误：
+必须通过的 Kafka Sink 门槛会启动隔离的 Redpanda broker 和 Confluent-compatible Schema Registry，创建唯一命名的单 partition topic，并验证有序 key、payload、header、JSON Schema、Avro 与 Protobuf key/value 注册、增量 schema 演进、使用按 ID 获取的 schema 解码 binary、Confluent framing 与 Protobuf message index、按 ID 和最新 subject 查询、真正的 null tombstone、成功 flush、topic 清理，以及关闭自动建 topic 时向不存在 topic 投递产生的显式错误：
 
 ```bash
 bash scripts/test-kafka-sink.sh
@@ -1036,6 +1042,6 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. 路线图
 
-1. 在 `1.0` 前补 Protobuf Schema Registry 格式、打包、安全策略、运维手册和稳定升级迁移。
+1. 在 `1.0` 前补打包、安全策略、运维手册和稳定升级迁移。
 2. 剩余发布门槛通过后，冻结公共配置、事件和持久化状态兼容契约。
 3. 只有当当前三个连接器和共享运行时通过完整 `1.0` 门槛后，才考虑更多数据库。

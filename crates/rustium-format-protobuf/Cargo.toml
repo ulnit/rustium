@@ -1,0 +1,26 @@
+[package]
+name = "rustium-format-protobuf"
+description = "Rustium Debezium-compatible Protobuf encoder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+bytes.workspace = true
+hex.workspace = true
+prost.workspace = true
+prost-reflect.workspace = true
+protox-parse.workspace = true
+rustium-core = { path = "../rustium-core" }
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+indexmap.workspace = true
+
+[lints]
+workspace = true

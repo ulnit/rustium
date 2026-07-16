@@ -696,6 +696,7 @@ fn format_config(properties: &BTreeMap<String, String>) -> Result<FormatConfig> 
     const JSON_CONVERTER: &str = "org.apache.kafka.connect.json.JsonConverter";
     const JSON_SCHEMA_CONVERTER: &str = "io.confluent.connect.json.JsonSchemaConverter";
     const AVRO_CONVERTER: &str = "io.confluent.connect.avro.AvroConverter";
+    const PROTOBUF_CONVERTER: &str = "io.confluent.connect.protobuf.ProtobufConverter";
 
     let key_converter = properties
         .get("key.converter")
@@ -722,9 +723,11 @@ fn format_config(properties: &BTreeMap<String, String>) -> Result<FormatConfig> 
         FormatType::DebeziumJsonSchema
     } else if key_converter == AVRO_CONVERTER && value_converter == AVRO_CONVERTER {
         FormatType::DebeziumAvro
+    } else if key_converter == PROTOBUF_CONVERTER && value_converter == PROTOBUF_CONVERTER {
+        FormatType::DebeziumProtobuf
     } else {
         return Err(Error::Configuration(format!(
-            "Rustium requires matching key.converter and value.converter values; supported pairs are {JSON_CONVERTER:?}, {JSON_SCHEMA_CONVERTER:?}, and {AVRO_CONVERTER:?}, got {key_converter:?} and {value_converter:?}"
+            "Rustium requires matching key.converter and value.converter values; supported pairs are {JSON_CONVERTER:?}, {JSON_SCHEMA_CONVERTER:?}, {AVRO_CONVERTER:?}, and {PROTOBUF_CONVERTER:?}, got {key_converter:?} and {value_converter:?}"
         )));
     };
 
@@ -736,6 +739,29 @@ fn format_config(properties: &BTreeMap<String, String>) -> Result<FormatConfig> 
                 return Err(Error::Configuration(format!(
                     "{property}={mode:?} is not implemented for Avro; Rustium uses deterministic avro adjustment"
                 )));
+            }
+        }
+    }
+    if kind == FormatType::DebeziumProtobuf {
+        for prefix in ["key.converter", "value.converter"] {
+            if let Some(value) = properties.get(&format!("{prefix}.scrub.invalid.names"))
+                && value != "true"
+            {
+                return Err(Error::Configuration(format!(
+                    "{prefix}.scrub.invalid.names={value:?} is not implemented; Rustium always performs deterministic Protobuf name adjustment"
+                )));
+            }
+            for option in [
+                "optional.for.nullables",
+                "wrapper.for.nullables",
+                "generate.struct.for.nulls",
+                "flatten.unions",
+            ] {
+                if bool_value(properties, &format!("{prefix}.{option}"), false)? {
+                    return Err(Error::Configuration(format!(
+                        "{prefix}.{option}=true is not implemented by Rustium's typed Protobuf contract"
+                    )));
+                }
             }
         }
     }
@@ -1123,6 +1149,16 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "value.converter.basic.auth.user.info",
         "schema.name.adjustment.mode",
         "field.name.adjustment.mode",
+        "key.converter.scrub.invalid.names",
+        "value.converter.scrub.invalid.names",
+        "key.converter.optional.for.nullables",
+        "value.converter.optional.for.nullables",
+        "key.converter.wrapper.for.nullables",
+        "value.converter.wrapper.for.nullables",
+        "key.converter.generate.struct.for.nulls",
+        "value.converter.generate.struct.for.nulls",
+        "key.converter.flatten.unions",
+        "value.converter.flatten.unions",
         "heartbeat.interval.ms",
         "heartbeat.action.query",
         "heartbeat.topics.prefix",
@@ -1851,6 +1887,58 @@ field.name.adjustment.mode=none
         )
         .unwrap_err();
         assert!(error.to_string().contains("field.name.adjustment.mode"));
+    }
+
+    #[test]
+    fn maps_confluent_protobuf_converters_and_rejects_wire_variants() {
+        let config = parse(
+            r#"
+name=inventory
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+rustium.sink.type=kafka
+rustium.kafka.bootstrap.servers=kafka:9092
+key.converter=io.confluent.connect.protobuf.ProtobufConverter
+key.converter.schema.registry.url=http://registry:8081
+key.converter.scrub.invalid.names=true
+key.converter.optional.for.nullables=false
+value.converter=io.confluent.connect.protobuf.ProtobufConverter
+value.converter.schema.registry.url=http://registry:8081
+value.converter.scrub.invalid.names=true
+value.converter.optional.for.nullables=false
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.format.kind, FormatType::DebeziumProtobuf);
+        assert_eq!(
+            config.format.schema_registry.as_ref().unwrap().urls,
+            ["http://registry:8081"]
+        );
+        assert!(!config.compatibility_warnings.iter().any(|warning| {
+            warning.contains("converter") || warning.contains("optional.for.nullables")
+        }));
+
+        let error = parse(
+            r#"
+name=inventory
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+key.converter=io.confluent.connect.protobuf.ProtobufConverter
+key.converter.schema.registry.url=http://registry:8081
+key.converter.optional.for.nullables=true
+value.converter=io.confluent.connect.protobuf.ProtobufConverter
+value.converter.schema.registry.url=http://registry:8081
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("optional.for.nullables=true"));
     }
 
     #[test]

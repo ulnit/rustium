@@ -18,6 +18,7 @@ rustium-config = { path = "../rustium-config" }
 rustium-core = { path = "../rustium-core" }
 rustium-format-avro = { path = "../rustium-format-avro" }
 rustium-format-json = { path = "../rustium-format-json" }
+rustium-format-protobuf = { path = "../rustium-format-protobuf" }
 rustium-mysql = { path = "../rustium-mysql" }
 rustium-postgresql = { path = "../rustium-postgresql" }
 rustium-server = { path = "../rustium-server" }

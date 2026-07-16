@@ -1161,7 +1161,12 @@ impl Default for FormatConfig {
 impl FormatConfig {
     fn validate(&self, sink: &SinkConfig) -> Result<()> {
         match (self.kind, &self.schema_registry) {
-            (FormatType::DebeziumJsonSchema | FormatType::DebeziumAvro, Some(registry)) => {
+            (
+                FormatType::DebeziumJsonSchema
+                | FormatType::DebeziumAvro
+                | FormatType::DebeziumProtobuf,
+                Some(registry),
+            ) => {
                 if !matches!(sink, SinkConfig::Kafka { .. }) {
                     return Err(Error::Configuration(format!(
                         "format.type={} requires sink.type=kafka",
@@ -1170,12 +1175,15 @@ impl FormatConfig {
                 }
                 registry.validate()
             }
-            (FormatType::DebeziumJsonSchema | FormatType::DebeziumAvro, None) => {
-                Err(Error::Configuration(format!(
-                    "format.type={} requires format.schema_registry",
-                    self.kind.as_str()
-                )))
-            }
+            (
+                FormatType::DebeziumJsonSchema
+                | FormatType::DebeziumAvro
+                | FormatType::DebeziumProtobuf,
+                None,
+            ) => Err(Error::Configuration(format!(
+                "format.type={} requires format.schema_registry",
+                self.kind.as_str()
+            ))),
             (_, Some(_)) => Err(Error::Configuration(
                 "format.schema_registry is only valid with a schema-registry format".into(),
             )),
@@ -1201,6 +1209,7 @@ pub enum FormatType {
     DebeziumJson,
     DebeziumJsonSchema,
     DebeziumAvro,
+    DebeziumProtobuf,
 }
 
 impl FormatType {
@@ -1210,6 +1219,7 @@ impl FormatType {
             Self::DebeziumJson => "debezium_json",
             Self::DebeziumJsonSchema => "debezium_json_schema",
             Self::DebeziumAvro => "debezium_avro",
+            Self::DebeziumProtobuf => "debezium_protobuf",
         }
     }
 }
@@ -1862,6 +1872,30 @@ sink:
             avro.format.schema_registry.as_ref().unwrap().cache_capacity,
             32
         );
+
+        let protobuf = Config::from_yaml(
+            r#"
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: orders-protobuf
+source:
+  type: mysql
+  databases: [app]
+  username: rustium
+  password: secret
+format:
+  type: debezium_protobuf
+  schema_registry:
+    urls: [http://registry:8081]
+sink:
+  type: kafka
+  bootstrap_servers: [kafka:9092]
+  topic_prefix: app
+"#,
+        )
+        .unwrap();
+        assert_eq!(protobuf.format.kind, FormatType::DebeziumProtobuf);
     }
 
     #[test]

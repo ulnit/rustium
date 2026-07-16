@@ -557,6 +557,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registers_protobuf_schema_and_preserves_message_index() {
+        let mut server = mockito::Server::new_async().await;
+        let definition = r#"syntax = "proto3"; message Key { int64 id = 1; }"#;
+        let registration = server
+            .mock("POST", "/subjects/orders-key/versions")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "schema": definition,
+                "schemaType": "PROTOBUF"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/vnd.schemaregistry.v1+json")
+            .with_body(r#"{"id":53}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let mut framer = SchemaRegistryFramer::new(SchemaRegistrySettings {
+            urls: vec![server.url()],
+            username: None,
+            password: None,
+            request_timeout: Duration::from_secs(1),
+            cache_capacity: 8,
+        })
+        .unwrap();
+        let framed = framer
+            .frame(
+                &Bytes::from_static(&[0, 8, 14]),
+                &WireSchema {
+                    subject: "orders-key".into(),
+                    schema_type: WireSchemaType::Protobuf,
+                    definition: definition.into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(framed.as_ref(), &[0, 0, 0, 0, 53, 0, 8, 14]);
+        registration.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn treats_registry_compatibility_rejections_as_non_retryable() {
         let mut server = mockito::Server::new_async().await;
         let rejection = server

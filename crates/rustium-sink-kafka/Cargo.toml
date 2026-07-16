@@ -21,8 +21,11 @@ url.workspace = true
 apache-avro.workspace = true
 chrono.workspace = true
 mockito.workspace = true
+prost-reflect.workspace = true
+protox-parse.workspace = true
 rustium-format-avro = { path = "../rustium-format-avro" }
 rustium-format-json = { path = "../rustium-format-json" }
+rustium-format-protobuf = { path = "../rustium-format-protobuf" }
 serde_json.workspace = true
 uuid.workspace = true
 
