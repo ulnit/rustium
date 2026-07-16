@@ -1036,9 +1036,9 @@ fn duration_ms(
 
 fn snapshot_mode(mode: &str) -> Result<SnapshotMode> {
     match mode {
-        "initial" | "always" | "initial_only" => Ok(SnapshotMode::Initial),
+        "initial" => Ok(SnapshotMode::Initial),
         "when_needed" => Ok(SnapshotMode::WhenNeeded),
-        "never" | "no_data" | "schema_only" => Ok(SnapshotMode::Never),
+        "never" | "no_data" => Ok(SnapshotMode::Never),
         other => Err(Error::Configuration(format!(
             "snapshot.mode={other:?} is recognized but not supported by the current connector"
         ))),
@@ -1212,6 +1212,27 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_snapshot_modes_with_different_semantics() {
+        assert_eq!(snapshot_mode("initial").unwrap(), SnapshotMode::Initial);
+        assert_eq!(
+            snapshot_mode("when_needed").unwrap(),
+            SnapshotMode::WhenNeeded
+        );
+        assert_eq!(snapshot_mode("never").unwrap(), SnapshotMode::Never);
+        assert_eq!(snapshot_mode("no_data").unwrap(), SnapshotMode::Never);
+        for mode in [
+            "always",
+            "initial_only",
+            "schema_only",
+            "recovery",
+            "custom",
+        ] {
+            let error = snapshot_mode(mode).unwrap_err();
+            assert!(error.to_string().contains("not supported"), "mode={mode}");
+        }
+    }
 
     #[test]
     fn parses_postgres_properties_and_regex_filters() {

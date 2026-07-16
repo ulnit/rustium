@@ -999,7 +999,7 @@ impl SourceConnector for SqlServerSource {
                 .as_ref()
                 .is_none_or(|checkpoint| !checkpoint.snapshot_completed),
         };
-        let checkpoint_position = checkpoint
+        let mut checkpoint_position = checkpoint
             .as_ref()
             .map(|checkpoint| checkpoint.source_position.clone());
         if checkpoint_position
@@ -1016,7 +1016,7 @@ impl SourceConnector for SqlServerSource {
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.connector_state.as_ref())
                 .is_some();
-        let (incremental_progress, completed_signal_ids) = if !snapshot_needed {
+        let (mut incremental_progress, mut completed_signal_ids) = if !snapshot_needed {
             checkpoint
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.connector_state.as_ref())
@@ -1027,7 +1027,7 @@ impl SourceConnector for SqlServerSource {
             (None, Vec::new())
         };
 
-        let (cursor, resume_position) = if snapshot_needed {
+        let (mut cursor, mut resume_position) = if snapshot_needed {
             (
                 CdcCursor::at_snapshot(self.run_snapshot(&context.output).await?),
                 None,
@@ -1046,7 +1046,31 @@ impl SourceConnector for SqlServerSource {
         };
 
         let mut client = connect(&self.config, self.database()).await?;
-        validate_retention(&mut client, &self.captures, &cursor.commit_lsn).await?;
+        if self.snapshot.mode == SnapshotMode::WhenNeeded && !snapshot_needed {
+            if let Err(error) =
+                validate_retention(&mut client, &self.captures, &cursor.commit_lsn).await
+            {
+                if matches!(&error, Error::State(_)) {
+                    warn!(
+                        connector = %self.connector_name,
+                        %error,
+                        "SQL Server checkpoint is older than CDC retention; taking a recovery snapshot"
+                    );
+                    client.close().await.map_err(sqlserver_error)?;
+                    let anchor = self.run_snapshot(&context.output).await?;
+                    cursor = CdcCursor::at_snapshot(anchor);
+                    resume_position = None;
+                    checkpoint_position = None;
+                    incremental_progress = None;
+                    completed_signal_ids.clear();
+                    client = connect(&self.config, self.database()).await?;
+                } else {
+                    return Err(error);
+                }
+            }
+        } else {
+            validate_retention(&mut client, &self.captures, &cursor.commit_lsn).await?;
+        }
         let mut state = StreamingState::new(cursor, resume_position);
         let mut incremental =
             SqlServerIncrementalSnapshot::new(incremental_progress, completed_signal_ids);

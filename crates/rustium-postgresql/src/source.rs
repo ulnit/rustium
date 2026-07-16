@@ -347,7 +347,7 @@ impl SourceConnector for PostgresSource {
 
     async fn run(&mut self, mut context: SourceContext) -> Result<()> {
         let checkpoint = context.initial_checkpoint.clone();
-        let snapshot_needed = match self.snapshot.mode {
+        let mut snapshot_needed = match self.snapshot.mode {
             SnapshotMode::Never => false,
             SnapshotMode::Initial | SnapshotMode::WhenNeeded => checkpoint
                 .as_ref()
@@ -366,17 +366,45 @@ impl SourceConnector for PostgresSource {
                 incremental_progress = state.incremental_snapshot;
                 completed_signal_ids = state.completed_signal_ids;
             } else if checkpoint.is_some() {
-                return Err(Error::State(
-                    "PostgreSQL checkpoint predates persistent schema history and cannot safely replay relation changes; reset the checkpoint and run a new initial snapshot"
-                        .into(),
-                ));
+                if self.snapshot.mode == SnapshotMode::WhenNeeded {
+                    warn!(
+                        connector = %self.connector_name,
+                        "PostgreSQL checkpoint has no schema history; taking a recovery snapshot"
+                    );
+                    snapshot_needed = true;
+                    self.schemas.clear();
+                    incremental_progress = None;
+                    completed_signal_ids.clear();
+                } else {
+                    return Err(Error::State(
+                        "PostgreSQL checkpoint predates persistent schema history and cannot safely replay relation changes; reset the checkpoint and run a new initial snapshot"
+                            .into(),
+                    ));
+                }
             }
         }
 
         if snapshot_needed {
             self.prepare_snapshot_slot().await?;
         } else if checkpoint.is_some() {
-            validate_resume_slot(&self.config).await?;
+            if let Err(error) = validate_resume_slot(&self.config).await {
+                if self.snapshot.mode == SnapshotMode::WhenNeeded
+                    && matches!(&error, Error::State(_))
+                {
+                    warn!(
+                        connector = %self.connector_name,
+                        %error,
+                        "PostgreSQL checkpoint history is unavailable; taking a recovery snapshot"
+                    );
+                    snapshot_needed = true;
+                    self.schemas.clear();
+                    incremental_progress = None;
+                    completed_signal_ids.clear();
+                    self.prepare_snapshot_slot().await?;
+                } else {
+                    return Err(error);
+                }
+            }
         }
 
         let replication_url = self.config.connection_url(true)?;

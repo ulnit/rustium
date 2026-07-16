@@ -649,17 +649,7 @@ impl MySqlSource {
                     signal_key.0, signal_key.1
                 ))
             })?;
-            let columns = signal_schema
-                .event_schema
-                .fields
-                .iter()
-                .map(|field| field.name.to_ascii_lowercase())
-                .collect::<Vec<_>>();
-            if columns.len() < 3 || columns[..3] != ["id", "type", "data"] {
-                return Err(Error::Configuration(
-                    "MySQL signal.data.collection must expose id, type, data as its first three columns".into(),
-                ));
-            }
+            validate_signal_schema(signal_schema)?;
         }
         if !schemas
             .values()
@@ -773,6 +763,18 @@ impl MySqlSource {
             current_binlog_coordinates(&mut connection, self.source_server_id).await?;
         connection.disconnect().await.map_err(mysql_error)?;
         Ok(coordinates)
+    }
+
+    async fn checkpoint_binlog_available(&self, position: &MySqlPosition) -> Result<bool> {
+        let mut connection = connect(&self.config).await?;
+        let logs: Vec<(String, u64)> = connection
+            .query("SHOW BINARY LOGS")
+            .await
+            .map_err(mysql_error)?;
+        connection.disconnect().await.map_err(mysql_error)?;
+        Ok(logs.into_iter().any(|(filename, file_size)| {
+            filename == position.binlog_filename && position.binlog_position <= file_size
+        }))
     }
 
     async fn open_binlog_stream(&self, coordinates: &BinlogCoordinates) -> Result<BinlogStream> {
@@ -1296,7 +1298,7 @@ impl SourceConnector for MySqlSource {
     async fn run(&mut self, mut context: SourceContext) -> Result<()> {
         self.gtid_source_filter = GtidSourceFilter::from_config(&self.config)?;
         let checkpoint = context.initial_checkpoint.clone();
-        let snapshot_needed = match self.snapshot.mode {
+        let mut snapshot_needed = match self.snapshot.mode {
             SnapshotMode::Never => false,
             SnapshotMode::Initial | SnapshotMode::WhenNeeded => checkpoint
                 .as_ref()
@@ -1331,11 +1333,40 @@ impl SourceConnector for MySqlSource {
                 incremental_progress = state.incremental_snapshot;
                 completed_signal_ids = state.completed_signal_ids;
             } else if checkpoint.is_some() {
-                return Err(Error::State(
-                    "MySQL checkpoint predates persistent schema history and cannot safely replay destructive DDL; reset the checkpoint and run a new initial snapshot"
-                        .into(),
-                ));
+                if self.snapshot.mode == SnapshotMode::WhenNeeded {
+                    warn!(
+                        connector = %self.connector_name,
+                        "MySQL checkpoint has no schema history; taking a recovery snapshot"
+                    );
+                    snapshot_needed = true;
+                    self.schemas.clear();
+                    incremental_progress = None;
+                    completed_signal_ids.clear();
+                } else {
+                    return Err(Error::State(
+                        "MySQL checkpoint predates persistent schema history and cannot safely replay destructive DDL; reset the checkpoint and run a new initial snapshot"
+                            .into(),
+                    ));
+                }
             }
+        }
+
+        if !snapshot_needed
+            && self.snapshot.mode == SnapshotMode::WhenNeeded
+            && let Some(SourcePosition::MySql(position)) = &resume_position
+            && !self.checkpoint_binlog_available(position).await?
+        {
+            warn!(
+                connector = %self.connector_name,
+                filename = %position.binlog_filename,
+                position = position.binlog_position,
+                "MySQL checkpoint binlog position is no longer retained; taking a recovery snapshot"
+            );
+            snapshot_needed = true;
+            self.schemas.clear();
+            incremental_progress = None;
+            completed_signal_ids.clear();
+            resume_position = None;
         }
 
         let coordinates = if snapshot_needed {
@@ -1519,6 +1550,35 @@ fn signal_table_key(config: &MySqlSourceConfig) -> Option<(String, String)> {
         return None;
     }
     Some((database.to_owned(), table.to_owned()))
+}
+
+fn validate_signal_schema(schema: &TableSchema) -> Result<()> {
+    let expected = ["id", "type", "data"];
+    if schema.event_schema.fields.len() != expected.len()
+        || schema
+            .event_schema
+            .fields
+            .iter()
+            .zip(expected)
+            .any(|(field, expected)| {
+                field.name.to_ascii_lowercase() != expected
+                    || !mysql_signal_text_type(&field.type_name)
+            })
+    {
+        return Err(Error::Configuration(format!(
+            "MySQL signal table {}.{} must contain exactly text-compatible id, type, and data columns in that order",
+            schema.database, schema.table
+        )));
+    }
+    Ok(())
+}
+
+fn mysql_signal_text_type(type_name: &str) -> bool {
+    let normalized = type_name.to_ascii_lowercase();
+    matches!(
+        base_type(&normalized),
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext"
+    )
 }
 
 fn signal_channel_enabled(config: &MySqlSourceConfig, channel: &str) -> bool {
@@ -3264,6 +3324,51 @@ mod tests {
                 DataValue::Bytes(vec![0, 1, 2, 3])
             );
         }
+    }
+
+    #[test]
+    fn validates_mysql_signal_table_layout() {
+        let signal_schema = |fields: Vec<FieldSchema>| TableSchema {
+            database: "inventory".into(),
+            table: "rustium_signal".into(),
+            event_schema: EventSchema {
+                name: "signal".into(),
+                version: 1,
+                fields,
+            },
+        };
+        let field = |name: &str, type_name: &str| FieldSchema {
+            name: name.into(),
+            type_name: type_name.into(),
+            optional: false,
+            primary_key: name == "id",
+        };
+
+        assert!(
+            validate_signal_schema(&signal_schema(vec![
+                field("id", "varchar(255)"),
+                field("type", "text"),
+                field("data", "longtext"),
+            ]))
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_signal_schema(&signal_schema(vec![
+                field("id", "varchar(255)"),
+                field("type", "text"),
+                field("data", "longtext"),
+                field("extra", "text"),
+            ])),
+            Err(Error::Configuration(message)) if message.contains("exactly text-compatible")
+        ));
+        assert!(matches!(
+            validate_signal_schema(&signal_schema(vec![
+                field("id", "varchar(255)"),
+                field("type", "int"),
+                field("data", "longtext"),
+            ])),
+            Err(Error::Configuration(message)) if message.contains("exactly text-compatible")
+        ));
     }
 
     #[test]
