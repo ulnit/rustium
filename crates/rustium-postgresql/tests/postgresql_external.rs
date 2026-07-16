@@ -821,8 +821,18 @@ async fn keeps_installed_extension_types_identical_across_snapshot_and_wal() -> 
     let (client, connection_task) = connect(&settings).await?;
 
     let outcome = async {
+        let require_all_extension_types = std::env::var(
+            "RUSTIUM_POSTGRES_REQUIRE_EXTENSION_TYPES",
+        )
+        .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
         let vector_schema = installed_extension_schema(&client, "vector").await?;
         let postgis_schema = installed_extension_schema(&client, "postgis").await?;
+        if require_all_extension_types {
+            require(
+                vector_schema.is_some() && postgis_schema.is_some(),
+                "PostgreSQL extension gate requires both vector and postgis",
+            )?;
+        }
         if vector_schema.is_none() && postgis_schema.is_none() {
             eprintln!(
                 "PostgreSQL extension gate skipped: neither vector nor postgis is installed"
@@ -850,6 +860,16 @@ async fn keeps_installed_extension_types_identical_across_snapshot_and_wal() -> 
         let sparsevec_type = type_name_exists(&client, sparsevec_name.as_deref()).await?;
         let geometry_type = type_name_exists(&client, geometry_name.as_deref()).await?;
         let geography_type = type_name_exists(&client, geography_name.as_deref()).await?;
+        if require_all_extension_types {
+            require(
+                vector_type
+                    && halfvec_type
+                    && sparsevec_type
+                    && geometry_type
+                    && geography_type,
+                "PostgreSQL extension gate requires vector, halfvec, sparsevec, geometry, and geography",
+            )?;
+        }
         require(
             vector_type || halfvec_type || sparsevec_type || geometry_type || geography_type,
             "installed PostgreSQL extension has no discoverable test type",

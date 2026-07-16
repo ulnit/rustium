@@ -267,9 +267,9 @@ With `incremental.snapshot.allow.schema.changes=false`, the chunk connection red
 
 If current catalog discovery fails while replaying a historical `Relation`, Rustium keeps the WAL-provided names, order, OIDs, typmods, and key flags. Type-name lookup first reuses an exact checkpointed column identity; if neither catalog nor history can resolve it, the field receives a conservative `unknown_oid_*` name. Both fallback paths are observable warnings and preserve decoding order without inventing nullability or defaults.
 
-#### 9.5 Remaining PostgreSQL gates
+#### 9.5 PostgreSQL extension fixture
 
-- live PostGIS/pgvector fixtures where installed;
+`scripts/test-postgresql-extensions.sh` builds a PostgreSQL 17 image from the repository Dockerfile, installs matching pgvector and PostGIS packages, enables logical replication, creates both extensions, and runs the exact snapshot/WAL equality test. The strict fixture requires vector, halfvec, sparsevec, geometry, and geography to exist; the dedicated GitHub CI job runs it on every push and pull request.
 
 ### 10. MySQL Connector
 
@@ -342,7 +342,7 @@ The MySQL 8.4 Docker gate covers:
 - checkpoint stop before an old-schema row, destructive drop/add-column DDL, and a new-schema row;
 - restart after the database already exposes the final schema, with correct old-schema decoding, DDL state checkpointing, and new-schema decoding.
 
-Unit gates cover checkpoint/state atomicity, version 1/2/3 checkpoint compatibility, schema-history serialization, incremental keyset progress/control, completed-signal replay, PostgreSQL snapshot/file/in-process signal parsing, MySQL signal parsing, durable runtime signal acknowledgement, management gating, replay-state rewind, scalar and extension conversions, heartbeat encoding, selected-table isolation, create/alter/drop/rename DDL application, and JKS plus modern PKCS#12 TLS-store conversion and failure handling. A librdkafka MockCluster gate verifies Kafka key filtering, single-partition consumption, and no offset commit before durable signal acknowledgement. The external PostgreSQL 17 gate verifies forced replication-backend termination and automatic recovery, explicit failure after a checkpoint's slot is lost, periodic heartbeat emission, successful execution of `heartbeat.action.query`, heartbeat-table filtering, source/file/in-process-signaled chunking, immediate external-signal checkpointing, file and in-process read-only signaling without a signal table, checkpoint restart, additional conditions, concurrent-update deduplication, pause/resume/scoped-stop control, read-only transaction watermarks under a held update, restricted table permissions, zero connector watermark writes, unique surrogate-key ordering, completion cleanup, signal-table isolation, and snapshot/WAL equality for hstore, domains, enums, and tsvector. An opt-in superuser fixture temporarily limits `max_slot_wal_keep_size`, drives a slot to `wal_status=lost`, verifies fail-closed resume, and restores the original setting; it must be run on an isolated PostgreSQL instance. An optional fixture adds vector/halfvec/sparsevec and PostGIS geometry/geography when those extensions are installed; neither extension is installed on the current PostgreSQL 17 test instance. The external MySQL 8.4 gate verifies periodic heartbeat emission during an idle stream, exact-server-UUID GTID startup, checkpoint recovery, destructive-DDL recovery including schema-invariant index/default operations, in-process incremental snapshot execution, typed keyset restart after deletion/insertion, durable completed signal IDs, concurrent-window deduplication, the core plus OGC spatial snapshot/binlog type matrix, and real-broker Kafka replay across the connector-checkpoint/offset-commit crash window; the test requires temporary free space on the MySQL data volume.
+Unit gates cover checkpoint/state atomicity, version 1/2/3 checkpoint compatibility, schema-history serialization, incremental keyset progress/control, completed-signal replay, PostgreSQL snapshot/file/in-process signal parsing, MySQL signal parsing, durable runtime signal acknowledgement, management gating, replay-state rewind, scalar and extension conversions, heartbeat encoding, selected-table isolation, create/alter/drop/rename DDL application, and JKS plus modern PKCS#12 TLS-store conversion and failure handling. A librdkafka MockCluster gate verifies Kafka key filtering, single-partition consumption, and no offset commit before durable signal acknowledgement. The external PostgreSQL 17 gate verifies forced replication-backend termination and automatic recovery, explicit failure after a checkpoint's slot is lost, periodic heartbeat emission, successful execution of `heartbeat.action.query`, heartbeat-table filtering, source/file/in-process-signaled chunking, immediate external-signal checkpointing, file and in-process read-only signaling without a signal table, checkpoint restart, additional conditions, concurrent-update deduplication, pause/resume/scoped-stop control, read-only transaction watermarks under a held update, restricted table permissions, zero connector watermark writes, unique surrogate-key ordering, completion cleanup, signal-table isolation, and snapshot/WAL equality for hstore, domains, enums, and tsvector. An opt-in superuser fixture temporarily limits `max_slot_wal_keep_size`, drives a slot to `wal_status=lost`, verifies fail-closed resume, and restores the original setting; it must be run on an isolated PostgreSQL instance. A required Docker/CI fixture verifies vector/halfvec/sparsevec and PostGIS geometry/geography on PostgreSQL 17. The external MySQL 8.4 gate verifies periodic heartbeat emission during an idle stream, exact-server-UUID GTID startup, checkpoint recovery, destructive-DDL recovery including schema-invariant index/default operations, in-process incremental snapshot execution, typed keyset restart after deletion/insertion, durable completed signal IDs, concurrent-window deduplication, the core plus OGC spatial snapshot/binlog type matrix, and real-broker Kafka replay across the connector-checkpoint/offset-commit crash window; the test requires temporary free space on the MySQL data volume.
 
 ### 11. SQL Server Connector
 
@@ -457,7 +457,11 @@ RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo \
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture --test-threads=1
 ```
 
-These tests create isolated business-table/signal-table/publication/slot/role names and temporary signal files, then verify snapshot rows, ordered transactional create/update/delete events, checkpoint stop, an old-schema row, destructive drop/add-column DDL, a new-schema row, historical `Relation` replay with schema versions 1 and 2, restart without snapshot replay, forced termination and automatic recovery of the active replication backend, fail-closed resume after deleting a checkpoint's slot, periodic heartbeat records at a safe WAL position, `heartbeat.action.query`, heartbeat-table filtering, checkpointed source/file/in-process incremental snapshots, immediate external-signal state checkpointing, filtered chunks, concurrent-update deduplication, pause/resume/scoped-stop control, file and in-process read-only snapshots without a signal table, read-only transaction watermarks with a held update, zero watermark writes under restricted permissions, unique surrogate ordering against a reversed UUID primary-key order, signal-table isolation, and identical snapshot/WAL conversion across the core PostgreSQL type matrix including hstore, domain, enum, and tsvector values. The opt-in superuser fixture has also driven a live slot to `wal_status=lost` and verified fail-closed resume on PostgreSQL 17. An optional fixture exercises pgvector and PostGIS types when installed. The mandatory gates pass against PostgreSQL 17 with `wal_level=logical`; the current instance has neither optional extension installed.
+These tests create isolated business-table/signal-table/publication/slot/role names and temporary signal files, then verify snapshot rows, ordered transactional create/update/delete events, checkpoint stop, an old-schema row, destructive drop/add-column DDL, a new-schema row, historical `Relation` replay with schema versions 1 and 2, restart without snapshot replay, forced termination and automatic recovery of the active replication backend, fail-closed resume after deleting a checkpoint's slot, periodic heartbeat records at a safe WAL position, `heartbeat.action.query`, heartbeat-table filtering, checkpointed source/file/in-process incremental snapshots, immediate external-signal state checkpointing, filtered chunks, concurrent-update deduplication, pause/resume/scoped-stop control, file and in-process read-only snapshots without a signal table, read-only transaction watermarks with a held update, zero watermark writes under restricted permissions, unique surrogate ordering against a reversed UUID primary-key order, signal-table isolation, and identical snapshot/WAL conversion across the core PostgreSQL type matrix including hstore, domain, enum, and tsvector values. The opt-in superuser fixture has also driven a live slot to `wal_status=lost` and verified fail-closed resume on PostgreSQL 17. The Docker fixture additionally requires pgvector and PostGIS snapshot/WAL equality on PostgreSQL 17.
+
+```bash
+bash scripts/test-postgresql-extensions.sh
+```
 
 The optional external Kafka signal gate creates a unique single-partition topic, sends a foreign-key record followed by a connector-key record, verifies that only the matching signal is delivered, observes the skipped offset, releases the durable acknowledgement, verifies the next committed offset, and deletes the topic:
 
@@ -488,11 +492,10 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. Roadmap
 
-1. Close the optional live PostgreSQL PostGIS/pgvector type gate.
-2. Close SQL Server container-portability and extended-type gates.
-3. Add real-broker Kafka Sink delivery and failure-path gates.
-4. Only then consider additional databases.
-5. Add Schema Registry formats, packaging, security policy, operational runbooks, and stable upgrade migrations before `1.0`.
+1. Close SQL Server container-portability and extended-type gates.
+2. Add real-broker Kafka Sink delivery and failure-path gates.
+3. Only then consider additional databases.
+4. Add Schema Registry formats, packaging, security policy, operational runbooks, and stable upgrade migrations before `1.0`.
 
 ---
 
@@ -751,9 +754,9 @@ Connector-state version 5 保存 signal ID、展开后的集合、每集合 cond
 
 重放历史 `Relation` 时，如果当前 catalog 发现失败，Rustium 会保留 WAL 提供的名称、顺序、OID、typmod 和 key 标志。类型名解析会先复用 checkpoint 中完全匹配的列身份；catalog 与历史都无法解析时，字段使用保守的 `unknown_oid_*` 名称。两条回退路径都会发出可观测 warning，在不伪造 nullable/default 元数据的前提下保持解码顺序。
 
-#### 9.5 PostgreSQL 剩余门槛
+#### 9.5 PostgreSQL 扩展 fixture
 
-- 服务器已安装扩展时的 PostGIS/pgvector 实测；
+`scripts/test-postgresql-extensions.sh` 使用仓库 Dockerfile 构建 PostgreSQL 17 镜像，安装同主版本 pgvector 和 PostGIS 包，启用逻辑复制，创建两个扩展并运行精确的快照/WAL 等值测试。严格 fixture 要求 vector、halfvec、sparsevec、geometry、geography 全部存在；独立 GitHub CI job 会在每次 push 和 pull request 时运行。
 
 ### 10. MySQL 连接器
 
@@ -826,7 +829,7 @@ MySQL 8.4 Docker 门槛覆盖：
 - 在旧 schema 行之前停止并建立 checkpoint，随后执行破坏性删列/加列 DDL，再写入新 schema 行；
 - 当数据库已经暴露最终 schema 后重启，正确解码旧 schema 行、checkpoint DDL 状态，并解码新 schema 行。
 
-单元门槛覆盖 checkpoint/state 原子性、version 1/2/3 checkpoint 兼容、schema-history 序列化、增量 keyset 进度/控制、已完成 signal 重放、PostgreSQL snapshot/file/in-process 信号解析、MySQL 信号解析、持久 runtime 信号确认、管理端点门槛、重放状态回卷、标量与扩展类型转换、heartbeat 编码、选表隔离、create/alter/drop/rename DDL 应用，以及 JKS 与现代 PKCS#12 TLS 存储转换和失败处理。librdkafka MockCluster 门槛会验证 Kafka key 过滤、单 partition 消费，以及持久信号确认前不提交 offset。外部 PostgreSQL 17 门槛验证强制终止 replication backend 后自动恢复、checkpoint 对应 slot 丢失后的显式失败、周期 heartbeat、成功执行 `heartbeat.action.query`、heartbeat 表过滤、source/file/in-process 信号分块、外部信号即时 checkpoint、完全无信号表的 file 和 in-process 只读信号、checkpoint 重启、additional condition、并发更新去重、pause/resume/scoped-stop 控制、保持更新事务时的只读事务水位、受限表权限、零连接器 watermark 写入、唯一 surrogate-key 排序、完成状态清理、信号表隔离，以及 hstore、domain、enum、tsvector 的快照/WAL 一致性。可选 superuser fixture 会临时限制 `max_slot_wal_keep_size`、让 slot 进入 `wal_status=lost`、验证 fail-closed 恢复并还原原设置，必须在隔离的 PostgreSQL 实例上运行。可选扩展 fixture 会在已安装相应扩展时增加 vector/halfvec/sparsevec 和 PostGIS geometry/geography；当前 PostgreSQL 17 测试实例未安装这两个扩展。外部 MySQL 8.4 门槛还会验证空闲 stream 周期 heartbeat、精确 server UUID 的 GTID 启动、checkpoint 恢复（包含 schema-invariant 索引/默认值操作的破坏性 DDL 恢复）、删除/插入后的带类型 keyset 重启、已完成 signal ID 持久化、chunk 窗口并发去重、核心加 OGC 空间类型的快照/binlog 类型矩阵，以及 connector checkpoint/offset commit 崩溃窗口中的真实 broker Kafka signal 重放。
+单元门槛覆盖 checkpoint/state 原子性、version 1/2/3 checkpoint 兼容、schema-history 序列化、增量 keyset 进度/控制、已完成 signal 重放、PostgreSQL snapshot/file/in-process 信号解析、MySQL signal 解析、持久 runtime 信号确认、管理端点门槛、重放状态回卷、标量与扩展类型转换、heartbeat 编码、选表隔离、create/alter/drop/rename DDL 应用，以及 JKS 与现代 PKCS#12 TLS 存储转换和失败处理。librdkafka MockCluster 门槛会验证 Kafka key 过滤、单 partition 消费，以及持久信号确认前不提交 offset。外部 PostgreSQL 17 门槛验证强制终止 replication backend 后自动恢复、checkpoint 对应 slot 丢失后的显式失败、周期 heartbeat、成功执行 `heartbeat.action.query`、heartbeat 表过滤、source/file/in-process 信号分块、外部信号即时 checkpoint、完全无信号表的 file 和 in-process 只读信号、checkpoint 重启、additional condition、并发更新去重、pause/resume/scoped-stop 控制、保持更新事务时的只读事务水位、受限表权限、零连接器 watermark 写入、唯一 surrogate-key 排序、完成状态清理、信号表隔离，以及 hstore、domain、enum、tsvector 的快照/WAL 一致性。可选 superuser fixture 会临时限制 `max_slot_wal_keep_size`、让 slot 进入 `wal_status=lost`、验证 fail-closed 恢复并还原原设置，必须在隔离的 PostgreSQL 实例上运行。必选 Docker/CI fixture 会在 PostgreSQL 17 上验证 vector/halfvec/sparsevec 与 PostGIS geometry/geography。外部 MySQL 8.4 门槛还会验证空闲 stream 周期 heartbeat、精确 server UUID 的 GTID 启动、checkpoint 恢复（包含 schema-invariant 索引/默认值操作的破坏性 DDL 恢复）、删除/插入后的带类型 keyset 重启、已完成 signal ID 持久化、chunk 窗口并发去重、核心加 OGC 空间类型的快照/binlog 类型矩阵，以及 connector checkpoint/offset commit 崩溃窗口中的真实 broker Kafka signal 重放。
 
 ### 11. SQL Server 连接器
 
@@ -941,7 +944,11 @@ RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo \
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture --test-threads=1
 ```
 
-这些测试使用隔离的业务表/信号表/publication/slot/role 名称和临时信号文件，验证快照记录、同一事务内有序的 create/update/delete 事件、checkpoint 停止、旧 schema 行、破坏性删列/加列 DDL、新 schema 行、schema version 1 和 2 的历史 `Relation` 重放、重启不重复快照、强制终止活动 replication backend 后自动恢复、删除 checkpoint 对应 slot 后 fail-closed 恢复、安全 WAL 位点上的周期 heartbeat、`heartbeat.action.query`、heartbeat 表过滤、带 checkpoint 的 source/file/in-process 增量快照、外部信号状态即时 checkpoint、过滤分块、并发更新去重、pause/resume/scoped-stop 控制、完全无信号表的 file 和 in-process 只读快照、保持更新事务时的只读事务水位、受限权限下零 watermark 写入、与 UUID 主键反向顺序对照的唯一 surrogate 排序、信号表隔离，以及包含 hstore、domain、enum、tsvector 的 PostgreSQL 核心类型矩阵在快照/WAL 路径上的一致转换。可选 superuser fixture 也已在 PostgreSQL 17 上让真实 slot 进入 `wal_status=lost` 并验证 fail-closed 恢复。可选扩展 fixture 会在已安装时实测 pgvector 和 PostGIS 类型。必选门槛已在启用 `wal_level=logical` 的 PostgreSQL 17 上通过；当前实例未安装这两个可选扩展。
+这些测试使用隔离的业务表/信号表/publication/slot/role 名称和临时信号文件，验证快照记录、同一事务内有序的 create/update/delete 事件、checkpoint 停止、旧 schema 行、破坏性删列/加列 DDL、新 schema 行、schema version 1 和 2 的历史 `Relation` 重放、重启不重复快照、强制终止活动 replication backend 后自动恢复、删除 checkpoint 对应 slot 后 fail-closed 恢复、安全 WAL 位点上的周期 heartbeat、`heartbeat.action.query`、heartbeat 表过滤、带 checkpoint 的 source/file/in-process 增量快照、外部信号状态即时 checkpoint、过滤分块、并发更新去重、pause/resume/scoped-stop 控制、完全无信号表的 file 和 in-process 只读快照、保持更新事务时的只读事务水位、受限权限下零 watermark 写入、与 UUID 主键反向顺序对照的唯一 surrogate 排序、信号表隔离，以及包含 hstore、domain、enum、tsvector 的 PostgreSQL 核心类型矩阵在快照/WAL 路径上的一致转换。可选 superuser fixture 也已在 PostgreSQL 17 上让真实 slot 进入 `wal_status=lost` 并验证 fail-closed 恢复。Docker fixture 还会在 PostgreSQL 17 上强制验证 pgvector 和 PostGIS 的快照/WAL 一致性。
+
+```bash
+bash scripts/test-postgresql-extensions.sh
+```
 
 可选的外部 Kafka 信号门槛会创建唯一命名的单 partition topic，先发送其他 connector key 的 record，再发送目标 connector key 的 record，验证只投递匹配信号、观察跳过后的 offset、释放持久确认、验证下一已提交 offset，最后删除 topic：
 
@@ -972,8 +979,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. 路线图
 
-1. 补齐 PostgreSQL 可选 PostGIS/pgvector 类型实测门槛。
-2. 补齐 SQL Server 容器可移植性和扩展类型门槛。
-3. 补齐真实 broker Kafka Sink 投递与失败路径门槛。
-4. 只有完成前三项后才考虑其他数据库。
-5. 在 `1.0` 前补 Schema Registry 格式、打包、安全策略、运维手册和稳定升级迁移。
+1. 补齐 SQL Server 容器可移植性和扩展类型门槛。
+2. 补齐真实 broker Kafka Sink 投递与失败路径门槛。
+3. 只有完成前两项后才考虑其他数据库。
+4. 在 `1.0` 前补 Schema Registry 格式、打包、安全策略、运维手册和稳定升级迁移。
