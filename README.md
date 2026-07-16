@@ -123,7 +123,7 @@ export RUSTIUM_POSTGRES_TEST_PORT=5432
 export RUSTIUM_POSTGRES_TEST_USER=postgres
 export RUSTIUM_POSTGRES_TEST_PASSWORD='replace-me'
 export RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo
-cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
+cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture --test-threads=1
 ```
 
 The tests create uniquely named tables, signal tables, publications, replication roles, managed slots, and signal files. They cover snapshot handoff, transaction ordering, checkpoint stop, destructive DDL with historical `Relation` replay, restart without a repeated snapshot, forced termination and automatic recovery of the active replication backend, explicit failure after a checkpoint's replication slot is lost, periodic heartbeat records, `heartbeat.action.query`, heartbeat-table filtering, resumable source/file/in-process-signaled incremental snapshots, immediate external-signal state checkpointing, additional conditions, concurrent-update deduplication, pause/resume/scoped-stop controls, read-only transaction-snapshot watermarking with no signal-table writes, file and in-process read-only signaling without any signal table, validated surrogate-key ordering, and identical snapshot/WAL conversion for high-precision numeric, special values, JSONB, UUID, bytea, temporal, network, range, bit, array, hstore, domain, enum, and tsvector types. These gates pass against PostgreSQL 17 with `wal_level=logical`. An opt-in fixture also temporarily constrains `max_slot_wal_keep_size`, generates WAL, forces checkpoints, and verifies explicit failure after `wal_status=lost`; it restores the original setting before returning. Set `RUSTIUM_POSTGRES_RUN_WAL_RETENTION_TEST=true` only on an isolated superuser test instance. Another optional fixture verifies vector/halfvec/sparsevec and PostGIS geometry/geography whenever `vector` or `postgis` is already installed; the current PostgreSQL 17 test instance has neither extension installed. A separate librdkafka MockCluster gate verifies Kafka key filtering, single-partition consumption, and offset commit only after durable signal acknowledgement.
@@ -141,7 +141,7 @@ Run the optional real-broker Kafka signal gate against a reachable plaintext Kaf
 ```bash
 RUSTIUM_KAFKA_TEST_BOOTSTRAP_SERVERS=kafka.example.com:9092 \
 cargo test -p rustium-signal-kafka --test kafka_external \
-  -- --ignored --nocapture
+  -- --ignored --nocapture --test-threads=1
 ```
 
 Run the external SQL Server 2017+ CDC integration test without storing credentials in the repository:
@@ -406,6 +406,7 @@ Implemented behavior:
 - optional `heartbeat.action.query` execution on a separate ordinary MySQL connection at the heartbeat cadence
 - FULL, MINIMAL, and NOBLOB row images with explicit unavailable values where MySQL omits data
 - PARTIAL_JSON update diffs reconstructed from a complete before image, with unavailable fallback when safe reconstruction is impossible
+- source-table, file, and in-process signaling for incremental snapshot controls, with chunk progress persisted in connector state
 - Docker and external integration coverage against MySQL 8.4, including filtered GTID startup and restart across destructive DDL
 
 Recommended MySQL permissions for the connector user:
@@ -428,7 +429,9 @@ DDL parsing failures stop the connector by default. Debezium-compatible `schema.
 
 Checkpoint v1 JSON remains readable, but a completed MySQL v1 checkpoint has no historical schema baseline and is rejected for resume. Reset that checkpoint and run a new initial snapshot once to establish checkpoint v2 schema history.
 
-Known MySQL gaps include signaling records, incremental snapshots, Java-specific truststore/keystore conversion, and wider DDL/type fixtures. MySQL `signal.*` and incremental-snapshot properties emit an explicit compatibility warning until those capabilities are implemented. When `binlog_row_value_options=PARTIAL_JSON` is enabled, a diff without a complete before image remains explicitly unavailable rather than being guessed.
+MySQL supports source-table, file, and bounded in-process signaling for Debezium-compatible `execute-snapshot`, `pause-snapshot`, `resume-snapshot`, and `stop-snapshot` controls. Incremental snapshots are chunked, ordered by primary key when available, and persisted in connector state so a checkpoint restart resumes the active collection. Java-specific truststore/keystore conversion remains unsupported; wider DDL/type fixtures and an optional Kafka signal consumer are still tracked as follow-up work. When `binlog_row_value_options=PARTIAL_JSON` is enabled, a diff without a complete before image remains explicitly unavailable rather than being guessed.
+
+For MySQL source-table signaling, set `signal.data.collection=database.signal_table` and include the signal table in the connector user's `SELECT` scope. The table must expose `id`, `type`, and `data` columns; the connector does not write to it. File signaling consumes one JSON envelope per line and clears the file only after reading it. In-process signaling uses the same `SignalSender` and HTTP management route as the other connectors. MySQL `signal.enabled.channels=kafka` is accepted only as a migration warning and is not enabled until the connector has a native Kafka signal consumer.
 
 ### SQL Server
 
@@ -652,7 +655,7 @@ export RUSTIUM_POSTGRES_TEST_PORT=5432
 export RUSTIUM_POSTGRES_TEST_USER=postgres
 export RUSTIUM_POSTGRES_TEST_PASSWORD='replace-me'
 export RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo
-cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture
+cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture --test-threads=1
 ```
 
 测试会创建唯一命名的业务表、信号表、publication、复制角色、托管 slot 和信号文件，覆盖快照切换、事务顺序、checkpoint 停止、跨破坏性 DDL 的历史 `Relation` 重放、重启不重复快照、强制终止活动 replication backend 后自动恢复、checkpoint 对应 slot 丢失后的显式失败、周期 heartbeat record、`heartbeat.action.query`、heartbeat 表过滤、可恢复的 source/file/in-process 信号增量快照、外部信号状态即时 checkpoint、additional condition、并发更新去重、pause/resume/scoped-stop 控制、不写信号表的只读事务快照 watermark、完全无信号表的 file 和 in-process 只读信号、经验证的 surrogate-key 排序，以及高精度 numeric、特殊值、JSONB、UUID、bytea、时间、网络、range、bit、数组、hstore、domain、enum 和 tsvector 类型在快照/WAL 路径上的一致转换。这些门槛已在启用 `wal_level=logical` 的 PostgreSQL 17 上通过。可选 WAL retention fixture 会临时限制 `max_slot_wal_keep_size`、生成 WAL 并强制 checkpoint，验证 `wal_status=lost` 后显式失败，结束前恢复原设置；只应在隔离的 superuser 测试实例上设置 `RUSTIUM_POSTGRES_RUN_WAL_RETENTION_TEST=true` 单独运行。另一个可选 fixture 会在数据库已安装 `vector` 或 `postgis` 时验证 vector/halfvec/sparsevec 与 PostGIS geometry/geography；当前 PostgreSQL 17 测试实例未安装这两个扩展。独立的 librdkafka MockCluster 门槛会验证 Kafka key 过滤、单 partition 消费，以及只有持久信号确认后才提交 offset。
@@ -927,6 +930,7 @@ MySQL 连接器通过原生复制协议读取行级二进制日志。
 - 可选地在 heartbeat 周期通过独立普通 MySQL 连接执行 `heartbeat.action.query`
 - 支持 FULL、MINIMAL、NOBLOB row image；MySQL 未提供的值会明确标记为 unavailable
 - 根据完整 before image 重建 PARTIAL_JSON 更新 diff；无法安全重建时保守标记为 unavailable
+- 支持源表、文件和进程内增量快照信号，并将 chunk 进度持久化到 connector state
 - MySQL 8.4 Docker 和外部集成测试，包括过滤后的 GTID 启动和跨破坏性 DDL 重启
 
 建议给 MySQL 连接器用户授予：
@@ -949,7 +953,9 @@ DDL 默认解析失败即停止连接器。可使用 Debezium 兼容参数 `sche
 
 Checkpoint v1 JSON 仍可读取，但已完成的 MySQL v1 checkpoint 不含历史 schema 基线，因此会拒绝恢复。升级后需要重置该 checkpoint 并执行一次新的 initial snapshot，以建立 checkpoint v2 schema history。
 
-MySQL 已知缺口包括信号记录、Java 专用 truststore/keystore 转换、增量快照，以及更广的 DDL/类型样例。MySQL 的 `signal.*` 和增量快照参数在对应能力实现前会输出明确的兼容性警告。启用 `binlog_row_value_options=PARTIAL_JSON` 时，如果 diff 没有完整 before image，仍会明确标记为 unavailable，而不会猜测结果。
+MySQL 已支持源表、文件和有界进程内信号，并兼容 Debezium 的 `execute-snapshot`、`pause-snapshot`、`resume-snapshot`、`stop-snapshot` 控制。增量快照按 chunk 执行；优先按主键排序，并将活动进度持久化到 connector state，checkpoint 重启后可继续当前集合。Java 专用 truststore/keystore 转换仍不支持；更广的 DDL/类型样例和可选 Kafka signal consumer 作为后续工作跟踪。启用 `binlog_row_value_options=PARTIAL_JSON` 时，如果 diff 没有完整 before image，仍会明确标记为 unavailable，而不会猜测结果。
+
+MySQL 源表信号需要配置 `signal.data.collection=database.signal_table`，并让连接器用户对信号表具有 `SELECT` 权限；连接器不会向信号表写入数据。信号表必须提供 `id`、`type`、`data` 三列。文件信号每行一个 JSON envelope，读取后清空文件；进程内信号复用其他连接器的 `SignalSender` 和 HTTP 管理端点。`signal.enabled.channels=kafka` 目前仅作为迁移兼容警告接受，在原生 Kafka signal consumer 完成前不会启用。
 
 ### Debezium 配置兼容
 

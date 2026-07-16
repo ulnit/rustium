@@ -129,6 +129,12 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
         heartbeat_action_query: None,
         heartbeat_topics_prefix: "__debezium-heartbeat".into(),
         heartbeat_topic_name: None,
+        signal_data_collection: None,
+        signal_enabled_channels: vec!["source".into(), "file".into(), "in-process".into()],
+        signal_file: "signals.jsonl".into(),
+        signal_poll_interval: Duration::from_millis(500),
+        incremental_snapshot_chunk_size: 1_024,
+        incremental_snapshot_watermarking_strategy: "insert_insert".into(),
     };
     let mut source = MySqlSource::new(
         "inventory-mysql",

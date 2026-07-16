@@ -8,7 +8,8 @@ use mysql_async::{Conn, OptsBuilder, prelude::Queryable};
 use rustium_config::{MySqlSourceConfig, SnapshotConfig, SnapshotMode, TableSelection};
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
-    RecordBoundary, SourceConnector, SourceContext, SourcePosition, SourceRecord,
+    RecordBoundary, SignalRecord, SignalSender, SourceConnector, SourceContext, SourcePosition,
+    SourceRecord,
 };
 use rustium_mysql::MySqlSource;
 use tokio::{
@@ -29,6 +30,87 @@ struct TestSettings {
     cdc_user: String,
     cdc_password: String,
     database: String,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external MySQL 8.0+ server with row binlog and GTID enabled"]
+async fn runs_incremental_snapshot_from_mysql_signal_channel() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_incremental_{}", &suffix[..12]);
+    let signal_table = format!("rustium_signal_{}", &suffix[..12]);
+    let connector_name = format!("mysql-incremental-{}", &suffix[..12]);
+    let qualified_table = format!(
+        "{}.{}",
+        quote_identifier(&settings.database),
+        quote_identifier(&table_name)
+    );
+    let qualified_signal = format!(
+        "{}.{}",
+        quote_identifier(&settings.database),
+        quote_identifier(&signal_table)
+    );
+    let mut admin = connect_admin(&settings).await?;
+    let outcome: TestResult = async {
+        admin.query_drop(format!("CREATE TABLE {qualified_table} (id BIGINT PRIMARY KEY, value VARCHAR(50) NOT NULL)")).await?;
+        admin.query_drop(format!("CREATE TABLE {qualified_signal} (id VARCHAR(200) PRIMARY KEY, type VARCHAR(64) NOT NULL, data JSON NOT NULL)")).await?;
+        admin.query_drop(format!("INSERT INTO {qualified_table} VALUES (1,'one'),(2,'two')")).await?;
+        let mut config = settings.source_config(&table_name);
+        config.signal_data_collection = Some(format!("{}.{}", settings.database, signal_table));
+        config.signal_enabled_channels = vec!["source".into(), "in-process".into()];
+        config.incremental_snapshot_chunk_size = 2;
+        let (snapshot_position, schema_history) = capture_snapshot(&connector_name, config.clone()).await?;
+        let checkpoint = Checkpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            connector_name: connector_name.clone(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: snapshot_position.clone(),
+            snapshot_completed: true,
+            config_fingerprint: "mysql-incremental-test".into(),
+            updated_at: SystemTime::now(),
+            connector_state: Some(schema_history),
+        };
+        let mut source = MySqlSource::new(&connector_name, config, SnapshotConfig { mode: SnapshotMode::Never, fetch_size: 1 });
+        source.validate().await?;
+        let (mut output, signal_sender, cancellation, source_task) = start_source_with_signals(source, Some(checkpoint), Some(snapshot_position));
+        signal_sender.send(SignalRecord::new(
+            "mysql-incremental-1",
+            "execute-snapshot",
+            serde_json::json!({"type":"incremental","data-collections":[format!("{}.{}", settings.database, table_name)]}),
+        )).await?;
+        let mut rows = 0;
+        let capture_result: TestResult = async {
+            loop {
+                let record = receive(&mut output).await?;
+                let Some(event) = record.event else { continue };
+                if event.source.attributes.get("rustium.snapshot.kind").and_then(serde_json::Value::as_str) != Some("incremental") { continue; }
+                require(event.operation == Operation::Read, "MySQL incremental event is not a read")?;
+                rows += 1;
+                if rows == 2 { break Ok(()) }
+            }
+        }.await;
+        finish_source(cancellation, source_task, capture_result).await?;
+        require(rows == 2, "MySQL incremental snapshot did not emit all rows")
+    }.await;
+    let cleanup = async {
+        admin
+            .query_drop(format!("DROP TABLE IF EXISTS {qualified_signal}"))
+            .await?;
+        admin
+            .query_drop(format!("DROP TABLE IF EXISTS {qualified_table}"))
+            .await?;
+        admin.disconnect().await.map_err(boxed_error)
+    }
+    .await;
+    match (outcome, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            eprintln!("MySQL incremental cleanup failed: {cleanup_error}");
+            Err(error)
+        }
+    }
 }
 
 impl TestSettings {
@@ -76,6 +158,12 @@ impl TestSettings {
             heartbeat_action_query: None,
             heartbeat_topics_prefix: "__debezium-heartbeat".into(),
             heartbeat_topic_name: None,
+            signal_data_collection: None,
+            signal_enabled_channels: vec!["source".into(), "file".into(), "in-process".into()],
+            signal_file: "signals.jsonl".into(),
+            signal_poll_interval: Duration::from_millis(500),
+            incremental_snapshot_chunk_size: 1_024,
+            incremental_snapshot_watermarking_strategy: "insert_insert".into(),
         }
     }
 }
@@ -598,6 +686,37 @@ fn start_source(
             .await
     });
     (output_rx, cancellation, source_task)
+}
+
+fn start_source_with_signals(
+    source: MySqlSource,
+    initial_checkpoint: Option<Checkpoint>,
+    acknowledged_position: Option<SourcePosition>,
+) -> (
+    mpsc::Receiver<rustium_core::Result<SourceRecord>>,
+    SignalSender,
+    CancellationToken,
+    JoinHandle<rustium_core::Result<()>>,
+) {
+    let (output_tx, output_rx) = mpsc::channel(64);
+    let (signal_sender, signals) = rustium_core::signal_channel(16);
+    let (ack_tx, ack_rx) = watch::channel(acknowledged_position);
+    let cancellation = CancellationToken::new();
+    let source_cancel = cancellation.clone();
+    let source_task = tokio::spawn(async move {
+        let _ack_tx = ack_tx;
+        let mut source = source;
+        source
+            .run(SourceContext {
+                output: output_tx,
+                acknowledged: ack_rx,
+                initial_checkpoint,
+                signals,
+                cancellation: source_cancel,
+            })
+            .await
+    });
+    (output_rx, signal_sender, cancellation, source_task)
 }
 
 async fn finish_source<T>(

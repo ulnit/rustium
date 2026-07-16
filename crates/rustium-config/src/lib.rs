@@ -251,6 +251,20 @@ impl SourceConfig {
                     config.heartbeat_topic_name.as_deref(),
                 );
                 semantic
+                    .as_object_mut()
+                    .expect("source semantic is an object")
+                    .insert(
+                        "signals".into(),
+                        serde_json::json!({
+                            "data_collection": config.signal_data_collection,
+                            "enabled_channels": config.signal_enabled_channels,
+                            "file": config.signal_file,
+                            "poll_interval_ms": config.signal_poll_interval.as_millis(),
+                            "chunk_size": config.incremental_snapshot_chunk_size,
+                            "watermarking_strategy": config.incremental_snapshot_watermarking_strategy,
+                        }),
+                    );
+                semantic
             }
             Self::Sqlserver(config) => serde_json::json!({
                 "type": "sqlserver",
@@ -528,6 +542,19 @@ pub struct MySqlSourceConfig {
     pub heartbeat_topics_prefix: String,
     #[serde(default)]
     pub heartbeat_topic_name: Option<String>,
+    #[serde(default)]
+    pub signal_data_collection: Option<String>,
+    #[serde(default = "default_signal_enabled_channels")]
+    pub signal_enabled_channels: Vec<String>,
+    #[serde(default = "default_signal_file")]
+    pub signal_file: String,
+    #[serde(default = "default_signal_poll_interval")]
+    #[serde(with = "humantime_serde")]
+    pub signal_poll_interval: Duration,
+    #[serde(default = "default_incremental_snapshot_chunk_size")]
+    pub incremental_snapshot_chunk_size: usize,
+    #[serde(default = "default_incremental_snapshot_watermarking_strategy")]
+    pub incremental_snapshot_watermarking_strategy: String,
 }
 
 impl MySqlSourceConfig {
@@ -558,6 +585,52 @@ impl MySqlSourceConfig {
             self.heartbeat_topic_name.as_deref(),
             self.heartbeat_action_query.as_deref(),
         )?;
+        if self.incremental_snapshot_chunk_size == 0 {
+            return Err(Error::Configuration(
+                "source.incremental_snapshot_chunk_size must be greater than zero".into(),
+            ));
+        }
+        if self.incremental_snapshot_watermarking_strategy != "insert_insert" {
+            return Err(Error::Configuration(
+                "source.incremental_snapshot_watermarking_strategy currently supports only insert_insert".into(),
+            ));
+        }
+        if self.signal_poll_interval.is_zero() {
+            return Err(Error::Configuration(
+                "source.signal_poll_interval must be greater than zero".into(),
+            ));
+        }
+        if self.signal_enabled_channels.iter().any(|channel| {
+            channel.trim().is_empty()
+                || !matches!(channel.as_str(), "source" | "file" | "in-process")
+        }) {
+            return Err(Error::Configuration(
+                "source.signal_enabled_channels currently supports source, file, and in-process for MySQL".into(),
+            ));
+        }
+        if self
+            .signal_enabled_channels
+            .iter()
+            .any(|channel| channel == "file")
+            && self.signal_file.trim().is_empty()
+        {
+            return Err(Error::Configuration(
+                "source.signal_file must not be empty when the file signal channel is enabled"
+                    .into(),
+            ));
+        }
+        if let Some(collection) = &self.signal_data_collection {
+            let mut parts = collection.split('.');
+            let database = parts.next().unwrap_or_default();
+            let table = parts.next().unwrap_or_default();
+            if database.is_empty() || table.is_empty() || parts.next().is_some() {
+                return Err(Error::Configuration(
+                    "source.signal_data_collection must be a database-qualified MySQL table".into(),
+                ));
+            }
+            validate_name(database, "source.signal_data_collection database")?;
+            validate_name(table, "source.signal_data_collection table")?;
+        }
         if !matches!(
             self.ssl_mode.as_str(),
             "disabled" | "preferred" | "required" | "verify_ca" | "verify_identity"

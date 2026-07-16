@@ -216,36 +216,60 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
                 .into(),
         );
     }
-    if [
-        "signal.data.collection",
-        "signal.enabled.channels",
-        "signal.file",
-        "signal.poll.interval.ms",
-        "signal.kafka.topic",
-        "signal.kafka.groupId",
-        "signal.kafka.bootstrap.servers",
-        "signal.kafka.poll.timeout.ms",
-        "incremental.snapshot.chunk.size",
-        "incremental.snapshot.allow.schema.changes",
-        "incremental.snapshot.watermarking.strategy",
-        "read.only",
-    ]
-    .iter()
-    .any(|key| properties.contains_key(*key))
-    {
-        warnings.push(
-            "MySQL signal and incremental snapshot properties are recognized for migration but are not implemented yet; they were ignored"
-                .into(),
-        );
+    let signal_collections = csv_property(properties.get("signal.data.collection"));
+    if signal_collections.len() > 1 {
+        return Err(Error::Configuration(
+            "Rustium MySQL currently accepts one table in signal.data.collection".into(),
+        ));
     }
-    if properties
-        .keys()
-        .any(|key| key.starts_with("signal.consumer."))
-    {
-        warnings.push(
-            "signal.consumer.* is recognized for migration but MySQL signaling is not implemented yet; the properties were ignored"
-                .into(),
-        );
+    let signal_data_collection = signal_collections.into_iter().next();
+    let requested_signal_channels = {
+        let channels = csv_property(properties.get("signal.enabled.channels"));
+        if channels.is_empty() {
+            default_signal_enabled_channels()
+        } else {
+            channels
+        }
+    };
+    let mut signal_enabled_channels = Vec::new();
+    for channel in &requested_signal_channels {
+        let mapped = match channel.as_str() {
+            "source" | "file" | "in-process" => Some(channel.clone()),
+            "kafka" => None,
+            "jmx" => Some("in-process".into()),
+            _ => None,
+        };
+        if let Some(mapped) = mapped
+            && !signal_enabled_channels.contains(&mapped)
+        {
+            signal_enabled_channels.push(mapped);
+        }
+    }
+    if signal_enabled_channels.is_empty() {
+        return Err(Error::Configuration(
+            "MySQL signal.enabled.channels enables no implemented channel".into(),
+        ));
+    }
+    for channel in &requested_signal_channels {
+        match channel.as_str() {
+            "jmx" => warnings.push(
+                "signal.enabled.channels=jmx is JVM-specific; Rustium maps it to the bounded in-process channel and its SignalSender/HTTP management API".into(),
+            ),
+            "source" | "file" | "in-process" => {}
+            "kafka" => warnings.push(
+                "signal.enabled.channels=kafka is recognized for migration but the MySQL Kafka signal consumer is not implemented yet; the channel was ignored".into(),
+            ),
+            _ => warnings.push(format!("signal.enabled.channels={channel} is not implemented and was ignored")),
+        }
+    }
+    if bool_value(
+        properties,
+        "incremental.snapshot.allow.schema.changes",
+        false,
+    )? {
+        return Err(Error::Configuration(
+            "incremental.snapshot.allow.schema.changes=true is not implemented for MySQL".into(),
+        ));
     }
     let gtid_source_includes = csv_property(properties.get("gtid.source.includes"));
     let gtid_source_excludes = csv_property(properties.get("gtid.source.excludes"));
@@ -317,6 +341,26 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
                 .cloned()
                 .unwrap_or_else(default_heartbeat_topics_prefix),
             heartbeat_topic_name: properties.get("topic.heartbeat.name").cloned(),
+            signal_data_collection,
+            signal_enabled_channels,
+            signal_file: properties
+                .get("signal.file")
+                .cloned()
+                .unwrap_or_else(default_signal_file),
+            signal_poll_interval: duration_ms(
+                properties,
+                "signal.poll.interval.ms",
+                default_signal_poll_interval(),
+            )?,
+            incremental_snapshot_chunk_size: usize_value(
+                properties,
+                "incremental.snapshot.chunk.size",
+                default_incremental_snapshot_chunk_size(),
+            )?,
+            incremental_snapshot_watermarking_strategy: properties
+                .get("incremental.snapshot.watermarking.strategy")
+                .cloned()
+                .unwrap_or_else(default_incremental_snapshot_watermarking_strategy),
         }),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -1086,7 +1130,7 @@ gtid.source.includes=(unterminated
     }
 
     #[test]
-    fn warns_when_mysql_signal_properties_are_not_implemented() {
+    fn parses_mysql_signal_and_incremental_snapshot_properties() {
         let config = parse(
             r#"
 name=mysql
@@ -1103,15 +1147,10 @@ signal.consumer.security.protocol=SASL_SSL
 "#,
         )
         .unwrap();
-        assert!(config.compatibility_warnings.iter().any(|warning| {
-            warning.contains("MySQL signal and incremental snapshot properties")
-        }));
-        assert!(
-            config
-                .compatibility_warnings
-                .iter()
-                .any(|warning| { warning.contains("signal.consumer.*") })
-        );
+        let source = config.source.as_mysql().unwrap();
+        assert_eq!(source.signal_enabled_channels, ["file"]);
+        assert_eq!(source.signal_file, "/run/rustium/signals.jsonl");
+        assert_eq!(source.incremental_snapshot_chunk_size, 128);
     }
 
     #[test]

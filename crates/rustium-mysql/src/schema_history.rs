@@ -14,7 +14,7 @@ use sqlparser::{
 };
 
 pub(crate) const MYSQL_SCHEMA_HISTORY_FORMAT: &str = "rustium.mysql.schema-history";
-const MYSQL_SCHEMA_HISTORY_VERSION: u32 = 1;
+const MYSQL_SCHEMA_HISTORY_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TableSchema {
@@ -32,6 +32,29 @@ impl TableSchema {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MySqlSchemaHistoryState {
     tables: Vec<TableSchema>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incremental_snapshot: Option<IncrementalSnapshotProgress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct IncrementalSnapshotProgress {
+    pub(crate) signal_id: String,
+    pub(crate) data_collections: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) additional_conditions: std::collections::BTreeMap<String, String>,
+    pub(crate) current_collection: usize,
+    #[serde(default)]
+    pub(crate) offset: u64,
+    #[serde(default)]
+    pub(crate) chunk_sequence: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) paused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MySqlConnectorState {
+    pub(crate) schemas: HashMap<(String, String), TableSchema>,
+    pub(crate) incremental_snapshot: Option<IncrementalSnapshotProgress>,
 }
 
 pub(crate) fn encode_schema_history(
@@ -39,7 +62,10 @@ pub(crate) fn encode_schema_history(
 ) -> Result<ConnectorStateEnvelope> {
     let mut tables = schemas.values().cloned().collect::<Vec<_>>();
     tables.sort_by_key(TableSchema::key);
-    let payload = serde_json::to_value(MySqlSchemaHistoryState { tables })?;
+    let payload = serde_json::to_value(MySqlSchemaHistoryState {
+        tables,
+        incremental_snapshot: None,
+    })?;
     Ok(ConnectorStateEnvelope::new(
         MYSQL_SCHEMA_HISTORY_FORMAT,
         MYSQL_SCHEMA_HISTORY_VERSION,
@@ -47,6 +73,7 @@ pub(crate) fn encode_schema_history(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn decode_schema_history(
     envelope: &ConnectorStateEnvelope,
 ) -> Result<HashMap<(String, String), TableSchema>> {
@@ -56,7 +83,7 @@ pub(crate) fn decode_schema_history(
             envelope.format, MYSQL_SCHEMA_HISTORY_FORMAT
         )));
     }
-    if envelope.version != MYSQL_SCHEMA_HISTORY_VERSION {
+    if !(1..=MYSQL_SCHEMA_HISTORY_VERSION).contains(&envelope.version) {
         return Err(Error::State(format!(
             "unsupported MySQL schema history version {}; expected {}",
             envelope.version, MYSQL_SCHEMA_HISTORY_VERSION
@@ -74,6 +101,55 @@ pub(crate) fn decode_schema_history(
         }
     }
     Ok(schemas)
+}
+
+pub(crate) fn encode_connector_state(
+    schemas: &HashMap<(String, String), TableSchema>,
+    incremental_snapshot: Option<&IncrementalSnapshotProgress>,
+) -> Result<ConnectorStateEnvelope> {
+    let mut tables = schemas.values().cloned().collect::<Vec<_>>();
+    tables.sort_by_key(TableSchema::key);
+    let payload = serde_json::to_value(MySqlSchemaHistoryState {
+        tables,
+        incremental_snapshot: incremental_snapshot.cloned(),
+    })?;
+    Ok(ConnectorStateEnvelope::new(
+        MYSQL_SCHEMA_HISTORY_FORMAT,
+        MYSQL_SCHEMA_HISTORY_VERSION,
+        payload,
+    ))
+}
+
+pub(crate) fn decode_connector_state(
+    envelope: &ConnectorStateEnvelope,
+) -> Result<MySqlConnectorState> {
+    if envelope.format != MYSQL_SCHEMA_HISTORY_FORMAT {
+        return Err(Error::State(format!(
+            "MySQL checkpoint has connector state format {:?}, expected {:?}",
+            envelope.format, MYSQL_SCHEMA_HISTORY_FORMAT
+        )));
+    }
+    if !(1..=MYSQL_SCHEMA_HISTORY_VERSION).contains(&envelope.version) {
+        return Err(Error::State(format!(
+            "unsupported MySQL schema history version {}; expected 1 through {}",
+            envelope.version, MYSQL_SCHEMA_HISTORY_VERSION
+        )));
+    }
+    let state: MySqlSchemaHistoryState = serde_json::from_value(envelope.payload.clone())?;
+    let mut schemas = HashMap::with_capacity(state.tables.len());
+    for table in state.tables {
+        let key = table.key();
+        if schemas.insert(key.clone(), table).is_some() {
+            return Err(Error::State(format!(
+                "MySQL schema history contains duplicate table {}.{}",
+                key.0, key.1
+            )));
+        }
+    }
+    Ok(MySqlConnectorState {
+        schemas,
+        incremental_snapshot: state.incremental_snapshot,
+    })
 }
 
 pub(crate) fn apply_ddl(
@@ -652,6 +728,12 @@ mod tests {
             heartbeat_action_query: None,
             heartbeat_topics_prefix: "__debezium-heartbeat".into(),
             heartbeat_topic_name: None,
+            signal_data_collection: None,
+            signal_enabled_channels: vec!["source".into(), "file".into(), "in-process".into()],
+            signal_file: "signals.jsonl".into(),
+            signal_poll_interval: Duration::from_millis(500),
+            incremental_snapshot_chunk_size: 1_024,
+            incremental_snapshot_watermarking_strategy: "insert_insert".into(),
         }
     }
 
@@ -729,6 +811,35 @@ mod tests {
         let envelope = encode_schema_history(&schemas).unwrap();
         assert_eq!(envelope.format, MYSQL_SCHEMA_HISTORY_FORMAT);
         assert_eq!(decode_schema_history(&envelope).unwrap(), schemas);
+    }
+
+    #[test]
+    fn round_trips_incremental_snapshot_progress() {
+        let config = config();
+        let mut schemas = HashMap::new();
+        apply_ddl(
+            &mut schemas,
+            "CREATE TABLE inventory.orders (id BIGINT PRIMARY KEY, amount DECIMAL(10,2))",
+            "",
+            &config,
+            "inventory-mysql",
+        )
+        .unwrap();
+        let progress = IncrementalSnapshotProgress {
+            signal_id: "snapshot-1".into(),
+            data_collections: vec!["inventory.orders".into()],
+            additional_conditions: std::collections::BTreeMap::from([(
+                "inventory.orders".into(),
+                "amount > 0".into(),
+            )]),
+            current_collection: 0,
+            offset: 4,
+            chunk_sequence: 3,
+            paused: true,
+        };
+        let envelope = encode_connector_state(&schemas, Some(&progress)).unwrap();
+        let decoded = decode_connector_state(&envelope).unwrap();
+        assert_eq!(decoded.incremental_snapshot, Some(progress));
     }
 
     #[test]

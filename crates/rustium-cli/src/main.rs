@@ -134,6 +134,11 @@ fn in_process_signals_enabled(config: &Config) -> bool {
             .signal_enabled_channels
             .iter()
             .any(|channel| channel == "in-process")
+    }) || config.source.as_mysql().is_some_and(|source| {
+        source
+            .signal_enabled_channels
+            .iter()
+            .any(|channel| channel == "in-process")
     })
 }
 
