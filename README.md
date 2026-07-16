@@ -35,7 +35,7 @@ The repository contains a runnable alpha implementation.
 | Area | Status |
 |---|---|
 | Typed `ChangeEvent` model and deterministic event IDs | Implemented |
-| Bounded Tokio pipeline and graceful shutdown | Implemented |
+| Bounded Tokio pipeline and graceful shutdown | Implemented; required 256-cycle runtime backpressure/retry soak enforced by CI |
 | At-least-once sink/checkpoint/source acknowledgement ordering | Implemented |
 | SQLite checkpoint v2 with versioned connector state | Implemented and unit tested; v1 JSON remains readable |
 | Native JSON and Debezium-compatible JSON, including delete tombstones | Implemented |
@@ -43,7 +43,7 @@ The repository contains a runnable alpha implementation.
 | Kafka sink with idempotent producer settings | Implemented; real-broker delivery and failure gate enforced by CI |
 | PostgreSQL 14+ snapshot, `pgoutput`, persistent schema history, heartbeat records, multi-channel signaling, incremental snapshots, and core type matrix | Implemented; external gates pass with PostgreSQL 17 |
 | MySQL 8+ snapshot, row-binlog streaming, GTID source filters, persistent schema history, and heartbeat records | Implemented; required Docker CI and external MySQL 8.4 recovery/soak gates pass |
-| SQL Server CDC | Implemented; external integration test passes with SQL Server 2022 Developer CU25 |
+| SQL Server CDC | Implemented; required Docker CI and external SQL Server 2022 recovery/soak gates pass |
 | CLI, health, status, stop, and Prometheus endpoints | Implemented |
 | Container image, Helm chart, published crates | Not published |
 
@@ -92,6 +92,15 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+Run the required shared runtime soak gate:
+
+```bash
+RUSTIUM_RUNTIME_SOAK_CYCLES=256 \
+cargo test -p rustium-core --test runtime_soak -- --ignored --nocapture
+```
+
+The gate repeatedly holds a capacity-one Source queue behind a retrying Sink and requires byte-identical batch replay, an unchanged checkpoint until delivery succeeds, ordered final progress, bounded queue admission, exact retry metrics, and Sink shutdown. Separate repeated paths exhaust the finite retry budget and cancel an unbounded 60-second retry wait, proving that the Source is cancelled, the Sink is closed, unacknowledged positions remain uncheckpointed, operational exhaustion enters `FAILED`, and cancellation exits promptly in `STOPPED` without counting a failed event. `RUSTIUM_RUNTIME_SOAK_CYCLES` accepts `1..10000`; CI requires 256 cycles.
 
 Run the real MySQL 8.4 integration test:
 
@@ -568,7 +577,7 @@ Available sinks:
 
 The Kafka Sink accepts only `acks=all` or its `-1` alias because Rustium checkpoints immediately after a successful batch. Allowing `acks=0/1` would acknowledge source progress before Kafka replication and could lose already-checkpointed records. Rustium always enables producer idempotence and owns `bootstrap.servers`, acknowledgement, compression, idempotence, and delivery-timeout properties; those keys cannot be replaced through `sink.properties` or `rustium.kafka.property.*`. Security, batching, and other non-conflicting librdkafka properties remain pass-through. The required real-broker CI gate verifies ordered keys, payloads, headers, true null tombstones, topic cleanup, and an explicit error when broker delivery cannot complete.
 
-Retryable Sink validation, delivery, and flush failures use cancellation-aware exponential backoff. A delivery retry preserves and replays the same batch, and the checkpoint advances only after that batch succeeds. This prevents skipped source positions, but a failure after partial broker delivery can duplicate records; consumers must therefore remain idempotent. Source reconnection remains connector-owned because WAL slots, binlog table maps, and SQL Server CDC cursors require connector-specific recovery state; PostgreSQL, MySQL, and SQL Server all have connector-specific recovery verified against real databases.
+Retryable Sink validation, delivery, and flush failures use cancellation-aware exponential backoff. A delivery retry preserves and replays the same batch, and the checkpoint advances only after that batch succeeds. Cancellation during delivery backoff interrupts the wait, leaves the checkpoint unchanged, performs Source and Sink cleanup, and completes as a graceful stop without incrementing failed-event counters. This prevents skipped source positions, but a failure after partial broker delivery can duplicate records; consumers must therefore remain idempotent. Source reconnection remains connector-owned because WAL slots, binlog table maps, and SQL Server CDC cursors require connector-specific recovery state; PostgreSQL, MySQL, and SQL Server all have connector-specific recovery verified against real databases.
 
 ### Management API
 
@@ -621,7 +630,7 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 | 领域 | 状态 |
 |---|---|
 | 强类型 `ChangeEvent` 与确定性事件 ID | 已实现 |
-| 有界 Tokio 流水线与优雅关闭 | 已实现 |
+| 有界 Tokio 流水线与优雅关闭 | 已实现；CI 强制运行 256 轮 runtime 背压/重试 soak |
 | Sink/checkpoint/Source 确认顺序的 at-least-once 语义 | 已实现 |
 | 带版本化连接器状态的 SQLite checkpoint v2 | 已实现并通过单元测试；仍可读取 v1 JSON |
 | 原生 JSON 与 Debezium 兼容 JSON，包括 delete tombstone | 已实现 |
@@ -629,7 +638,7 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 | 带幂等 Producer 设置的 Kafka Sink | 已实现；CI 强制运行真实 broker 投递与失败门槛 |
 | PostgreSQL 14+ 快照、`pgoutput`、持久 schema history、heartbeat record、多 channel 信号、增量快照和核心类型矩阵 | 已实现；PostgreSQL 17 外部门槛通过 |
 | MySQL 8+ 快照、行级 binlog、GTID source 过滤、持久 schema history 和 heartbeat record | 已实现；必选 Docker CI 和外部 MySQL 8.4 恢复/soak 门槛通过 |
-| SQL Server CDC | 已实现；SQL Server 2022 Developer CU25 外部集成测试通过 |
+| SQL Server CDC | 已实现；必选 Docker CI 和外部 SQL Server 2022 恢复/soak 门槛通过 |
 | CLI、健康、状态、停止和 Prometheus 端点 | 已实现 |
 | 容器镜像、Helm Chart、已发布 crate | 尚未发布 |
 
@@ -678,6 +687,15 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+运行必须通过的共享 runtime soak 门槛：
+
+```bash
+RUSTIUM_RUNTIME_SOAK_CYCLES=256 \
+cargo test -p rustium-core --test runtime_soak -- --ignored --nocapture
+```
+
+该门槛会反复让容量为 1 的 Source 队列被重试中的 Sink 阻塞，并要求每次重放的 batch 字节级一致、投递成功前 checkpoint 不变、最终位点有序推进、队列准入有界、重试指标精确且 Sink 完成关闭。独立的重复路径还会耗尽有限重试预算，并取消一次 60 秒的无限重试等待，以证明 Source 被取消、Sink 被关闭、未确认位点不进入 checkpoint、业务性重试耗尽进入 `FAILED`，而取消会迅速进入 `STOPPED` 且不计失败事件。`RUSTIUM_RUNTIME_SOAK_CYCLES` 接受 `1..10000`；CI 固定要求 256 轮。
 
 运行真实 MySQL 8.4 集成测试：
 
@@ -1146,7 +1164,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 Kafka Sink 只接受 `acks=all` 或等价别名 `-1`，因为 Rustium 会在 batch 成功后立即 checkpoint。允许 `acks=0/1` 会在 Kafka 完成副本写入前确认源端进度，可能丢失已 checkpoint 的 record。Rustium 始终启用 Producer 幂等，并拥有 `bootstrap.servers`、确认、压缩、幂等和投递超时参数；不能通过 `sink.properties` 或 `rustium.kafka.property.*` 覆盖这些 key。安全、batch 和其他不冲突的 librdkafka 属性仍可透传。必须通过的真实 broker CI 门槛会验证有序 key、payload、header、真正的 null tombstone、topic 清理，以及 broker 无法完成投递时的显式错误。
 
-可重试的 Sink 校验、投递和 flush 失败使用可被取消的指数退避。投递重试会保留并重放同一批次，只有该批次成功后才推进 checkpoint。这可以避免跳过源位点，但 broker 已部分投递后发生失败时可能产生重复记录，因此 Consumer 必须保持幂等。Source 重连仍由连接器负责，因为 WAL slot、binlog table map 和 SQL Server CDC cursor 都需要连接器特有的恢复状态；PostgreSQL、MySQL 和 SQL Server 均已有经过真实数据库验证的连接器特有恢复。
+可重试的 Sink 校验、投递和 flush 失败使用可被取消的指数退避。投递重试会保留并重放同一批次，只有该批次成功后才推进 checkpoint。在投递退避期间取消会中断等待、保持 checkpoint 不变、完成 Source 和 Sink 清理，并作为优雅停止结束且不增加失败事件计数。这可以避免跳过源位点，但 broker 已部分投递后发生失败时可能产生重复记录，因此 Consumer 必须保持幂等。Source 重连仍由连接器负责，因为 WAL slot、binlog table map 和 SQL Server CDC cursor 都需要连接器特有的恢复状态；PostgreSQL、MySQL 和 SQL Server 均已有经过真实数据库验证的连接器特有恢复。
 
 ### 管理 API
 

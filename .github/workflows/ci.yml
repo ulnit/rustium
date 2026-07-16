@@ -35,6 +35,22 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --locked
 
+  runtime-soak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Soak shared runtime backpressure and retry invariants
+        env:
+          RUSTIUM_RUNTIME_SOAK_CYCLES: "256"
+        run: >-
+          cargo test -p rustium-core --test runtime_soak --locked --
+          --ignored --nocapture
+
   postgresql-cdc:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

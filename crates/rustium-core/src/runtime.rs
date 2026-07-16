@@ -375,6 +375,10 @@ impl ConnectorRuntime {
             self.flush_sink_with_retry(&cancellation).await
         }
         .await;
+        let pipeline_result = match pipeline_result {
+            Err(Error::Cancelled) if cancellation.is_cancelled() => Ok(()),
+            result => result,
+        };
 
         if pipeline_result.is_ok() {
             self.status.transition(ConnectorState::Stopping, None).await;
@@ -525,6 +529,9 @@ impl ConnectorRuntime {
                 highest_position: position.clone(),
             };
             if let Err(error) = self.write_sink_with_retry(&batch, cancellation).await {
+                if matches!(error, Error::Cancelled) {
+                    return Err(error);
+                }
                 error!(connector = %self.identity.name, %error, "sink delivery failed");
                 self.status.increment_failed_events(delivered).await;
                 return Err(error);
