@@ -1,10 +1,20 @@
 use std::{
+    collections::BTreeMap,
     error::Error as StdError,
     io,
     time::{Duration, SystemTime},
 };
 
 use mysql_async::{Conn, OptsBuilder, prelude::Queryable};
+use rdkafka::{
+    ClientConfig,
+    admin::{AdminClient, AdminOptions, NewTopic, TopicReplication},
+    client::DefaultClientContext,
+    consumer::{Consumer, StreamConsumer},
+    producer::{FutureProducer, FutureRecord},
+    topic_partition_list::{Offset, TopicPartitionList},
+    util::Timeout,
+};
 use rustium_config::{MySqlSourceConfig, SnapshotConfig, SnapshotMode, TableSelection};
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
@@ -12,6 +22,7 @@ use rustium_core::{
     SourceRecord,
 };
 use rustium_mysql::MySqlSource;
+use rustium_signal_kafka::KafkaSignalChannel;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -30,6 +41,265 @@ struct TestSettings {
     cdc_user: String,
     cdc_password: String,
     database: String,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires external MySQL row binlog/GTID and a Kafka-compatible broker"]
+async fn recovers_completed_snapshot_before_kafka_signal_offset_commit() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let bootstrap_servers = required_env("RUSTIUM_KAFKA_TEST_BOOTSTRAP_SERVERS")?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_kafka_{}", &suffix[..12]);
+    let connector_name = format!("mysql-kafka-{}", &suffix[..12]);
+    let signal_id = format!("mysql-kafka-signal-{}", &suffix[..12]);
+    let topic = format!("rustium-mysql-signal-{}", &suffix[..12]);
+    let group_id = format!("rustium-mysql-signal-group-{}", &suffix[..12]);
+    let qualified_table = format!(
+        "{}.{}",
+        quote_identifier(&settings.database),
+        quote_identifier(&table_name)
+    );
+    let kafka_admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap_servers)
+        .create()?;
+    let topic_spec = NewTopic::new(&topic, 1, TopicReplication::Fixed(1));
+    let created = kafka_admin
+        .create_topics(
+            [&topic_spec],
+            &AdminOptions::new().operation_timeout(Some(Duration::from_secs(10))),
+        )
+        .await?;
+    require(
+        matches!(created.as_slice(), [Ok(created)] if created == &topic),
+        "MySQL Kafka signal topic was not created",
+    )?;
+    let mut admin = connect_admin(&settings).await?;
+
+    let outcome: TestResult = async {
+        admin
+            .query_drop(format!(
+                "CREATE TABLE {qualified_table} (id BIGINT PRIMARY KEY, value VARCHAR(50) NOT NULL)"
+            ))
+            .await?;
+        admin
+            .query_drop(format!(
+                "INSERT INTO {qualified_table} VALUES (1,'one'),(2,'two')"
+            ))
+            .await?;
+
+        let base_config = settings.source_config(&table_name);
+        let (snapshot_position, schema_history) =
+            capture_snapshot(&connector_name, base_config.clone()).await?;
+        let initial_checkpoint = Checkpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            connector_name: connector_name.clone(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: snapshot_position.clone(),
+            snapshot_completed: true,
+            config_fingerprint: "mysql-kafka-recovery-test".into(),
+            updated_at: SystemTime::now(),
+            connector_state: Some(schema_history),
+        };
+        let mut config = base_config;
+        config.signal_enabled_channels = vec!["kafka".into()];
+        config.signal_kafka_topic = Some(topic.clone());
+        config.signal_kafka_bootstrap_servers = vec![bootstrap_servers.clone()];
+        config.signal_kafka_group_id = group_id.clone();
+        config.signal_kafka_poll_timeout = Duration::from_millis(50);
+        config.incremental_snapshot_chunk_size = 1;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &bootstrap_servers)
+            .create()?;
+        let offset_observer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &bootstrap_servers)
+            .set("group.id", &group_id)
+            .create()?;
+        let payload = serde_json::to_string(&SignalRecord::new(
+            &signal_id,
+            "execute-snapshot",
+            serde_json::json!({
+                "type": "incremental",
+                "data-collections": [format!("{}.{}", settings.database, table_name)],
+            }),
+        ))?;
+
+        let mut source = MySqlSource::new(
+            &connector_name,
+            config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, signal_sender, source_cancellation, source_task) =
+            start_source_with_signals(source, Some(initial_checkpoint), Some(snapshot_position));
+        let kafka_cancellation = CancellationToken::new();
+        let channel = KafkaSignalChannel::new(
+            std::slice::from_ref(&bootstrap_servers),
+            &connector_name,
+            &topic,
+            &group_id,
+            Duration::from_millis(50),
+            &BTreeMap::new(),
+        )?;
+        let kafka_task = tokio::spawn(channel.run(signal_sender, kafka_cancellation.clone()));
+        for key in ["other-connector", connector_name.as_str()] {
+            producer
+                .send(
+                    FutureRecord::to(&topic).key(key).payload(&payload),
+                    Timeout::After(Duration::from_secs(10)),
+                )
+                .await
+                .map_err(|(error, _)| error)?;
+        }
+        wait_for_kafka_offset(&offset_observer, &topic, Offset::Offset(1)).await?;
+
+        let mut withheld_acknowledgement = None;
+        let mut incremental_rows = 0;
+        let completed_checkpoint = loop {
+            let mut record = receive(&mut output).await?;
+            if withheld_acknowledgement.is_none() && !record.signal_acknowledgements.is_empty() {
+                withheld_acknowledgement = record.signal_acknowledgements.pop();
+            }
+            if record.event.as_ref().is_some_and(|event| {
+                event
+                    .source
+                    .attributes
+                    .get("rustium.snapshot.kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("incremental")
+            }) {
+                incremental_rows += 1;
+            }
+            let Some(state) = record.connector_state.clone() else {
+                continue;
+            };
+            let completed = state
+                .payload
+                .get("completed_signal_ids")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&signal_id)));
+            if completed && record.boundary == RecordBoundary::TransactionCommit {
+                break Checkpoint {
+                    schema_version: CHECKPOINT_SCHEMA_VERSION,
+                    connector_name: connector_name.clone(),
+                    generation: uuid::Uuid::new_v4(),
+                    source_position: record.position,
+                    snapshot_completed: true,
+                    config_fingerprint: "mysql-kafka-recovery-test".into(),
+                    updated_at: SystemTime::now(),
+                    connector_state: Some(state),
+                };
+            }
+        };
+        require(
+            incremental_rows == 2,
+            "Kafka signal did not snapshot both MySQL rows",
+        )?;
+        require(
+            withheld_acknowledgement.is_some(),
+            "Kafka signal checkpoint did not carry an acknowledgement",
+        )?;
+
+        require(
+            committed_kafka_offset(&offset_observer, &topic)? == Offset::Offset(1),
+            "Kafka signal offset advanced before checkpoint acknowledgement",
+        )?;
+        source_cancellation.cancel();
+        source_task.await??;
+        kafka_cancellation.cancel();
+        kafka_task.await??;
+        drop(withheld_acknowledgement);
+        tokio::time::sleep(Duration::from_secs(12)).await;
+
+        let (probe_sender, mut probe_receiver) = rustium_core::signal_channel(1);
+        let probe_cancellation = CancellationToken::new();
+        let probe_channel = KafkaSignalChannel::new(
+            std::slice::from_ref(&bootstrap_servers),
+            &connector_name,
+            &topic,
+            &group_id,
+            Duration::from_millis(50),
+            &BTreeMap::new(),
+        )?;
+        let probe_task = tokio::spawn(probe_channel.run(probe_sender, probe_cancellation.clone()));
+        let probe_delivery = tokio::time::timeout(Duration::from_secs(10), probe_receiver.recv())
+            .await?
+            .ok_or_else(|| test_error("Kafka replay probe channel closed"))?;
+        require(
+            probe_delivery.record().id == signal_id,
+            "Kafka did not replay the completed MySQL signal",
+        )?;
+
+        let mut source = MySqlSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let completed_position = completed_checkpoint.source_position.clone();
+        let (mut output, signal_sender, source_cancellation, source_task) =
+            start_source_with_signals(source, Some(completed_checkpoint), Some(completed_position));
+        signal_sender.send(probe_delivery.record().clone()).await?;
+
+        loop {
+            let record = receive(&mut output).await?;
+            require(
+                !record.event.as_ref().is_some_and(|event| {
+                    event
+                        .source
+                        .attributes
+                        .get("rustium.snapshot.kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("incremental")
+                }),
+                "replayed completed Kafka signal emitted duplicate incremental rows",
+            )?;
+            let completed = record
+                .connector_state
+                .as_ref()
+                .and_then(|state| state.payload.get("completed_signal_ids"))
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&signal_id)));
+            if completed && record.boundary == RecordBoundary::Heartbeat {
+                probe_delivery.acknowledge();
+                break;
+            }
+        }
+        wait_for_kafka_offset(&offset_observer, &topic, Offset::Offset(2)).await?;
+        source_cancellation.cancel();
+        source_task.await??;
+        probe_cancellation.cancel();
+        probe_task.await??;
+        Ok(())
+    }
+    .await;
+
+    let mysql_cleanup = admin
+        .query_drop(format!("DROP TABLE IF EXISTS {qualified_table}"))
+        .await
+        .map_err(boxed_error);
+    let mysql_close = admin.disconnect().await.map_err(boxed_error);
+    let kafka_cleanup = kafka_admin
+        .delete_topics(
+            &[&topic],
+            &AdminOptions::new().operation_timeout(Some(Duration::from_secs(10))),
+        )
+        .await
+        .map(|_| ())
+        .map_err(boxed_error);
+    match (outcome, mysql_cleanup, mysql_close, kafka_cleanup) {
+        (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), _, _, _) => Err(error),
+        (Ok(()), Err(error), _, _)
+        | (Ok(()), Ok(()), Err(error), _)
+        | (Ok(()), Ok(()), Ok(()), Err(error)) => Err(error),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1314,6 +1584,32 @@ async fn receive(
         .map_err(|_| test_error("timed out waiting for a MySQL source record"))?
         .ok_or_else(|| test_error("MySQL source closed before the test completed"))?
         .map_err(boxed_error)
+}
+
+async fn wait_for_kafka_offset(
+    consumer: &StreamConsumer,
+    topic: &str,
+    expected: Offset,
+) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if committed_kafka_offset(consumer, topic)? == expected {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await?
+}
+
+fn committed_kafka_offset(consumer: &StreamConsumer, topic: &str) -> TestResult<Offset> {
+    let mut partitions = TopicPartitionList::new();
+    partitions.add_partition(topic, 0);
+    Ok(consumer
+        .committed_offsets(partitions, Timeout::After(Duration::from_secs(2)))?
+        .find_partition(topic, 0)
+        .ok_or_else(|| test_error("Kafka committed offset has no signal partition"))?
+        .offset())
 }
 
 async fn connect_admin(settings: &TestSettings) -> TestResult<Conn> {

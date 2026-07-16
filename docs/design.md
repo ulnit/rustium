@@ -343,12 +343,11 @@ The MySQL 8.4 Docker gate covers:
 - checkpoint stop before an old-schema row, destructive drop/add-column DDL, and a new-schema row;
 - restart after the database already exposes the final schema, with correct old-schema decoding, DDL state checkpointing, and new-schema decoding.
 
-Unit gates cover checkpoint/state atomicity, version 1/2/3 checkpoint compatibility, schema-history serialization, incremental keyset progress/control, completed-signal replay, PostgreSQL snapshot/file/in-process signal parsing, MySQL signal parsing, durable runtime signal acknowledgement, management gating, replay-state rewind, scalar and extension conversions, heartbeat encoding, selected-table isolation, and create/alter/drop/rename DDL application. A librdkafka MockCluster gate verifies Kafka key filtering, single-partition consumption, and no offset commit before durable signal acknowledgement. The external PostgreSQL 17 gate verifies forced replication-backend termination and automatic recovery, explicit failure after a checkpoint's slot is lost, periodic heartbeat emission, successful `heartbeat.action.query`, heartbeat-table filtering, source/file/in-process-signaled chunking, immediate external-signal checkpointing, file and in-process read-only signaling without a signal table, checkpoint restart, additional conditions, concurrent-update deduplication, pause/resume/scoped-stop control, read-only transaction watermarks under a held update, restricted table permissions, zero connector watermark writes, unique surrogate-key ordering, completion cleanup, signal-table isolation, and snapshot/WAL equality for hstore, domains, enums, and tsvector. An opt-in superuser fixture temporarily limits `max_slot_wal_keep_size`, drives a slot to `wal_status=lost`, verifies fail-closed resume, and restores the original setting; it must be run on an isolated PostgreSQL instance. An optional fixture adds vector/halfvec/sparsevec and PostGIS geometry/geography when those extensions are installed; neither extension is installed on the current PostgreSQL 17 test instance. The external MySQL 8.4 gate verifies periodic heartbeat emission during an idle stream, exact-server-UUID GTID startup, checkpoint recovery, destructive-DDL recovery including schema-invariant index/default operations, in-process incremental snapshot execution, typed keyset restart after deletion/insertion, durable completed signal IDs, concurrent-window deduplication, and the core plus OGC spatial snapshot/binlog type matrix; the test requires temporary free space on the MySQL data volume.
+Unit gates cover checkpoint/state atomicity, version 1/2/3 checkpoint compatibility, schema-history serialization, incremental keyset progress/control, completed-signal replay, PostgreSQL snapshot/file/in-process signal parsing, MySQL signal parsing, durable runtime signal acknowledgement, management gating, replay-state rewind, scalar and extension conversions, heartbeat encoding, selected-table isolation, and create/alter/drop/rename DDL application. A librdkafka MockCluster gate verifies Kafka key filtering, single-partition consumption, and no offset commit before durable signal acknowledgement. The external PostgreSQL 17 gate verifies forced replication-backend termination and automatic recovery, explicit failure after a checkpoint's slot is lost, periodic heartbeat emission, successful execution of `heartbeat.action.query`, heartbeat-table filtering, source/file/in-process-signaled chunking, immediate external-signal checkpointing, file and in-process read-only signaling without a signal table, checkpoint restart, additional conditions, concurrent-update deduplication, pause/resume/scoped-stop control, read-only transaction watermarks under a held update, restricted table permissions, zero connector watermark writes, unique surrogate-key ordering, completion cleanup, signal-table isolation, and snapshot/WAL equality for hstore, domains, enums, and tsvector. An opt-in superuser fixture temporarily limits `max_slot_wal_keep_size`, drives a slot to `wal_status=lost`, verifies fail-closed resume, and restores the original setting; it must be run on an isolated PostgreSQL instance. An optional fixture adds vector/halfvec/sparsevec and PostGIS geometry/geography when those extensions are installed; neither extension is installed on the current PostgreSQL 17 test instance. The external MySQL 8.4 gate verifies periodic heartbeat emission during an idle stream, exact-server-UUID GTID startup, checkpoint recovery, destructive-DDL recovery including schema-invariant index/default operations, in-process incremental snapshot execution, typed keyset restart after deletion/insertion, durable completed signal IDs, concurrent-window deduplication, the core plus OGC spatial snapshot/binlog type matrix, and real-broker Kafka replay across the connector-checkpoint/offset-commit crash window; the test requires temporary free space on the MySQL data volume.
 
 #### 10.6 Remaining MySQL gates
 
 - Java-specific truststore/keystore conversion to Rustls materials;
-- connector-level real-broker Kafka signal recovery coverage.
 
 ### 11. SQL Server Connector
 
@@ -446,10 +445,11 @@ RUSTIUM_MYSQL_TEST_ADMIN_PASSWORD='replace-me' \
 RUSTIUM_MYSQL_TEST_USER=cdc \
 RUSTIUM_MYSQL_TEST_PASSWORD='replace-me' \
 RUSTIUM_MYSQL_TEST_DATABASE=cdc_demo \
+RUSTIUM_KAFKA_TEST_BOOTSTRAP_SERVERS=kafka.example.com:9092 \
 cargo test -p rustium-mysql --test mysql_external -- --ignored --nocapture
 ```
 
-This gate creates isolated selected tables with the admin account and uses the CDC account for capture. It verifies snapshot/replication, exact-server-UUID GTID-filtered startup, `heartbeat.action.query`, checkpointed schema versions 1 and 2 across destructive DDL, periodic idle-stream heartbeats from a safe binlog position, and cleanup. It has passed against MySQL 8.4 with row binlog and GTID enabled.
+This gate creates isolated selected tables with the admin account and uses the CDC account for capture. It verifies snapshot/replication, exact-server-UUID GTID-filtered startup, `heartbeat.action.query`, checkpointed schema versions across destructive and schema-neutral DDL, periodic idle-stream heartbeats from a safe binlog position, OGC spatial equality, and cleanup. With the Kafka variable, it also verifies real-broker replay after a completed connector checkpoint while the original signal offset remains uncommitted, followed by idempotent Source handling and offset commit only after the recovery checkpoint. It has passed against MySQL 8.4 with row binlog and GTID enabled.
 
 The ignored external PostgreSQL test reads connection settings from the environment and does not contain repository credentials:
 
@@ -493,7 +493,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 ### 16. Roadmap
 
 1. Close PostgreSQL optional live PostGIS/pgvector and real-broker Kafka recovery gates.
-2. Close MySQL Java TLS-store conversion and connector-level real-broker Kafka recovery gates.
+2. Close MySQL Java TLS-store conversion.
 3. Close SQL Server container-portability, extended-type, and real-broker Kafka gates.
 4. Only then consider additional databases.
 5. Add Schema Registry formats, packaging, security policy, operational runbooks, and stable upgrade migrations before `1.0`.
@@ -831,12 +831,11 @@ MySQL 8.4 Docker 门槛覆盖：
 - 在旧 schema 行之前停止并建立 checkpoint，随后执行破坏性删列/加列 DDL，再写入新 schema 行；
 - 当数据库已经暴露最终 schema 后重启，正确解码旧 schema 行、checkpoint DDL 状态，并解码新 schema 行。
 
-单元门槛覆盖 checkpoint/state 原子性、version 1/2/3 checkpoint 兼容、schema-history 序列化、增量 keyset 进度/控制、已完成 signal 重放、PostgreSQL snapshot/file/in-process 信号解析、MySQL 信号解析、持久 runtime 信号确认、管理端点门槛、重放状态回卷、标量与扩展类型转换、heartbeat 编码、选表隔离，以及 create/alter/drop/rename DDL 应用。librdkafka MockCluster 门槛会验证 Kafka key 过滤、单 partition 消费，以及持久信号确认前不提交 offset。外部 PostgreSQL 17 门槛验证强制终止 replication backend 后自动恢复、checkpoint 对应 slot 丢失后的显式失败、周期 heartbeat、成功执行 `heartbeat.action.query`、heartbeat 表过滤、source/file/in-process 信号分块、外部信号即时 checkpoint、完全无信号表的 file 和 in-process 只读信号、checkpoint 重启、additional condition、并发更新去重、pause/resume/scoped-stop 控制、保持更新事务时的只读事务水位、受限表权限、零连接器 watermark 写入、唯一 surrogate-key 排序、完成状态清理、信号表隔离，以及 hstore、domain、enum、tsvector 的快照/WAL 一致性。可选 superuser fixture 会临时限制 `max_slot_wal_keep_size`、让 slot 进入 `wal_status=lost`、验证 fail-closed 恢复并还原原设置，必须在隔离的 PostgreSQL 实例上运行。可选扩展 fixture 会在已安装相应扩展时增加 vector/halfvec/sparsevec 和 PostGIS geometry/geography；当前 PostgreSQL 17 测试实例未安装这两个扩展。外部 MySQL 8.4 门槛还会验证空闲 stream 周期 heartbeat、精确 server UUID 的 GTID 启动、checkpoint 恢复（包含 schema-invariant 索引/默认值操作的破坏性 DDL 恢复）、删除/插入后的带类型 keyset 重启、已完成 signal ID 持久化、chunk 窗口并发去重，以及核心加 OGC 空间类型的快照/binlog 类型矩阵。
+单元门槛覆盖 checkpoint/state 原子性、version 1/2/3 checkpoint 兼容、schema-history 序列化、增量 keyset 进度/控制、已完成 signal 重放、PostgreSQL snapshot/file/in-process 信号解析、MySQL 信号解析、持久 runtime 信号确认、管理端点门槛、重放状态回卷、标量与扩展类型转换、heartbeat 编码、选表隔离，以及 create/alter/drop/rename DDL 应用。librdkafka MockCluster 门槛会验证 Kafka key 过滤、单 partition 消费，以及持久信号确认前不提交 offset。外部 PostgreSQL 17 门槛验证强制终止 replication backend 后自动恢复、checkpoint 对应 slot 丢失后的显式失败、周期 heartbeat、成功执行 `heartbeat.action.query`、heartbeat 表过滤、source/file/in-process 信号分块、外部信号即时 checkpoint、完全无信号表的 file 和 in-process 只读信号、checkpoint 重启、additional condition、并发更新去重、pause/resume/scoped-stop 控制、保持更新事务时的只读事务水位、受限表权限、零连接器 watermark 写入、唯一 surrogate-key 排序、完成状态清理、信号表隔离，以及 hstore、domain、enum、tsvector 的快照/WAL 一致性。可选 superuser fixture 会临时限制 `max_slot_wal_keep_size`、让 slot 进入 `wal_status=lost`、验证 fail-closed 恢复并还原原设置，必须在隔离的 PostgreSQL 实例上运行。可选扩展 fixture 会在已安装相应扩展时增加 vector/halfvec/sparsevec 和 PostGIS geometry/geography；当前 PostgreSQL 17 测试实例未安装这两个扩展。外部 MySQL 8.4 门槛还会验证空闲 stream 周期 heartbeat、精确 server UUID 的 GTID 启动、checkpoint 恢复（包含 schema-invariant 索引/默认值操作的破坏性 DDL 恢复）、删除/插入后的带类型 keyset 重启、已完成 signal ID 持久化、chunk 窗口并发去重、核心加 OGC 空间类型的快照/binlog 类型矩阵，以及 connector checkpoint/offset commit 崩溃窗口中的真实 broker Kafka signal 重放。
 
 #### 10.6 MySQL 剩余门槛
 
 - Java 专用 truststore/keystore 到 Rustls 材料的转换；
-- 连接器级真实 broker Kafka signal 恢复覆盖。
 
 ### 11. SQL Server 连接器
 
@@ -934,10 +933,11 @@ RUSTIUM_MYSQL_TEST_ADMIN_PASSWORD='replace-me' \
 RUSTIUM_MYSQL_TEST_USER=cdc \
 RUSTIUM_MYSQL_TEST_PASSWORD='replace-me' \
 RUSTIUM_MYSQL_TEST_DATABASE=cdc_demo \
+RUSTIUM_KAFKA_TEST_BOOTSTRAP_SERVERS=kafka.example.com:9092 \
 cargo test -p rustium-mysql --test mysql_external -- --ignored --nocapture
 ```
 
-该门槛使用管理账号创建隔离的选中表，并使用 CDC 账号捕获。测试验证快照/复制、基于精确 server UUID 的 GTID 过滤启动、`heartbeat.action.query`、破坏性 DDL 前后 checkpoint 的 schema version 1 和 2、从安全 binlog 位点发送的空闲周期 heartbeat，以及资源清理。测试已在启用行级 binlog 和 GTID 的 MySQL 8.4 上通过。
+该门槛使用管理账号创建隔离的选中表，并使用 CDC 账号捕获。测试验证快照/复制、基于精确 server UUID 的 GTID 过滤启动、`heartbeat.action.query`、包含 schema-invariant 索引/默认值操作的破坏性 DDL checkpoint、从安全 binlog 位点发送的空闲周期 heartbeat、OGC 空间值一致性以及资源清理。设置 Kafka 变量后，还会验证真实 broker 在 connector checkpoint 已完成但原 signal offset 尚未提交时的重放、幂等 Source 处理，以及仅在恢复 checkpoint 确认后提交 offset。测试已在启用行级 binlog 和 GTID 的 MySQL 8.4 上通过。
 
 被忽略的 PostgreSQL 外部测试从环境变量读取连接配置，仓库中不包含测试凭据：
 
@@ -981,7 +981,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 ### 16. 路线图
 
 1. 补齐 PostgreSQL 可选 PostGIS/pgvector 实测和真实 broker Kafka 恢复门槛。
-2. 补齐 MySQL TLS store 和连接器级真实 broker Kafka 恢复门槛。
+2. 补齐 MySQL TLS store。
 3. 补齐 SQL Server 容器可移植性、扩展类型和真实 broker Kafka 门槛。
 4. 只有完成前三项后才考虑其他数据库。
 5. 在 `1.0` 前补 Schema Registry 格式、打包、安全策略、运维手册和稳定升级迁移。

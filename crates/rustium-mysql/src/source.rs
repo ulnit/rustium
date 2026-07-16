@@ -1188,9 +1188,8 @@ impl MySqlSource {
                     incremental.mark_checkpointed();
                 }
                 delivery = context.signals.recv(),
-                    if (signal_channel_enabled(&self.config, "in-process")
-                        || signal_channel_enabled(&self.config, "kafka"))
-                        && state.transaction.is_none() => {
+                    if signal_channel_enabled(&self.config, "in-process")
+                        || signal_channel_enabled(&self.config, "kafka") => {
                     let delivery = delivery.ok_or_else(|| Error::Source("MySQL runtime signal channel closed".into()))?;
                     let signal = match MySqlIncrementalSnapshot::parse_external_record(delivery.record()) {
                         Ok(signal) => signal,
