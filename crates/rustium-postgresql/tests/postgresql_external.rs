@@ -19,7 +19,7 @@ use rustium_config::{
 };
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
-    RecordBoundary, Row, SignalRecord, SourceConnector, SourceContext, SourcePosition,
+    RecordBoundary, RetryPolicy, Row, SignalRecord, SourceConnector, SourceContext, SourcePosition,
     SourceRecord,
 };
 use rustium_postgresql::PostgresSource;
@@ -1103,6 +1103,7 @@ async fn keeps_installed_extension_types_identical_across_snapshot_and_wal() -> 
 #[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
 async fn reconnects_after_replication_backend_termination() -> TestResult {
     let settings = TestSettings::from_env()?;
+    let soak_cycles = reconnect_soak_cycles()?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let table_name = format!("rustium_pg_reconnect_{}", &suffix[..12]);
     let publication = format!("rustium_reconnect_pub_{}", &suffix[..12]);
@@ -1126,9 +1127,15 @@ async fn reconnects_after_replication_backend_termination() -> TestResult {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
             },
-        );
+        )
+        .with_retry_policy(RetryPolicy {
+            max_retries: 20,
+            initial_delay: Duration::from_millis(25),
+            max_delay: Duration::from_millis(250),
+        });
         source.validate().await?;
-        let (mut output, cancellation, source_task) = start_source(source, None);
+        let (mut output, cancellation, source_task) =
+            start_source_with_output_capacity(source, None, 1);
         let capture_result: TestResult = async {
             loop {
                 let record = receive(&mut output).await?;
@@ -1136,49 +1143,73 @@ async fn reconnects_after_replication_backend_termination() -> TestResult {
                     break;
                 }
             }
-            let original_pid = wait_for_active_pid(&client, &slot_name).await?;
-            require(
+            for cycle in 0..soak_cycles {
+                let first_id = 2_i64 + i64::from(cycle) * 3;
+                let expected_ids = [first_id, first_id + 1, first_id + 2];
+                let original_pid = wait_for_active_pid(&client, &slot_name).await?;
                 client
-                    .query_one("SELECT pg_terminate_backend($1)", &[&original_pid])
-                    .await?
-                    .get::<_, bool>(0),
-                "PostgreSQL did not terminate the replication backend",
-            )?;
-            client
-                .execute(
-                    &format!("INSERT INTO public.{table_name} VALUES (2, 'after-reconnect')"),
-                    &[],
-                )
-                .await?;
-            let mut saw_row = false;
-            loop {
-                let record = receive(&mut output).await?;
-                match record.boundary {
-                    RecordBoundary::Data => {
+                    .batch_execute(&format!(
+                        "INSERT INTO public.{table_name} VALUES \
+                            ({first_id}, 'backpressure-{cycle}-a'), \
+                            ({}, 'backpressure-{cycle}-b');",
+                        first_id + 1
+                    ))
+                    .await?;
+                wait_for_output_backpressure(&output).await?;
+                require(
+                    client
+                        .query_one("SELECT pg_terminate_backend($1)", &[&original_pid])
+                        .await?
+                        .get::<_, bool>(0),
+                    "PostgreSQL did not terminate the replication backend",
+                )?;
+                client
+                    .execute(
+                        &format!(
+                            "INSERT INTO public.{table_name} VALUES ({}, 'after-reconnect-{cycle}')",
+                            first_id + 2
+                        ),
+                        &[],
+                    )
+                    .await?;
+
+                let mut first_seen = Vec::new();
+                let mut seen = BTreeMap::<i64, usize>::new();
+                loop {
+                    let record = receive(&mut output).await?;
+                    if record.boundary == RecordBoundary::Data {
                         let event = record
                             .event
                             .ok_or_else(|| test_error("reconnect record has no event"))?;
                         if event.operation == Operation::Create
-                            && event.after.as_ref().and_then(|row| row.get("id"))
-                                == Some(&DataValue::Int64(2))
+                            && let Some(DataValue::Int64(id)) =
+                                event.after.as_ref().and_then(|row| row.get("id"))
+                            && expected_ids.contains(id)
                         {
-                            saw_row = true;
+                            if !seen.contains_key(id) {
+                                first_seen.push(*id);
+                            }
+                            *seen.entry(*id).or_default() += 1;
                         }
                     }
-                    RecordBoundary::TransactionCommit => {
-                        if saw_row {
-                            break;
-                        }
+                    if record.boundary == RecordBoundary::TransactionCommit
+                        && expected_ids.iter().all(|id| seen.contains_key(id))
+                    {
+                        break;
                     }
-                    _ => {}
                 }
+                require(
+                    first_seen == expected_ids,
+                    "PostgreSQL reconnect soak did not preserve first-seen source order",
+                )?;
+                let reconnected_pid =
+                    wait_for_different_active_pid(&client, &slot_name, original_pid).await?;
+                require(
+                    reconnected_pid != original_pid,
+                    "PostgreSQL replication backend PID did not change after recovery",
+                )?;
             }
-            let reconnected_pid =
-                wait_for_different_active_pid(&client, &slot_name, original_pid).await?;
-            require(
-                reconnected_pid != original_pid,
-                "PostgreSQL replication backend PID did not change after recovery",
-            )
+            Ok(())
         }
         .await;
         let stop_result = stop_source(cancellation, source_task).await;
@@ -3008,9 +3039,39 @@ fn start_source(
     CancellationToken,
     JoinHandle<rustium_core::Result<()>>,
 ) {
-    let (output, cancellation, source_task, _signal_sender) =
-        start_source_with_signals(source, initial_checkpoint);
-    (output, cancellation, source_task)
+    start_source_with_output_capacity(source, initial_checkpoint, 64)
+}
+
+fn start_source_with_output_capacity(
+    mut source: PostgresSource,
+    initial_checkpoint: Option<Checkpoint>,
+    output_capacity: usize,
+) -> (
+    mpsc::Receiver<rustium_core::Result<SourceRecord>>,
+    CancellationToken,
+    JoinHandle<rustium_core::Result<()>>,
+) {
+    let (output_tx, output_rx) = mpsc::channel(output_capacity);
+    let (_signal_sender, signals) = rustium_core::signal_channel(64);
+    let acknowledged_position = initial_checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.source_position.clone());
+    let (ack_tx, ack_rx) = watch::channel(acknowledged_position);
+    let cancellation = CancellationToken::new();
+    let source_cancel = cancellation.clone();
+    let source_task = tokio::spawn(async move {
+        let _ack_tx = ack_tx;
+        source
+            .run(SourceContext {
+                output: output_tx,
+                acknowledged: ack_rx,
+                initial_checkpoint,
+                signals,
+                cancellation: source_cancel,
+            })
+            .await
+    });
+    (output_rx, cancellation, source_task)
 }
 
 fn start_source_with_signals(
@@ -3072,6 +3133,31 @@ async fn receive(
         .map_err(|_| test_error("timed out waiting for a PostgreSQL source record"))?
         .ok_or_else(|| test_error("PostgreSQL source output closed unexpectedly"))??;
     Ok(record)
+}
+
+fn reconnect_soak_cycles() -> TestResult<u32> {
+    let cycles = std::env::var("RUSTIUM_POSTGRES_RECONNECT_SOAK_CYCLES")
+        .unwrap_or_else(|_| "3".into())
+        .parse::<u32>()?;
+    require(
+        (1..=1_000).contains(&cycles),
+        "RUSTIUM_POSTGRES_RECONNECT_SOAK_CYCLES must be between 1 and 1000",
+    )?;
+    Ok(cycles)
+}
+
+async fn wait_for_output_backpressure(
+    output: &mpsc::Receiver<rustium_core::Result<SourceRecord>>,
+) -> TestResult {
+    for _ in 0..100 {
+        if output.capacity() == 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(test_error(
+        "PostgreSQL source output did not reach bounded backpressure",
+    ))
 }
 
 async fn receive_with_context(

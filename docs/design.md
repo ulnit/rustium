@@ -271,7 +271,7 @@ If current catalog discovery fails while replaying a historical `Relation`, Rust
 
 #### 9.5 PostgreSQL extension fixture
 
-`scripts/test-postgresql-extensions.sh` builds a PostgreSQL 17 image from the repository Dockerfile, installs matching pgvector and PostGIS packages, enables logical replication, and runs two required gates. The type gate requires vector, halfvec, sparsevec, geometry, and geography to exist and remain identical across snapshot/WAL paths. The recovery gate forcibly terminates the active replication backend, commits a transaction while the original connection is down, and requires the new backend to deliver it. The dedicated `postgresql-cdc` GitHub CI job runs both on every push and pull request.
+`scripts/test-postgresql-extensions.sh` builds a PostgreSQL 17 image from the repository Dockerfile, installs matching pgvector and PostGIS packages, enables logical replication, and runs two required gates. Readiness requires the final PostgreSQL postmaster to be container PID 1 plus a successful query, so the entrypoint's temporary initialization server cannot satisfy the gate. The type gate requires vector, halfvec, sparsevec, geometry, and geography to exist and remain identical across snapshot/WAL paths. The recovery gate uses a capacity-one Source output, commits a multi-row transaction until the bounded channel is full, terminates the active replication backend, commits another transaction while the original connection is down, and requires the new backend to preserve every expected row plus first-seen source order. CI runs three cycles; `RUSTIUM_POSTGRES_RECONNECT_SOAK_CYCLES=1..1000` raises the count for longer runs. The dedicated `postgresql-cdc` GitHub CI job runs both gates on every push and pull request.
 
 ### 10. MySQL Connector
 
@@ -464,7 +464,7 @@ RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo \
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture --test-threads=1
 ```
 
-These tests create isolated business-table/signal-table/publication/slot/role names and temporary signal files, then verify snapshot rows, ordered transactional create/update/delete events, checkpoint stop, an old-schema row, destructive drop/add-column DDL, a new-schema row, historical `Relation` replay with schema versions 1 and 2, restart without snapshot replay, forced termination and automatic recovery of the active replication backend, fail-closed resume after deleting a checkpoint's slot, periodic heartbeat records at a safe WAL position, `heartbeat.action.query`, heartbeat-table filtering, checkpointed source/file/in-process incremental snapshots, immediate external-signal state checkpointing, filtered chunks, concurrent-update deduplication, pause/resume/scoped-stop control, file and in-process read-only snapshots without a signal table, read-only transaction watermarks with a held update, zero watermark writes under restricted permissions, unique surrogate ordering against a reversed UUID primary-key order, signal-table isolation, and identical snapshot/WAL conversion across the core PostgreSQL type matrix including hstore, domain, enum, and tsvector values. The opt-in superuser fixture has also driven a live slot to `wal_status=lost` and verified fail-closed resume on PostgreSQL 17. The Docker fixture additionally requires pgvector and PostGIS snapshot/WAL equality on PostgreSQL 17.
+These tests create isolated business-table/signal-table/publication/slot/role names and temporary signal files, then verify snapshot rows, ordered transactional create/update/delete events, checkpoint stop, an old-schema row, destructive drop/add-column DDL, a new-schema row, historical `Relation` replay with schema versions 1 and 2, restart without snapshot replay, repeated forced termination and automatic recovery of the active replication backend under capacity-one Source-output backpressure, fail-closed resume after deleting a checkpoint's slot, periodic heartbeat records at a safe WAL position, `heartbeat.action.query`, heartbeat-table filtering, checkpointed source/file/in-process incremental snapshots, immediate external-signal state checkpointing, filtered chunks, concurrent-update deduplication, pause/resume/scoped-stop control, file and in-process read-only snapshots without a signal table, read-only transaction watermarks with a held update, zero watermark writes under restricted permissions, unique surrogate ordering against a reversed UUID primary-key order, signal-table isolation, and identical snapshot/WAL conversion across the core PostgreSQL type matrix including hstore, domain, enum, and tsvector values. The opt-in superuser fixture has also driven a live slot to `wal_status=lost` and verified fail-closed resume on PostgreSQL 17. The Docker fixture additionally requires pgvector and PostGIS snapshot/WAL equality on PostgreSQL 17.
 
 ```bash
 bash scripts/test-postgresql-extensions.sh
@@ -505,7 +505,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. Roadmap
 
-1. Add long-running backpressure and reconnect soak gates across the three prioritized connectors and shared runtime.
+1. Extend the backpressure/reconnect soak gate from PostgreSQL to MySQL, SQL Server, and the shared runtime.
 2. Add Schema Registry formats, packaging, security policy, operational runbooks, and stable upgrade migrations before `1.0`.
 3. Consider additional databases only after the current three connectors and shared runtime pass the `1.0` gates.
 
@@ -770,7 +770,7 @@ Connector-state version 5 保存 signal ID、展开后的集合、每集合 cond
 
 #### 9.5 PostgreSQL 扩展 fixture
 
-`scripts/test-postgresql-extensions.sh` 使用仓库 Dockerfile 构建 PostgreSQL 17 镜像，安装同主版本 pgvector 和 PostGIS 包，启用逻辑复制，并执行两个强制门槛。类型门槛要求 vector、halfvec、sparsevec、geometry、geography 存在且在快照/WAL 路径上一致。恢复门槛强制终止活动 replication backend，在原连接断开期间提交事务，并要求新 backend 投递该事务。独立的 `postgresql-cdc` GitHub CI job 会在每次 push 和 pull request 时运行两项测试。
+`scripts/test-postgresql-extensions.sh` 使用仓库 Dockerfile 构建 PostgreSQL 17 镜像，安装同主版本 pgvector 和 PostGIS 包，启用逻辑复制，并执行两个强制门槛。就绪条件要求最终 PostgreSQL postmaster 成为容器 PID 1 且查询成功，因此 entrypoint 的临时初始化 server 无法误通过门槛。类型门槛要求 vector、halfvec、sparsevec、geometry、geography 存在且在快照/WAL 路径上一致。恢复门槛使用容量为 1 的 Source 输出，提交多行事务直到有界 channel 填满，终止活动 replication backend，在原连接断开期间再提交事务，并要求新 backend 保留全部预期记录及首次出现的源端顺序。CI 执行 3 轮；`RUSTIUM_POSTGRES_RECONNECT_SOAK_CYCLES=1..1000` 可提高长时间运行的循环数。独立的 `postgresql-cdc` GitHub CI job 会在每次 push 和 pull request 时运行两项门槛。
 
 ### 10. MySQL 连接器
 
@@ -963,7 +963,7 @@ RUSTIUM_POSTGRES_TEST_DATABASE=cdc_demo \
 cargo test -p rustium-postgresql --test postgresql_external -- --ignored --nocapture --test-threads=1
 ```
 
-这些测试使用隔离的业务表/信号表/publication/slot/role 名称和临时信号文件，验证快照记录、同一事务内有序的 create/update/delete 事件、checkpoint 停止、旧 schema 行、破坏性删列/加列 DDL、新 schema 行、schema version 1 和 2 的历史 `Relation` 重放、重启不重复快照、强制终止活动 replication backend 后自动恢复、删除 checkpoint 对应 slot 后 fail-closed 恢复、安全 WAL 位点上的周期 heartbeat、`heartbeat.action.query`、heartbeat 表过滤、带 checkpoint 的 source/file/in-process 增量快照、外部信号状态即时 checkpoint、过滤分块、并发更新去重、pause/resume/scoped-stop 控制、完全无信号表的 file 和 in-process 只读快照、保持更新事务时的只读事务水位、受限权限下零 watermark 写入、与 UUID 主键反向顺序对照的唯一 surrogate 排序、信号表隔离，以及包含 hstore、domain、enum、tsvector 的 PostgreSQL 核心类型矩阵在快照/WAL 路径上的一致转换。可选 superuser fixture 也已在 PostgreSQL 17 上让真实 slot 进入 `wal_status=lost` 并验证 fail-closed 恢复。Docker fixture 还会在 PostgreSQL 17 上强制验证 pgvector 和 PostGIS 的快照/WAL 一致性。
+这些测试使用隔离的业务表/信号表/publication/slot/role 名称和临时信号文件，验证快照记录、同一事务内有序的 create/update/delete 事件、checkpoint 停止、旧 schema 行、破坏性删列/加列 DDL、新 schema 行、schema version 1 和 2 的历史 `Relation` 重放、重启不重复快照、容量为 1 的 Source 输出背压下重复强制终止活动 replication backend 并自动恢复、删除 checkpoint 对应 slot 后 fail-closed 恢复、安全 WAL 位点上的周期 heartbeat、`heartbeat.action.query`、heartbeat 表过滤、带 checkpoint 的 source/file/in-process 增量快照、外部信号状态即时 checkpoint、过滤分块、并发更新去重、pause/resume/scoped-stop 控制、完全无信号表的 file 和 in-process 只读快照、保持更新事务时的只读事务水位、受限权限下零 watermark 写入、与 UUID 主键反向顺序对照的唯一 surrogate 排序、信号表隔离，以及包含 hstore、domain、enum、tsvector 的 PostgreSQL 核心类型矩阵在快照/WAL 路径上的一致转换。可选 superuser fixture 也已在 PostgreSQL 17 上让真实 slot 进入 `wal_status=lost` 并验证 fail-closed 恢复。Docker fixture 还会在 PostgreSQL 17 上强制验证 pgvector 和 PostGIS 的快照/WAL 一致性。
 
 ```bash
 bash scripts/test-postgresql-extensions.sh
@@ -1004,6 +1004,6 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. 路线图
 
-1. 为三个优先连接器和共享 runtime 增加长时间背压与重连 soak 门槛。
+1. 将 PostgreSQL 背压/重连 soak 门槛扩展到 MySQL、SQL Server 和共享 runtime。
 2. 在 `1.0` 前补 Schema Registry 格式、打包、安全策略、运维手册和稳定升级迁移。
 3. 只有当当前三个连接器和共享运行时通过 `1.0` 门槛后，才考虑更多数据库。

@@ -34,7 +34,10 @@ docker run --detach \
 
 ready=false
 for _ in $(seq 1 60); do
-    if docker exec "$container" pg_isready -U postgres -d "$database" >/dev/null 2>&1; then
+    if docker exec "$container" sh -c \
+        'test "$(head -n 1 "$PGDATA/postmaster.pid")" = 1' >/dev/null 2>&1 \
+        && docker exec "$container" psql -v ON_ERROR_STOP=1 -Atq \
+            -U postgres -d "$database" -c 'SELECT 1' >/dev/null 2>&1; then
         ready=true
         break
     fi
@@ -67,6 +70,7 @@ RUSTIUM_POSTGRES_TEST_PORT="$port" \
 RUSTIUM_POSTGRES_TEST_USER=postgres \
 RUSTIUM_POSTGRES_TEST_PASSWORD="$password" \
 RUSTIUM_POSTGRES_TEST_DATABASE="$database" \
+RUSTIUM_POSTGRES_RECONNECT_SOAK_CYCLES="${RUSTIUM_POSTGRES_RECONNECT_SOAK_CYCLES:-3}" \
 cargo test -p rustium-postgresql --test postgresql_external --locked -- \
     reconnects_after_replication_backend_termination \
     --ignored --exact --nocapture
