@@ -425,6 +425,8 @@ Metrics expose connector state, delivered events, failed events, pipeline queue 
 - Mutating HTTP endpoints are disabled by default.
 - Secrets are interpolated at load time and excluded from status and semantic fingerprints.
 
+The security response and deployment baseline are normative in [SECURITY.md](../SECURITY.md). Backup, recovery, alerting, and incident procedures are normative in [docs/runbook.md](runbook.md), and state/configuration compatibility plus rollback rules are normative in [docs/upgrades.md](upgrades.md).
+
 #### 14.1 Container and Kubernetes Packaging
 
 The repository ships a multi-stage `Dockerfile` and `deploy/helm/rustium` chart. The runtime image contains the Rustium binary and only the native Kafka/TLS libraries required at runtime, runs as UID/GID `65532`, uses `/var/lib/rustium` as its writable state directory, and exposes management port `8080`. The chart deliberately enforces one replica and `Recreate` because SQLite checkpoint ownership and source ordering are single-owner contracts. Its default pod uses a retained `ReadWriteOnce` PVC, a read-only root filesystem, dropped Linux capabilities, disabled ServiceAccount token mounting, and live/ready probes. Configuration is mounted from a Secret; production installations should use an externally managed Secret and interpolate database, Kafka, and Registry credentials through environment variables. `scripts/test-packaging.sh` builds the image, executes `rustium --version`, checks OCI/non-root metadata, lints and renders the chart, verifies persistence/probe/security invariants, and rejects multiple replicas. Published OCI artifacts remain a tagged-release operation and are not claimed by the source tree.
@@ -443,6 +445,8 @@ A connector is not complete because it compiles. Required gates include:
 - golden Debezium compatibility fixtures;
 - long-running backpressure and reconnect tests;
 - Kafka end-to-end durability tests.
+
+The release operator must also run the backup/restore, rollback, container, and Helm procedures in [docs/runbook.md](runbook.md) and [docs/upgrades.md](upgrades.md). A green compile without those operational checks is not a production release.
 
 The ignored MySQL Docker test is runnable with:
 
@@ -948,6 +952,8 @@ stdout 是 best-effort，仅用于开发，并将 tombstone 输出为一行 `nul
 - 变更型 HTTP 端点默认禁用。
 - Secret 在加载时插值，不进入状态和语义指纹。
 
+安全响应和部署基线以 [SECURITY.md](../SECURITY.md) 为规范；备份、恢复、告警和事故流程以 [docs/runbook.md](runbook.md) 为规范；状态/配置兼容性及 rollback 规则以 [docs/upgrades.md](upgrades.md) 为规范。
+
 #### 14.1 容器与 Kubernetes 打包
 
 仓库提供多阶段 `Dockerfile` 和 `deploy/helm/rustium` Chart。运行时镜像只包含 Rustium 二进制及 Kafka/TLS client 所需的原生运行库，以 UID/GID `65532` 运行，将 `/var/lib/rustium` 作为可写状态目录，并暴露 `8080` 管理端口。由于 SQLite checkpoint 所有权与源顺序都是单所有者契约，Chart 强制单副本和 `Recreate`。默认 Pod 使用保留的 `ReadWriteOnce` PVC、只读根文件系统、删除全部 Linux capabilities、关闭 ServiceAccount token 挂载，以及 live/ready probe。配置从 Secret 挂载；生产部署应使用外部管理的 Secret，并通过环境变量插入数据库、Kafka 和 Registry 凭据。`scripts/test-packaging.sh` 会构建镜像、执行 `rustium --version`、检查 OCI/非 root 元数据、lint/render Chart、验证持久化/probe/安全不变量，并拒绝多副本。OCI artifact 发布仍属于 tagged release 操作，源码仓库不会提前宣称已发布。
@@ -966,6 +972,8 @@ stdout 是 best-effort，仅用于开发，并将 tombstone 输出为一行 `nul
 - Debezium 兼容 golden fixture；
 - 长时间背压和重连测试；
 - Kafka 端到端持久性测试。
+
+发布运维人员还必须执行 [docs/runbook.md](runbook.md) 与 [docs/upgrades.md](upgrades.md) 中的 backup/restore、rollback、容器和 Helm 流程。只有编译通过而未完成这些运维检查，不构成生产发布。
 
 可运行被忽略的 MySQL Docker 测试：
 

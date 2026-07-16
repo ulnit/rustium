@@ -6,6 +6,9 @@ use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, params};
 use rustium_core::{Checkpoint, CheckpointStore, Error, Result};
 
+/// SQLite storage schema version, independent from the JSON checkpoint version.
+pub const SQLITE_STORAGE_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone)]
 pub struct SqliteCheckpointStore {
     path: PathBuf,
@@ -107,6 +110,15 @@ fn initialize(path: &PathBuf) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let connection = open_connection(path)?;
+    let storage_version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+        .map_err(state_error)?;
+    if storage_version > SQLITE_STORAGE_SCHEMA_VERSION {
+        return Err(Error::State(format!(
+            "SQLite state schema version {storage_version} is newer than the supported version {SQLITE_STORAGE_SCHEMA_VERSION}; upgrade Rustium before opening this state file"
+        )));
+    }
+
     connection
         .execute_batch(
             r#"CREATE TABLE IF NOT EXISTS checkpoints (
@@ -114,10 +126,15 @@ fn initialize(path: &PathBuf) -> Result<()> {
                  schema_version INTEGER NOT NULL,
                  payload TEXT NOT NULL,
                  updated_at_ms INTEGER NOT NULL
-               );
-               PRAGMA user_version = 1;"#,
+               );"#,
         )
         .map_err(state_error)?;
+
+    if storage_version < SQLITE_STORAGE_SCHEMA_VERSION {
+        connection
+            .pragma_update(None, "user_version", SQLITE_STORAGE_SCHEMA_VERSION)
+            .map_err(state_error)?;
+    }
     Ok(())
 }
 
@@ -180,6 +197,31 @@ mod tests {
         assert_eq!(store.load("orders").await.unwrap(), Some(checkpoint));
         store.delete("orders").await.unwrap();
         assert!(store.load("orders").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_a_future_storage_schema_without_downgrading_it() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("future.db");
+        let connection = Connection::open(&path).unwrap();
+        let future_version = SQLITE_STORAGE_SCHEMA_VERSION + 1;
+        connection
+            .pragma_update(None, "user_version", future_version)
+            .unwrap();
+        drop(connection);
+
+        let error = SqliteCheckpointStore::open(&path).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("newer than the supported version")
+        );
+
+        let connection = Connection::open(path).unwrap();
+        let stored_version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored_version, future_version);
     }
 
     #[test]

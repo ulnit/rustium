@@ -652,7 +652,7 @@ The mounted configuration should use `server.bind: 0.0.0.0:8080` and `state.path
 - Behavioral changes need tests, especially recovery and acknowledgement-order tests.
 - Commits must include a DCO `Signed-off-by` line.
 
-See [docs/design.md](docs/design.md) for the normative architecture and connector design.
+See [docs/design.md](docs/design.md) for the normative architecture and connector design. Use [docs/runbook.md](docs/runbook.md) for backup, recovery, alerting, and Kubernetes operations, [docs/upgrades.md](docs/upgrades.md) for checkpoint/configuration migration rules, and [SECURITY.md](SECURITY.md) for vulnerability reporting and secure deployment requirements.
 
 ### License and Independence
 
@@ -1290,7 +1290,7 @@ helm upgrade --install rustium deploy/helm/rustium \
 - 行为变更必须补测试，尤其是恢复和确认顺序测试。
 - Commit 必须包含 DCO `Signed-off-by`。
 
-规范架构和连接器设计见 [docs/design.md](docs/design.md)。
+规范架构和连接器设计见 [docs/design.md](docs/design.md)。备份、恢复、告警和 Kubernetes 运维见 [docs/runbook.md](docs/runbook.md)；checkpoint/配置迁移规则见 [docs/upgrades.md](docs/upgrades.md)；漏洞报告和安全部署要求见 [SECURITY.md](SECURITY.md)。
 
 ### 许可证与独立性
 
