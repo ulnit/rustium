@@ -181,7 +181,18 @@ impl PostgresSource {
         let config = self.config.clone();
         tokio::task::spawn_blocking(move || {
             let mut connection = connect(&connection_url)?;
-            let catalog = query_table_schema(&mut connection, &config, &schema, &table)?;
+            let catalog = match query_table_schema(&mut connection, &config, &schema, &table) {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    warn!(
+                        schema = %schema,
+                        table = %table,
+                        %error,
+                        "PostgreSQL relation catalog metadata is unavailable; using WAL relation metadata"
+                    );
+                    None
+                }
+            };
             let resolved_type_names = columns
                 .iter()
                 .map(|column| {
@@ -192,8 +203,20 @@ impl PostgresSource {
                             column.type_id, column.type_modifier
                         ),
                     )
+                    .unwrap_or_else(|error| {
+                        let fallback = relation_type_name_fallback(previous.as_ref(), column);
+                        warn!(
+                            schema = %schema,
+                            table = %table,
+                            column = %column.name,
+                            %error,
+                            fallback = %fallback,
+                            "PostgreSQL relation type metadata is unavailable; retaining a conservative type name"
+                        );
+                        fallback
+                    })
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Vec<_>>();
             schema_from_relation(
                 &schema,
                 &table,
@@ -281,6 +304,27 @@ impl PostgresSource {
         .await
         .map_err(|error| Error::Source(format!("snapshot task failed: {error}")))?
     }
+}
+
+fn relation_type_name_fallback(previous: Option<&TableSchema>, column: &RelationColumn) -> String {
+    previous
+        .and_then(|schema| {
+            schema.column_types.iter().find_map(|candidate| {
+                (candidate.name == column.name.as_ref()
+                    && candidate.type_oid == column.type_id
+                    && candidate.type_modifier == column.type_modifier)
+                    .then(|| {
+                        schema
+                            .event_schema
+                            .fields
+                            .iter()
+                            .find(|field| field.name == candidate.name)
+                    })
+                    .flatten()
+            })
+        })
+        .map(|field| field.type_name.clone())
+        .unwrap_or_else(|| format!("unknown_oid_{}", column.type_id))
 }
 
 #[async_trait]
@@ -2336,6 +2380,55 @@ mod tests {
                 .event_schema
                 .version,
             2
+        );
+    }
+
+    #[test]
+    fn reuses_historical_type_name_when_catalog_type_resolution_fails() {
+        let previous = TableSchema {
+            schema: "public".into(),
+            table: "orders".into(),
+            event_schema: EventSchema {
+                name: "test.public.orders.Envelope".into(),
+                version: 2,
+                fields: vec![FieldSchema {
+                    name: "legacy_amount".into(),
+                    type_name: "numeric(20,4)".into(),
+                    optional: true,
+                    primary_key: false,
+                }],
+            },
+            column_types: vec![PostgresColumnType {
+                name: "legacy_amount".into(),
+                type_oid: 1_640_001,
+                type_modifier: 1_310_728,
+            }],
+        };
+        let relation_column = RelationColumn {
+            name: Arc::from("legacy_amount"),
+            type_id: 1_640_001,
+            type_modifier: 1_310_728,
+            is_key: false,
+        };
+
+        assert_eq!(
+            relation_type_name_fallback(Some(&previous), &relation_column),
+            "numeric(20,4)"
+        );
+    }
+
+    #[test]
+    fn conservatively_names_unknown_relation_type_without_history() {
+        let relation_column = RelationColumn {
+            name: Arc::from("removed_extension_value"),
+            type_id: 1_640_002,
+            type_modifier: -1,
+            is_key: false,
+        };
+
+        assert_eq!(
+            relation_type_name_fallback(None, &relation_column),
+            "unknown_oid_1640002"
         );
     }
 
