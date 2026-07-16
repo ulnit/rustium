@@ -14,7 +14,7 @@ use sqlparser::{
 };
 
 pub(crate) const MYSQL_SCHEMA_HISTORY_FORMAT: &str = "rustium.mysql.schema-history";
-const MYSQL_SCHEMA_HISTORY_VERSION: u32 = 2;
+const MYSQL_SCHEMA_HISTORY_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TableSchema {
@@ -34,6 +34,35 @@ struct MySqlSchemaHistoryState {
     tables: Vec<TableSchema>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     incremental_snapshot: Option<IncrementalSnapshotProgress>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    completed_signal_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub(crate) enum MySqlKeyValue {
+    Int(i64),
+    UInt(u64),
+    Float(u32),
+    Double(u64),
+    Bytes(Vec<u8>),
+    Date {
+        year: u16,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+        micros: u32,
+    },
+    Time {
+        negative: bool,
+        days: u32,
+        hours: u8,
+        minutes: u8,
+        seconds: u8,
+        micros: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,8 +72,13 @@ pub(crate) struct IncrementalSnapshotProgress {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub(crate) additional_conditions: std::collections::BTreeMap<String, String>,
     pub(crate) current_collection: usize,
+    // Retained only to deserialize v2 checkpoints. Version 3 uses keyset progress.
     #[serde(default)]
     pub(crate) offset: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_key: Option<Vec<MySqlKeyValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) maximum_key: Option<Vec<MySqlKeyValue>>,
     #[serde(default)]
     pub(crate) chunk_sequence: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -55,6 +89,7 @@ pub(crate) struct IncrementalSnapshotProgress {
 pub(crate) struct MySqlConnectorState {
     pub(crate) schemas: HashMap<(String, String), TableSchema>,
     pub(crate) incremental_snapshot: Option<IncrementalSnapshotProgress>,
+    pub(crate) completed_signal_ids: Vec<String>,
 }
 
 pub(crate) fn encode_schema_history(
@@ -65,6 +100,7 @@ pub(crate) fn encode_schema_history(
     let payload = serde_json::to_value(MySqlSchemaHistoryState {
         tables,
         incremental_snapshot: None,
+        completed_signal_ids: Vec::new(),
     })?;
     Ok(ConnectorStateEnvelope::new(
         MYSQL_SCHEMA_HISTORY_FORMAT,
@@ -106,12 +142,14 @@ pub(crate) fn decode_schema_history(
 pub(crate) fn encode_connector_state(
     schemas: &HashMap<(String, String), TableSchema>,
     incremental_snapshot: Option<&IncrementalSnapshotProgress>,
+    completed_signal_ids: &[String],
 ) -> Result<ConnectorStateEnvelope> {
     let mut tables = schemas.values().cloned().collect::<Vec<_>>();
     tables.sort_by_key(TableSchema::key);
     let payload = serde_json::to_value(MySqlSchemaHistoryState {
         tables,
         incremental_snapshot: incremental_snapshot.cloned(),
+        completed_signal_ids: completed_signal_ids.to_vec(),
     })?;
     Ok(ConnectorStateEnvelope::new(
         MYSQL_SCHEMA_HISTORY_FORMAT,
@@ -149,6 +187,7 @@ pub(crate) fn decode_connector_state(
     Ok(MySqlConnectorState {
         schemas,
         incremental_snapshot: state.incremental_snapshot,
+        completed_signal_ids: state.completed_signal_ids,
     })
 }
 
@@ -839,12 +878,16 @@ mod tests {
             )]),
             current_collection: 0,
             offset: 4,
+            last_key: Some(vec![MySqlKeyValue::UInt(42)]),
+            maximum_key: Some(vec![MySqlKeyValue::UInt(100)]),
             chunk_sequence: 3,
             paused: true,
         };
-        let envelope = encode_connector_state(&schemas, Some(&progress)).unwrap();
+        let completed = vec!["snapshot-0".into()];
+        let envelope = encode_connector_state(&schemas, Some(&progress), &completed).unwrap();
         let decoded = decode_connector_state(&envelope).unwrap();
         assert_eq!(decoded.incremental_snapshot, Some(progress));
+        assert_eq!(decoded.completed_signal_ids, completed);
     }
 
     #[test]

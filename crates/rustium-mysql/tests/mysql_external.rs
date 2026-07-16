@@ -113,6 +113,200 @@ async fn runs_incremental_snapshot_from_mysql_signal_channel() -> TestResult {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external MySQL 8.0+ server with row binlog and GTID enabled"]
+async fn resumes_incremental_snapshot_with_persisted_keyset() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_keyset_{}", &suffix[..12]);
+    let connector_name = format!("mysql-keyset-{}", &suffix[..12]);
+    let signal_id = format!("mysql-keyset-signal-{}", &suffix[..12]);
+    let qualified_table = format!(
+        "{}.{}",
+        quote_identifier(&settings.database),
+        quote_identifier(&table_name)
+    );
+    let mut admin = connect_admin(&settings).await?;
+    let outcome: TestResult = async {
+        admin
+            .query_drop(format!(
+                "CREATE TABLE {qualified_table} (id BIGINT PRIMARY KEY, value VARCHAR(50) NOT NULL)"
+            ))
+            .await?;
+        admin
+            .query_drop(format!(
+                "INSERT INTO {qualified_table} VALUES (1,'one'),(2,'two')"
+            ))
+            .await?;
+        let mut config = settings.source_config(&table_name);
+        config.signal_enabled_channels = vec!["in-process".into()];
+        config.incremental_snapshot_chunk_size = 1;
+        let (snapshot_position, schema_history) =
+            capture_snapshot(&connector_name, config.clone()).await?;
+        admin
+            .query_drop(format!("INSERT INTO {qualified_table} VALUES (3,'three')"))
+            .await?;
+        let checkpoint = Checkpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            connector_name: connector_name.clone(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: snapshot_position.clone(),
+            snapshot_completed: true,
+            config_fingerprint: "mysql-keyset-test".into(),
+            updated_at: SystemTime::now(),
+            connector_state: Some(schema_history),
+        };
+
+        let mut source = MySqlSource::new(
+            &connector_name,
+            config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, signal_sender, cancellation, source_task) =
+            start_source_with_signals(source, Some(checkpoint), Some(snapshot_position));
+        signal_sender
+            .send(SignalRecord::new(
+                &signal_id,
+                "execute-snapshot",
+                serde_json::json!({
+                    "type":"incremental",
+                    "data-collections":[format!("{}\\.{}", settings.database, table_name)]
+                }),
+            ))
+            .await?;
+
+        let first_checkpoint: TestResult<(SourcePosition, ConnectorStateEnvelope)> = async {
+            let mut saw_first_row = false;
+            loop {
+                let record = receive(&mut output).await?;
+                if let Some(event) = &record.event
+                    && event
+                        .source
+                        .attributes
+                        .get("rustium.snapshot.kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("incremental")
+                {
+                    let id = event
+                        .after
+                        .as_ref()
+                        .and_then(|row| row.get("id"))
+                        .and_then(mysql_integer);
+                    require(
+                        id == Some(1),
+                        format!(
+                            "first MySQL keyset chunk did not contain primary key 1; got {id:?}"
+                        ),
+                    )?;
+                    saw_first_row = true;
+                }
+                if saw_first_row && record.boundary == RecordBoundary::TransactionCommit {
+                    let state = record.connector_state.ok_or_else(|| {
+                        test_error("MySQL keyset chunk checkpoint has no connector state")
+                    })?;
+                    break Ok((record.position, state));
+                }
+            }
+        }
+        .await;
+        let first_checkpoint = finish_source(cancellation, source_task, first_checkpoint).await?;
+
+        admin
+            .query_drop(format!("DELETE FROM {qualified_table} WHERE id = 2"))
+            .await?;
+        admin
+            .query_drop(format!("INSERT INTO {qualified_table} VALUES (0,'zero')"))
+            .await?;
+        let checkpoint = Checkpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            connector_name: connector_name.clone(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: first_checkpoint.0.clone(),
+            snapshot_completed: true,
+            config_fingerprint: "mysql-keyset-test".into(),
+            updated_at: SystemTime::now(),
+            connector_state: Some(first_checkpoint.1),
+        };
+        let mut source = MySqlSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) =
+            start_source(source, Some(checkpoint), Some(first_checkpoint.0));
+        let resumed: TestResult = async {
+            let mut saw_last_row = false;
+            loop {
+                let record = receive(&mut output).await?;
+                if let Some(event) = &record.event
+                    && event
+                        .source
+                        .attributes
+                        .get("rustium.snapshot.kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("incremental")
+                {
+                    let id = event
+                        .after
+                        .as_ref()
+                        .and_then(|row| row.get("id"))
+                        .and_then(mysql_integer);
+                    require(
+                        id == Some(3),
+                        format!(
+                            "resumed MySQL keyset snapshot reread or skipped the wrong primary key; got {id:?}"
+                        ),
+                    )?;
+                    saw_last_row = true;
+                }
+                if saw_last_row && record.boundary == RecordBoundary::TransactionCommit {
+                    let state = record.connector_state.ok_or_else(|| {
+                        test_error("completed MySQL keyset checkpoint has no connector state")
+                    })?;
+                    let completed = state
+                        .payload
+                        .get("completed_signal_ids")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| {
+                            test_error("completed MySQL keyset checkpoint has no signal IDs")
+                        })?;
+                    require(
+                        completed.iter().any(|id| id.as_str() == Some(&signal_id)),
+                        "completed MySQL keyset checkpoint did not persist the signal ID",
+                    )?;
+                    break Ok(());
+                }
+            }
+        }
+        .await;
+        finish_source(cancellation, source_task, resumed).await
+    }
+    .await;
+    let cleanup = async {
+        admin
+            .query_drop(format!("DROP TABLE IF EXISTS {qualified_table}"))
+            .await?;
+        admin.disconnect().await.map_err(boxed_error)
+    }
+    .await;
+    match (outcome, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            eprintln!("MySQL keyset cleanup failed: {cleanup_error}");
+            Err(error)
+        }
+    }
+}
+
 impl TestSettings {
     fn from_env() -> TestResult<Self> {
         Ok(Self {
@@ -772,6 +966,15 @@ fn require(condition: bool, message: impl Into<String>) -> TestResult {
         Ok(())
     } else {
         Err(test_error(message))
+    }
+}
+
+fn mysql_integer(value: &DataValue) -> Option<i128> {
+    match value {
+        DataValue::Int32(value) => Some(i128::from(*value)),
+        DataValue::Int64(value) => Some(i128::from(*value)),
+        DataValue::UInt64(value) => Some(i128::from(*value)),
+        _ => None,
     }
 }
 

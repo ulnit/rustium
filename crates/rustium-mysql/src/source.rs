@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
 };
 
@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use futures::StreamExt;
 use mysql_async::{
-    BinlogStream, BinlogStreamRequest, ClientIdentity, Conn, Opts, OptsBuilder, Row as MySqlRow,
-    Sid, SslOpts, Value,
+    BinlogStream, BinlogStreamRequest, ClientIdentity, Conn, Opts, OptsBuilder, Params,
+    Row as MySqlRow, Sid, SslOpts, Value,
     binlog::{
         events::{Event as BinlogEvent, EventData, RowsEventData, TableMapEvent},
         row::BinlogRow,
@@ -26,11 +26,12 @@ use rustium_core::{
 use tracing::{debug, info, warn};
 
 use crate::schema_history::{
-    IncrementalSnapshotProgress, TableSchema, apply_ddl, decode_connector_state,
+    IncrementalSnapshotProgress, MySqlKeyValue, TableSchema, apply_ddl, decode_connector_state,
     encode_connector_state, encode_schema_history,
 };
 
 const CONNECTOR_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_COMPLETED_SIGNAL_IDS: usize = 1_024;
 
 #[derive(Debug, Clone)]
 struct BinlogCoordinates {
@@ -143,20 +144,57 @@ enum SnapshotSignal {
 struct MySqlIncrementalSnapshot {
     progress: Option<IncrementalSnapshotProgress>,
     event_serial: u64,
-    completed_signal_ids: HashSet<String>,
+    completed_signal_ids: Vec<String>,
+    state_dirty: bool,
 }
 
 impl MySqlIncrementalSnapshot {
-    fn new(progress: Option<IncrementalSnapshotProgress>) -> Self {
+    fn new(
+        progress: Option<IncrementalSnapshotProgress>,
+        completed_signal_ids: Vec<String>,
+    ) -> Self {
         Self {
             progress,
             event_serial: 0,
-            completed_signal_ids: HashSet::new(),
+            completed_signal_ids,
+            state_dirty: false,
         }
     }
 
     fn progress(&self) -> Option<&IncrementalSnapshotProgress> {
         self.progress.as_ref()
+    }
+
+    fn completed_signal_ids(&self) -> &[String] {
+        &self.completed_signal_ids
+    }
+
+    fn is_active(&self) -> bool {
+        self.progress
+            .as_ref()
+            .is_some_and(|progress| !progress.paused)
+    }
+
+    fn state_dirty(&self) -> bool {
+        self.state_dirty
+    }
+
+    fn mark_checkpointed(&mut self) {
+        self.state_dirty = false;
+    }
+
+    fn remember_completed(&mut self, id: String) {
+        if let Some(index) = self
+            .completed_signal_ids
+            .iter()
+            .position(|candidate| candidate == &id)
+        {
+            self.completed_signal_ids.remove(index);
+        }
+        self.completed_signal_ids.push(id);
+        if self.completed_signal_ids.len() > MAX_COMPLETED_SIGNAL_IDS {
+            self.completed_signal_ids.remove(0);
+        }
     }
 
     fn latest_position(&self, base: &SourcePosition) -> Result<Option<SourcePosition>> {
@@ -188,13 +226,7 @@ impl MySqlIncrementalSnapshot {
         parse_snapshot_signal(&id, &signal_type, &value)
     }
 
-    async fn handle_signal(
-        &mut self,
-        signal: SnapshotSignal,
-        source: &MySqlSource,
-        base_position: &SourcePosition,
-        output: &tokio::sync::mpsc::Sender<Result<SourceRecord>>,
-    ) -> Result<()> {
+    fn handle_signal(&mut self, signal: SnapshotSignal, source: &MySqlSource) -> Result<()> {
         match signal {
             SnapshotSignal::Execute {
                 id,
@@ -215,52 +247,84 @@ impl MySqlIncrementalSnapshot {
                 }
                 self.progress = Some(IncrementalSnapshotProgress {
                     signal_id: id,
-                    data_collections,
+                    data_collections: source.expand_data_collections(&data_collections)?,
                     additional_conditions,
                     current_collection: 0,
                     offset: 0,
+                    last_key: None,
+                    maximum_key: None,
                     chunk_sequence: 1,
                     paused: false,
                 });
-                self.run_to_completion(source, base_position, output).await
+                self.state_dirty = true;
+                Ok(())
             }
             SnapshotSignal::Stop {
                 id,
                 data_collections,
             } => {
-                if let Some(progress) = &self.progress {
-                    if data_collections.is_empty()
-                        || data_collections.iter().any(|collection| {
-                            progress
-                                .data_collections
-                                .iter()
-                                .any(|active| active == collection)
-                        })
-                    {
-                        info!(%id, "MySQL incremental snapshot stopped");
-                        self.progress = None;
-                    }
+                let Some(mut progress) = self.progress.take() else {
+                    return Ok(());
+                };
+                if data_collections.is_empty() {
+                    let signal_id = progress.signal_id;
+                    info!(%id, "MySQL incremental snapshot stopped");
+                    self.remember_completed(signal_id);
+                    self.state_dirty = true;
+                    return Ok(());
                 }
+                let patterns = compile_collection_patterns(&data_collections)?;
+                let original_collections = progress.data_collections.clone();
+                let current_collection = original_collections
+                    .get(progress.current_collection)
+                    .cloned();
+                let retained_before_current = original_collections
+                    .iter()
+                    .take(progress.current_collection)
+                    .filter(|collection| !collection_matches_any(collection, &patterns))
+                    .count();
+                progress
+                    .data_collections
+                    .retain(|collection| !collection_matches_any(collection, &patterns));
+                if progress.data_collections.len() == original_collections.len() {
+                    self.progress = Some(progress);
+                    return Ok(());
+                }
+                let current_removed = current_collection
+                    .as_ref()
+                    .is_some_and(|collection| collection_matches_any(collection, &patterns));
+                progress.current_collection = retained_before_current;
+                if current_removed {
+                    progress.offset = 0;
+                    progress.last_key = None;
+                    progress.maximum_key = None;
+                }
+                info!(%id, "MySQL incremental snapshot collections stopped");
+                if progress.current_collection >= progress.data_collections.len() {
+                    self.remember_completed(progress.signal_id);
+                } else {
+                    self.progress = Some(progress);
+                }
+                self.state_dirty = true;
                 Ok(())
             }
             SnapshotSignal::Pause { id } => {
-                if let Some(progress) = &mut self.progress {
+                if let Some(progress) = &mut self.progress
+                    && !progress.paused
+                {
                     progress.paused = true;
+                    self.state_dirty = true;
                     info!(%id, "MySQL incremental snapshot paused");
                 }
                 Ok(())
             }
             SnapshotSignal::Resume { id } => {
-                let should_resume = if let Some(progress) = &mut self.progress {
+                if let Some(progress) = &mut self.progress
+                    && progress.paused
+                {
                     progress.paused = false;
+                    self.state_dirty = true;
                     info!(%id, "MySQL incremental snapshot resumed");
-                    true
-                } else {
-                    false
-                };
-                if should_resume {
-                    self.run_to_completion(source, base_position, output)
-                        .await?;
                 }
                 Ok(())
             }
@@ -271,121 +335,121 @@ impl MySqlIncrementalSnapshot {
         }
     }
 
-    async fn run_to_completion(
+    async fn run_next_chunk(
         &mut self,
         source: &MySqlSource,
         base_position: &SourcePosition,
         output: &tokio::sync::mpsc::Sender<Result<SourceRecord>>,
     ) -> Result<()> {
-        while self
-            .progress
-            .as_ref()
-            .is_some_and(|progress| !progress.paused)
-        {
-            let Some(progress) = self.progress.clone() else {
-                break;
-            };
-            let Some(collection) = progress
-                .data_collections
-                .get(progress.current_collection)
-                .cloned()
-            else {
-                self.progress = None;
-                break;
-            };
-            let Some(schema) = source.schema_for_collection(&collection) else {
-                return Err(Error::Source(format!(
-                    "MySQL incremental snapshot collection {collection:?} is not captured"
-                )));
-            };
-            let rows = source.read_incremental_chunk(&schema, &progress).await?;
-            let row_count = rows.len();
-            for row in rows {
-                self.event_serial = self.event_serial.saturating_add(1);
-                let position = incremental_position(base_position, self.event_serial)?;
-                let mut attributes = BTreeMap::new();
-                attributes.insert("rustium.snapshot.kind".into(), "incremental".into());
-                let event = ChangeEvent {
-                    id: EventId::deterministic(
-                        &source.connector_name,
-                        &schema.database,
-                        &position,
-                        &collection,
-                        self.event_serial,
-                    ),
-                    source: SourceMetadata {
-                        connector: "mysql".into(),
-                        connector_name: source.connector_name.clone(),
-                        database: schema.database.clone(),
-                        schema: None,
-                        table: Some(schema.table.clone()),
-                        snapshot: true,
-                        version: CONNECTOR_VERSION.into(),
-                        attributes,
-                    },
-                    position: position.clone(),
-                    transaction: None,
-                    operation: Operation::Read,
-                    before: None,
-                    after: Some(convert_snapshot_row(row, &schema.event_schema)?),
-                    schema: schema.event_schema.clone(),
-                    source_time: None,
-                    observed_time: Utc::now(),
-                };
-                output
-                    .send(Ok(SourceRecord::data(event)))
-                    .await
-                    .map_err(|_| Error::Cancelled)?;
-            }
-            let mut next = progress;
-            if row_count < source.config.incremental_snapshot_chunk_size {
-                next.current_collection = next.current_collection.saturating_add(1);
-                next.offset = 0;
-            } else {
-                next.offset = next.offset.saturating_add(row_count as u64);
-            }
-            next.chunk_sequence = next.chunk_sequence.saturating_add(1);
-            self.progress = Some(next);
+        let Some(progress) = self.progress.clone() else {
+            return Ok(());
+        };
+        if progress.paused {
+            return Ok(());
+        }
+        let collection = progress
+            .data_collections
+            .get(progress.current_collection)
+            .cloned()
+            .ok_or_else(|| {
+                Error::State(format!(
+                    "MySQL incremental snapshot collection index {} is outside {} collections",
+                    progress.current_collection,
+                    progress.data_collections.len()
+                ))
+            })?;
+        let Some(schema) = source.schema_for_collection(&collection) else {
+            return Err(Error::Source(format!(
+                "MySQL incremental snapshot collection {collection:?} is not captured"
+            )));
+        };
+        let chunk = source.read_incremental_chunk(&schema, &progress).await?;
+        let row_count = chunk.rows.len();
+        let last_key = chunk.rows.last().map(|(_, key)| key.clone());
+        for (row, _) in chunk.rows {
             self.event_serial = self.event_serial.saturating_add(1);
             let position = incremental_position(base_position, self.event_serial)?;
+            let mut attributes = BTreeMap::new();
+            attributes.insert("rustium.snapshot.kind".into(), "incremental".into());
+            let event = ChangeEvent {
+                id: EventId::deterministic(
+                    &source.connector_name,
+                    &schema.database,
+                    &position,
+                    &collection,
+                    self.event_serial,
+                ),
+                source: SourceMetadata {
+                    connector: "mysql".into(),
+                    connector_name: source.connector_name.clone(),
+                    database: schema.database.clone(),
+                    schema: None,
+                    table: Some(schema.table.clone()),
+                    snapshot: true,
+                    version: CONNECTOR_VERSION.into(),
+                    attributes,
+                },
+                position: position.clone(),
+                transaction: None,
+                operation: Operation::Read,
+                before: None,
+                after: Some(convert_snapshot_row(row, &schema.event_schema)?),
+                schema: schema.event_schema.clone(),
+                source_time: None,
+                observed_time: Utc::now(),
+            };
             output
-                .send(Ok(SourceRecord {
-                    event: None,
-                    position,
-                    boundary: RecordBoundary::TransactionCommit,
-                    connector_state: Some(encode_connector_state(
-                        &source.schemas,
-                        self.progress.as_ref(),
-                    )?),
-                    signal_acknowledgements: Vec::new(),
-                }))
+                .send(Ok(SourceRecord::data(event)))
                 .await
                 .map_err(|_| Error::Cancelled)?;
         }
-        if self
-            .progress
-            .as_ref()
-            .is_some_and(|progress| progress.current_collection >= progress.data_collections.len())
-        {
-            if let Some(progress) = &self.progress {
-                self.completed_signal_ids.insert(progress.signal_id.clone());
-            }
+
+        let mut next = progress;
+        next.offset = 0;
+        if next.maximum_key.is_none() {
+            next.maximum_key.clone_from(&chunk.maximum_key);
+        }
+        next.last_key = last_key;
+        let collection_complete = next.maximum_key.is_none()
+            || next.last_key.as_ref() == next.maximum_key.as_ref()
+            || row_count < source.config.incremental_snapshot_chunk_size;
+        if collection_complete {
+            next.current_collection = next.current_collection.saturating_add(1);
+            next.last_key = None;
+            next.maximum_key = None;
+        }
+        next.chunk_sequence = next.chunk_sequence.saturating_add(1);
+        if next.current_collection >= next.data_collections.len() {
+            self.remember_completed(next.signal_id);
             self.progress = None;
-            self.event_serial = self.event_serial.saturating_add(1);
-            let position = incremental_position(base_position, self.event_serial)?;
-            output
-                .send(Ok(SourceRecord {
-                    event: None,
-                    position,
-                    boundary: RecordBoundary::TransactionCommit,
-                    connector_state: Some(encode_connector_state(&source.schemas, None)?),
-                    signal_acknowledgements: Vec::new(),
-                }))
-                .await
-                .map_err(|_| Error::Cancelled)?;
+        } else {
+            self.progress = Some(next);
         }
+
+        self.event_serial = self.event_serial.saturating_add(1);
+        let position = incremental_position(base_position, self.event_serial)?;
+        output
+            .send(Ok(SourceRecord {
+                event: None,
+                position,
+                boundary: RecordBoundary::TransactionCommit,
+                connector_state: Some(encode_connector_state(
+                    &source.schemas,
+                    self.progress.as_ref(),
+                    &self.completed_signal_ids,
+                )?),
+                signal_acknowledgements: Vec::new(),
+            }))
+            .await
+            .map_err(|_| Error::Cancelled)?;
+        self.mark_checkpointed();
         Ok(())
     }
+}
+
+struct IncrementalChunk {
+    rows: Vec<(MySqlRow, Vec<MySqlKeyValue>)>,
+    maximum_key: Option<Vec<MySqlKeyValue>>,
 }
 
 pub struct MySqlSource {
@@ -641,41 +705,76 @@ impl MySqlSource {
     fn schema_for_collection(&self, collection: &str) -> Option<TableSchema> {
         self.schemas
             .values()
-            .find(|schema| {
-                let name = format!("{}.{}", schema.database, schema.table);
-                regex::Regex::new(&format!(r"^(?:{collection})$"))
-                    .is_ok_and(|pattern| pattern.is_match(&name))
-            })
+            .find(|schema| format!("{}.{}", schema.database, schema.table) == collection)
             .cloned()
+    }
+
+    fn expand_data_collections(&self, patterns: &[String]) -> Result<Vec<String>> {
+        let patterns = patterns
+            .iter()
+            .map(|pattern| {
+                regex::Regex::new(&format!(r"^(?:{pattern})$")).map_err(|error| {
+                    Error::Source(format!(
+                        "invalid MySQL incremental snapshot collection pattern {pattern:?}: {error}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let signal_table = signal_table_key(&self.config);
+        let mut collections = self
+            .schemas
+            .values()
+            .filter(|schema| signal_table.as_ref() != Some(&schema.key()))
+            .filter_map(|schema| {
+                let collection = format!("{}.{}", schema.database, schema.table);
+                patterns
+                    .iter()
+                    .any(|pattern| pattern.is_match(&collection))
+                    .then_some(collection)
+            })
+            .collect::<Vec<_>>();
+        collections.sort();
+        collections.dedup();
+        if collections.is_empty() {
+            return Err(Error::Source(
+                "MySQL incremental snapshot patterns select no captured tables".into(),
+            ));
+        }
+        Ok(collections)
     }
 
     async fn read_incremental_chunk(
         &self,
         schema: &TableSchema,
         progress: &IncrementalSnapshotProgress,
-    ) -> Result<Vec<MySqlRow>> {
+    ) -> Result<IncrementalChunk> {
         let qualified = format!(
             "{}.{}",
             quote_identifier(&schema.database),
             quote_identifier(&schema.table)
         );
-        let ordering = schema
+        let key_fields = schema
             .event_schema
             .fields
             .iter()
-            .filter(|field| field.primary_key)
-            .map(|field| quote_identifier(&field.name))
+            .enumerate()
+            .filter(|(_, field)| field.primary_key)
+            .map(|(index, field)| (index, quote_identifier(&field.name)))
             .collect::<Vec<_>>();
-        let ordering = if ordering.is_empty() {
-            schema
-                .event_schema
-                .fields
-                .iter()
-                .map(|field| quote_identifier(&field.name))
-                .collect::<Vec<_>>()
-        } else {
-            ordering
-        };
+        if key_fields.is_empty() {
+            return Err(Error::Source(format!(
+                "MySQL incremental snapshot table {}.{} requires a primary key",
+                schema.database, schema.table
+            )));
+        }
+        let key_indices = key_fields
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+        let key_columns = key_fields
+            .iter()
+            .map(|(_, column)| column.clone())
+            .collect::<Vec<_>>();
         let collection_name = format!("{}.{}", schema.database, schema.table);
         let condition = progress
             .additional_conditions
@@ -685,21 +784,73 @@ impl MySqlSource {
                     .ok()
                     .and_then(|pattern| pattern.is_match(&collection_name).then_some(filter))
             });
-        let where_clause =
-            condition.map_or_else(String::new, |condition| format!(" WHERE ({condition})"));
-        let order_clause = if ordering.is_empty() {
-            String::new()
-        } else {
-            format!(" ORDER BY {}", ordering.join(", "))
-        };
-        let query = format!(
-            "SELECT * FROM {qualified}{where_clause}{order_clause} LIMIT {} OFFSET {}",
-            self.config.incremental_snapshot_chunk_size, progress.offset
-        );
         let mut connection = connect(&self.config).await?;
-        let rows = connection.query(query).await.map_err(mysql_error)?;
+        let maximum_key = match &progress.maximum_key {
+            Some(maximum_key) => Some(maximum_key.clone()),
+            None => {
+                let where_clause = condition
+                    .map(|condition| format!(" WHERE ({condition})"))
+                    .unwrap_or_default();
+                let ordering = key_columns
+                    .iter()
+                    .map(|column| format!("{column} DESC"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let query = format!(
+                    "SELECT {} FROM {qualified}{where_clause} ORDER BY {ordering} LIMIT 1",
+                    key_columns.join(", ")
+                );
+                let row: Option<MySqlRow> = connection
+                    .exec_first(query, ())
+                    .await
+                    .map_err(mysql_error)?;
+                row.map(|row| mysql_key_from_values(row.unwrap()))
+                    .transpose()?
+            }
+        };
+        let Some(maximum_key) = maximum_key else {
+            connection.disconnect().await.map_err(mysql_error)?;
+            return Ok(IncrementalChunk {
+                rows: Vec::new(),
+                maximum_key: None,
+            });
+        };
+
+        let mut predicates = Vec::new();
+        let mut parameters = Vec::new();
+        if let Some(condition) = condition {
+            predicates.push(format!("({condition})"));
+        }
+        if let Some(last_key) = &progress.last_key {
+            validate_key_width(&key_columns, last_key, "last")?;
+            predicates.push(key_comparison(&key_columns, ">"));
+            parameters.extend(last_key.iter().map(mysql_key_to_value));
+        }
+        validate_key_width(&key_columns, &maximum_key, "maximum")?;
+        predicates.push(key_comparison(&key_columns, "<="));
+        parameters.extend(maximum_key.iter().map(mysql_key_to_value));
+        let where_clause = format!(" WHERE {}", predicates.join(" AND "));
+        let query = format!(
+            "SELECT * FROM {qualified}{where_clause} ORDER BY {} LIMIT {}",
+            key_columns.join(", "),
+            self.config.incremental_snapshot_chunk_size
+        );
+        let rows: Vec<MySqlRow> = connection
+            .exec(query, Params::Positional(parameters))
+            .await
+            .map_err(mysql_error)?;
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                let key = mysql_key_from_row(&row, &key_indices)?;
+                Ok((row, key))
+            })
+            .collect::<Result<Vec<_>>>()?;
         connection.disconnect().await.map_err(mysql_error)?;
-        Ok(rows)
+        Ok(IncrementalChunk {
+            rows,
+            maximum_key: Some(maximum_key),
+        })
     }
 
     async fn process_binlog_event(
@@ -765,20 +916,7 @@ impl MySqlSource {
                         let Some(after) = after else { continue };
                         let signal_row = convert_binlog_row(&after, &schema.event_schema, None);
                         let signal = MySqlIncrementalSnapshot::parse_row(&signal_row)?;
-                        let base = mysql_position(
-                            &state.current_filename,
-                            event_start,
-                            state
-                                .transaction
-                                .as_ref()
-                                .map(|transaction| transaction.id.clone()),
-                            header.server_id(),
-                            0,
-                            false,
-                        );
-                        incremental
-                            .handle_signal(signal, self, &base, &context.output)
-                            .await?;
+                        incremental.handle_signal(signal, self)?;
                     }
                     let signal_position = mysql_position(
                         &state.current_filename,
@@ -791,11 +929,7 @@ impl MySqlSource {
                         1,
                         false,
                     );
-                    return Ok(Some(
-                        incremental
-                            .latest_position(&signal_position)?
-                            .unwrap_or(signal_position),
-                    ));
+                    return Ok(Some(signal_position));
                 }
                 state.convert_rows(
                     &rows,
@@ -832,7 +966,11 @@ impl MySqlSource {
                         }
                     }
                     self.schemas.clone_from(&state.schemas);
-                    record.connector_state = Some(encode_schema_history(&state.schemas)?);
+                    record.connector_state = Some(encode_connector_state(
+                        &state.schemas,
+                        incremental.progress(),
+                        incremental.completed_signal_ids(),
+                    )?);
                 }
                 record.into_iter().collect()
             }
@@ -840,7 +978,22 @@ impl MySqlSource {
         };
 
         let mut last_position = None;
-        for record in records {
+        for mut record in records {
+            if record.boundary == RecordBoundary::TransactionCommit
+                && record.connector_state.is_none()
+                && incremental.state_dirty()
+            {
+                record.connector_state = Some(encode_connector_state(
+                    &state.schemas,
+                    incremental.progress(),
+                    incremental.completed_signal_ids(),
+                )?);
+            }
+            if record.boundary == RecordBoundary::TransactionCommit
+                && record.connector_state.is_some()
+            {
+                incremental.mark_checkpointed();
+            }
             last_position = Some(record.position.clone());
             context
                 .output
@@ -864,22 +1017,21 @@ impl MySqlSource {
     ) -> Result<Option<Error>> {
         let mut heartbeat = heartbeat_timer(self.config.heartbeat_interval);
         let mut file_signal_poll = file_signal_timer(&self.config);
-        if incremental
-            .progress()
-            .is_some_and(|progress| !progress.paused)
-        {
-            if let Some(base) = last_safe_position.clone() {
-                incremental
-                    .run_to_completion(self, &base, &context.output)
-                    .await?;
-                if let Some(position) = incremental.latest_position(&base)? {
-                    *last_safe_position = Some(position);
-                }
-            }
-        }
+        let mut incremental_tick = tokio::time::interval(std::time::Duration::from_millis(1));
+        incremental_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = context.cancellation.cancelled() => return Ok(None),
+                _ = incremental_tick.tick(),
+                    if incremental.is_active() && state.transaction.is_none() => {
+                    let base = last_safe_position.clone().unwrap_or_else(|| mysql_position(
+                        &state.current_filename, 4, None, self.source_server_id, 0, false,
+                    ));
+                    incremental.run_next_chunk(self, &base, &context.output).await?;
+                    if let Some(position) = incremental.latest_position(&base)? {
+                        *last_safe_position = Some(position);
+                    }
+                }
                 () = next_file_signal_poll(&mut file_signal_poll),
                     if signal_channel_enabled(&self.config, "file") && state.transaction.is_none() => {
                     for line in crate::file_signal::read_and_clear(&self.config.signal_file).await? {
@@ -891,18 +1043,13 @@ impl MySqlSource {
                             Ok(signal) => signal,
                             Err(error) => { warn!(%error, "invalid MySQL file signal ignored"); continue; }
                         };
-                        let base = last_safe_position.clone().unwrap_or_else(|| mysql_position(
-                            &state.current_filename, 4, None, self.source_server_id, 0, false,
-                        ));
-                        incremental.handle_signal(signal, self, &base, &context.output).await?;
-                        if let Some(position) = incremental.latest_position(&base)? {
-                            *last_safe_position = Some(position);
-                        }
+                        incremental.handle_signal(signal, self)?;
                     }
                     emit_incremental_checkpoint(
                         &context.output, &self.schemas, incremental.progress(),
-                        last_safe_position.as_ref(), None,
+                        incremental.completed_signal_ids(), last_safe_position.as_ref(), None,
                     ).await?;
+                    incremental.mark_checkpointed();
                 }
                 delivery = context.signals.recv(),
                     if (signal_channel_enabled(&self.config, "in-process")
@@ -913,17 +1060,13 @@ impl MySqlSource {
                         Ok(signal) => signal,
                         Err(error) => { warn!(%error, "invalid MySQL runtime signal ignored"); delivery.acknowledge(); continue; }
                     };
-                    let base = last_safe_position.clone().unwrap_or_else(|| mysql_position(
-                        &state.current_filename, 4, None, self.source_server_id, 0, false,
-                    ));
-                    incremental.handle_signal(signal, self, &base, &context.output).await?;
-                    if let Some(position) = incremental.latest_position(&base)? {
-                        *last_safe_position = Some(position);
-                    }
+                    incremental.handle_signal(signal, self)?;
                     emit_incremental_checkpoint(
                         &context.output, &self.schemas, incremental.progress(),
-                        last_safe_position.as_ref(), delivery.into_acknowledgement(),
+                        incremental.completed_signal_ids(), last_safe_position.as_ref(),
+                        delivery.into_acknowledgement(),
                     ).await?;
+                    incremental.mark_checkpointed();
                 }
                 changed = context.acknowledged.changed() => {
                     if changed.is_err() {
@@ -1008,6 +1151,7 @@ impl SourceConnector for MySqlSource {
         }
 
         let mut incremental_progress = None;
+        let mut completed_signal_ids = Vec::new();
         let checkpoint_has_schema_history = checkpoint
             .as_ref()
             .and_then(|checkpoint| checkpoint.connector_state.as_ref())
@@ -1020,6 +1164,7 @@ impl SourceConnector for MySqlSource {
                 let state = decode_connector_state(connector_state)?;
                 self.schemas = state.schemas;
                 incremental_progress = state.incremental_snapshot;
+                completed_signal_ids = state.completed_signal_ids;
             } else if checkpoint.is_some() {
                 return Err(Error::State(
                     "MySQL checkpoint predates persistent schema history and cannot safely replay destructive DDL; reset the checkpoint and run a new initial snapshot"
@@ -1075,7 +1220,8 @@ impl SourceConnector for MySqlSource {
             resume_position.clone(),
         );
         let mut heartbeat_connection = open_heartbeat_connection(&self.config).await?;
-        let mut incremental = MySqlIncrementalSnapshot::new(incremental_progress);
+        let mut incremental =
+            MySqlIncrementalSnapshot::new(incremental_progress, completed_signal_ids);
         let mut stream_coordinates = coordinates.clone();
         let mut last_safe_position = Some(
             resume_position
@@ -1198,6 +1344,124 @@ fn signal_channel_enabled(config: &MySqlSourceConfig, channel: &str) -> bool {
         .signal_enabled_channels
         .iter()
         .any(|enabled| enabled == channel)
+}
+
+fn compile_collection_patterns(patterns: &[String]) -> Result<Vec<regex::Regex>> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            regex::Regex::new(&format!(r"^(?:{pattern})$")).map_err(|error| {
+                Error::Source(format!(
+                    "invalid MySQL snapshot control collection pattern {pattern:?}: {error}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn collection_matches_any(collection: &str, patterns: &[regex::Regex]) -> bool {
+    patterns.iter().any(|pattern| pattern.is_match(collection))
+}
+
+fn key_comparison(columns: &[String], operator: &str) -> String {
+    if columns.len() == 1 {
+        format!("{} {operator} ?", columns[0])
+    } else {
+        format!(
+            "({}) {operator} ({})",
+            columns.join(", "),
+            std::iter::repeat_n("?", columns.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn validate_key_width(columns: &[String], key: &[MySqlKeyValue], boundary: &str) -> Result<()> {
+    if columns.len() != key.len() {
+        return Err(Error::State(format!(
+            "MySQL incremental snapshot {boundary} key has {} values for {} primary-key columns",
+            key.len(),
+            columns.len()
+        )));
+    }
+    Ok(())
+}
+
+fn mysql_key_from_row(row: &MySqlRow, indices: &[usize]) -> Result<Vec<MySqlKeyValue>> {
+    indices
+        .iter()
+        .map(|index| {
+            row.as_ref(*index)
+                .ok_or_else(|| {
+                    Error::Source(format!(
+                        "MySQL incremental snapshot row has no primary-key column at index {index}"
+                    ))
+                })
+                .and_then(mysql_key_from_value)
+        })
+        .collect()
+}
+
+fn mysql_key_from_values(values: Vec<Value>) -> Result<Vec<MySqlKeyValue>> {
+    values.iter().map(mysql_key_from_value).collect()
+}
+
+fn mysql_key_from_value(value: &Value) -> Result<MySqlKeyValue> {
+    match value {
+        Value::NULL => Err(Error::Source(
+            "MySQL incremental snapshot primary key contains NULL".into(),
+        )),
+        Value::Int(value) => Ok(MySqlKeyValue::Int(*value)),
+        Value::UInt(value) => Ok(MySqlKeyValue::UInt(*value)),
+        Value::Float(value) => Ok(MySqlKeyValue::Float(value.to_bits())),
+        Value::Double(value) => Ok(MySqlKeyValue::Double(value.to_bits())),
+        Value::Bytes(value) => Ok(MySqlKeyValue::Bytes(value.clone())),
+        Value::Date(year, month, day, hour, minute, second, micros) => Ok(MySqlKeyValue::Date {
+            year: *year,
+            month: *month,
+            day: *day,
+            hour: *hour,
+            minute: *minute,
+            second: *second,
+            micros: *micros,
+        }),
+        Value::Time(negative, days, hours, minutes, seconds, micros) => Ok(MySqlKeyValue::Time {
+            negative: *negative,
+            days: *days,
+            hours: *hours,
+            minutes: *minutes,
+            seconds: *seconds,
+            micros: *micros,
+        }),
+    }
+}
+
+fn mysql_key_to_value(value: &MySqlKeyValue) -> Value {
+    match value {
+        MySqlKeyValue::Int(value) => Value::Int(*value),
+        MySqlKeyValue::UInt(value) => Value::UInt(*value),
+        MySqlKeyValue::Float(value) => Value::Float(f32::from_bits(*value)),
+        MySqlKeyValue::Double(value) => Value::Double(f64::from_bits(*value)),
+        MySqlKeyValue::Bytes(value) => Value::Bytes(value.clone()),
+        MySqlKeyValue::Date {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            micros,
+        } => Value::Date(*year, *month, *day, *hour, *minute, *second, *micros),
+        MySqlKeyValue::Time {
+            negative,
+            days,
+            hours,
+            minutes,
+            seconds,
+            micros,
+        } => Value::Time(*negative, *days, *hours, *minutes, *seconds, *micros),
+    }
 }
 
 fn file_signal_timer(config: &MySqlSourceConfig) -> Option<tokio::time::Interval> {
@@ -1345,6 +1609,7 @@ async fn emit_incremental_checkpoint(
     output: &tokio::sync::mpsc::Sender<Result<SourceRecord>>,
     schemas: &HashMap<(String, String), TableSchema>,
     progress: Option<&IncrementalSnapshotProgress>,
+    completed_signal_ids: &[String],
     position: Option<&SourcePosition>,
     acknowledgement: Option<SignalAcknowledgement>,
 ) -> Result<()> {
@@ -1356,7 +1621,11 @@ async fn emit_incremental_checkpoint(
             event: None,
             position: position.clone(),
             boundary: RecordBoundary::Heartbeat,
-            connector_state: Some(encode_connector_state(schemas, progress)?),
+            connector_state: Some(encode_connector_state(
+                schemas,
+                progress,
+                completed_signal_ids,
+            )?),
             signal_acknowledgements: acknowledgement.into_iter().collect(),
         }))
         .await
@@ -2612,6 +2881,104 @@ mod tests {
             mysql_timestamp("1784114317.113641"),
             Some("2026-07-15 11:18:37.113641".into())
         );
+    }
+
+    #[test]
+    fn builds_single_and_composite_mysql_keyset_predicates() {
+        assert_eq!(key_comparison(&["`id`".into()], ">"), "`id` > ?");
+        assert_eq!(
+            key_comparison(&["`tenant_id`".into(), "`id`".into()], "<="),
+            "(`tenant_id`, `id`) <= (?, ?)"
+        );
+    }
+
+    #[test]
+    fn ignores_completed_incremental_execute_signal_after_restart() {
+        let mut source = MySqlSource::new(
+            "inventory-mysql",
+            test_mysql_config(),
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        let schema = TableSchema {
+            database: "inventory".into(),
+            table: "orders".into(),
+            event_schema: EventSchema {
+                name: "inventory-mysql.inventory.orders.Envelope".into(),
+                version: 1,
+                fields: vec![FieldSchema {
+                    name: "id".into(),
+                    type_name: "bigint".into(),
+                    optional: false,
+                    primary_key: true,
+                }],
+            },
+        };
+        source.schemas.insert(schema.key(), schema);
+        let mut incremental = MySqlIncrementalSnapshot::new(None, vec!["snapshot-1".into()]);
+
+        incremental
+            .handle_signal(
+                SnapshotSignal::Execute {
+                    id: "snapshot-1".into(),
+                    data_collections: vec!["inventory\\.orders".into()],
+                    additional_conditions: BTreeMap::new(),
+                },
+                &source,
+            )
+            .unwrap();
+
+        assert!(incremental.progress().is_none());
+    }
+
+    #[test]
+    fn scoped_stop_advances_to_the_next_mysql_collection() {
+        let source = MySqlSource::new(
+            "inventory-mysql",
+            test_mysql_config(),
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        let progress = IncrementalSnapshotProgress {
+            signal_id: "snapshot-1".into(),
+            data_collections: vec![
+                "inventory.accounts".into(),
+                "inventory.orders".into(),
+                "inventory.shipments".into(),
+            ],
+            additional_conditions: BTreeMap::new(),
+            current_collection: 1,
+            offset: 0,
+            last_key: Some(vec![MySqlKeyValue::UInt(42)]),
+            maximum_key: Some(vec![MySqlKeyValue::UInt(100)]),
+            chunk_sequence: 3,
+            paused: false,
+        };
+        let mut incremental = MySqlIncrementalSnapshot::new(Some(progress), Vec::new());
+
+        incremental
+            .handle_signal(
+                SnapshotSignal::Stop {
+                    id: "stop-orders".into(),
+                    data_collections: vec!["inventory\\.orders".into()],
+                },
+                &source,
+            )
+            .unwrap();
+
+        let progress = incremental.progress().unwrap();
+        assert_eq!(
+            progress.data_collections,
+            ["inventory.accounts", "inventory.shipments"]
+        );
+        assert_eq!(progress.current_collection, 1);
+        assert_eq!(progress.last_key, None);
+        assert_eq!(progress.maximum_key, None);
+        assert!(incremental.state_dirty());
     }
 
     #[test]

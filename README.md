@@ -384,7 +384,7 @@ The signal table must contain exactly `id`, `type`, and `data` in that order and
 
 Set Debezium `read.only=true` or native `source.read_only: true` to replace inserted watermarks with `pg_current_snapshot()` low/high transaction watermarks. Rustium compares WAL transaction IDs against those snapshots, keeps the window open until every transaction visible across the chunk has passed, and applies the same primary-key deduplication. The connector requires only `SELECT` on captured tables plus logical-replication access and writes no watermark records. A source signal table remains necessary only when the `source` channel is used.
 
-Current PostgreSQL signaling supports the Debezium `source`, `file`, `in-process`, and `kafka` channels, the JMX-to-management migration alias, and incremental snapshot actions. Writable mode supports `insert_insert`; read-only mode uses transaction snapshots. With `incremental.snapshot.allow.schema.changes=false`, Rustium compares the catalog after opening every window and also rejects a changed WAL `Relation` for the active table, preserving the previous checkpoint instead of querying or emitting mismatched layouts. A completed checkpoint also requires the original replication slot to exist and report a WAL status that still retains the required history; a missing, `unreserved`, or `lost` slot fails before stream creation with a reset-and-resnapshot instruction rather than silently creating a new slot. Debezium's PostgreSQL connector does not support schema changes during an incremental snapshot, so Rustium rejects `incremental.snapshot.allow.schema.changes=true` instead of exposing unsafe semantics. Remaining PostgreSQL gates include metadata unavailable from transient historical `Relation` records, live PostGIS/pgvector fixtures on a server with those extensions installed, and real-broker Kafka end-to-end recovery coverage.
+Current PostgreSQL signaling supports the Debezium `source`, `file`, `in-process`, and `kafka` channels, the JMX-to-management migration alias, and incremental snapshot actions. Writable mode supports `insert_insert`; read-only mode uses transaction snapshots. With `incremental.snapshot.allow.schema.changes=false`, Rustium compares the catalog after opening every window and also rejects a changed WAL `Relation` for the active table, preserving the previous checkpoint instead of querying or emitting mismatched layouts. A completed checkpoint also requires the original replication slot to exist and report a WAL status that still retains the required history; a missing, `unreserved`, or `lost` slot fails before stream creation with a reset-and-resnapshot instruction rather than silently creating a new slot. Debezium's PostgreSQL connector does not support schema changes during an incremental snapshot, so Rustium rejects `incremental.snapshot.allow.schema.changes=true` instead of exposing unsafe semantics. Historical `Relation` replay now falls back to matching checkpointed type metadata, or a conservative `unknown_oid_*` name when both catalog and history are unavailable. Remaining PostgreSQL gates are live PostGIS/pgvector fixtures on a server with those extensions installed and real-broker Kafka end-to-end recovery coverage.
 
 ### MySQL
 
@@ -406,7 +406,7 @@ Implemented behavior:
 - optional `heartbeat.action.query` execution on a separate ordinary MySQL connection at the heartbeat cadence
 - FULL, MINIMAL, and NOBLOB row images with explicit unavailable values where MySQL omits data
 - PARTIAL_JSON update diffs reconstructed from a complete before image, with unavailable fallback when safe reconstruction is impossible
-- source-table, file, and in-process signaling for incremental snapshot controls, with chunk progress persisted in connector state
+- source-table, file, in-process, and Kafka signaling for incremental snapshot controls, with primary-key keyset progress and completed signal IDs persisted in connector state
 - Docker and external integration coverage against MySQL 8.4, including filtered GTID startup and restart across destructive DDL
 
 Recommended MySQL permissions for the connector user:
@@ -429,7 +429,7 @@ DDL parsing failures stop the connector by default. Debezium-compatible `schema.
 
 Checkpoint v1 JSON remains readable, but a completed MySQL v1 checkpoint has no historical schema baseline and is rejected for resume. Reset that checkpoint and run a new initial snapshot once to establish checkpoint v2 schema history.
 
-MySQL supports source-table, file, and bounded in-process signaling for Debezium-compatible `execute-snapshot`, `pause-snapshot`, `resume-snapshot`, and `stop-snapshot` controls. Incremental snapshots are chunked, ordered by primary key when available, and persisted in connector state so a checkpoint restart resumes the active collection. Java-specific truststore/keystore conversion remains unsupported; wider DDL/type fixtures and an optional Kafka signal consumer are still tracked as follow-up work. When `binlog_row_value_options=PARTIAL_JSON` is enabled, a diff without a complete before image remains explicitly unavailable rather than being guessed.
+MySQL supports source-table, file, bounded in-process, and Kafka signaling for Debezium-compatible `execute-snapshot`, `pause-snapshot`, `resume-snapshot`, and `stop-snapshot` controls. Incremental snapshots require a primary key, capture a fixed maximum key per collection, and advance with typed single-column or composite-key keyset queries instead of `LIMIT/OFFSET`. The current key, maximum key, collection, pause state, and a bounded history of completed signal IDs are persisted in connector state. Restart resumes after the last checkpointed key; a replayed completed execute signal is ignored, including the crash window between a connector checkpoint and Kafka offset commit. Only one chunk runs per event-loop turn, so binlog events and control signals are observed between chunks. Java-specific truststore/keystore conversion, wider DDL/type fixtures, and binlog-window deduplication under concurrent writes remain follow-up gates. When `binlog_row_value_options=PARTIAL_JSON` is enabled, a diff without a complete before image remains explicitly unavailable rather than being guessed.
 
 For MySQL source-table signaling, set `signal.data.collection=database.signal_table` and include the signal table in the connector user's `SELECT` scope. The table must expose `id`, `type`, and `data` columns; the connector does not write to it. File signaling consumes one JSON envelope per line and clears the file only after reading it. In-process signaling uses the same `SignalSender` and HTTP management route as the other connectors. Kafka signaling uses the existing single-partition, checkpoint-coupled `rustium-signal-kafka` channel and the same Debezium topic/key contract.
 
@@ -913,7 +913,7 @@ Execute payload 还接受 Debezium `additional-conditions`；每项包含一个 
 
 设置 Debezium `read.only=true` 或原生 `source.read_only: true`，即可用 `pg_current_snapshot()` 低/高事务水位替代插入 watermark。Rustium 将 WAL transaction ID 与这些快照比较，直到跨 chunk 可见的事务全部通过后才关闭窗口，并执行相同的主键去重。连接器只需要捕获表 `SELECT` 和逻辑复制权限，不写入 watermark 记录。只有使用 `source` channel 时才仍需 source 信号表。
 
-当前 PostgreSQL 信号能力支持 Debezium `source`、`file`、`in-process`、`kafka` channel、JMX 到管理通道的迁移别名和增量快照 action。可写模式支持 `insert_insert`，只读模式使用事务快照。当 `incremental.snapshot.allow.schema.changes=false` 时，Rustium 会在每次打开窗口后比较 catalog，并拒绝活动表发生变化的 WAL `Relation`；它保留旧 checkpoint，不会查询或发出布局不匹配的数据。已完成 checkpoint 还要求原 replication slot 存在且 WAL status 仍保留所需历史；slot 缺失、`unreserved` 或 `lost` 时会在建立 stream 前明确失败并要求 reset + resnapshot，不会静默创建新 slot。Debezium PostgreSQL 连接器不支持增量快照期间的 schema change，因此 Rustium 会拒绝 `incremental.snapshot.allow.schema.changes=true`，不会暴露不安全语义。PostgreSQL 剩余门槛包括短暂历史 `Relation` 无法提供的元数据、在安装相应扩展的服务器上执行 PostGIS/pgvector 实测，以及真实 broker Kafka 端到端恢复覆盖。
+当前 PostgreSQL 信号能力支持 Debezium `source`、`file`、`in-process`、`kafka` channel、JMX 到管理通道的迁移别名和增量快照 action。可写模式支持 `insert_insert`，只读模式使用事务快照。当 `incremental.snapshot.allow.schema.changes=false` 时，Rustium 会在每次打开窗口后比较 catalog，并拒绝活动表发生变化的 WAL `Relation`；它保留旧 checkpoint，不会查询或发出布局不匹配的数据。已完成 checkpoint 还要求原 replication slot 存在且 WAL status 仍保留所需历史；slot 缺失、`unreserved` 或 `lost` 时会在建立 stream 前明确失败并要求 reset + resnapshot，不会静默创建新 slot。Debezium PostgreSQL 连接器不支持增量快照期间的 schema change，因此 Rustium 会拒绝 `incremental.snapshot.allow.schema.changes=true`，不会暴露不安全语义。历史 `Relation` 重放现在会优先复用 checkpoint 中匹配的类型元数据；catalog 与历史都不可用时使用保守的 `unknown_oid_*` 名称。PostgreSQL 剩余门槛是在安装相应扩展的服务器上执行 PostGIS/pgvector 实测，以及真实 broker Kafka 端到端恢复覆盖。
 
 ### MySQL
 
@@ -935,7 +935,7 @@ MySQL 连接器通过原生复制协议读取行级二进制日志。
 - 可选地在 heartbeat 周期通过独立普通 MySQL 连接执行 `heartbeat.action.query`
 - 支持 FULL、MINIMAL、NOBLOB row image；MySQL 未提供的值会明确标记为 unavailable
 - 根据完整 before image 重建 PARTIAL_JSON 更新 diff；无法安全重建时保守标记为 unavailable
-- 支持源表、文件和进程内增量快照信号，并将 chunk 进度持久化到 connector state
+- 支持源表、文件、进程内和 Kafka 增量快照信号，并将主键 keyset 进度与已完成 signal ID 持久化到 connector state
 - MySQL 8.4 Docker 和外部集成测试，包括过滤后的 GTID 启动和跨破坏性 DDL 重启
 
 建议给 MySQL 连接器用户授予：
@@ -958,7 +958,7 @@ DDL 默认解析失败即停止连接器。可使用 Debezium 兼容参数 `sche
 
 Checkpoint v1 JSON 仍可读取，但已完成的 MySQL v1 checkpoint 不含历史 schema 基线，因此会拒绝恢复。升级后需要重置该 checkpoint 并执行一次新的 initial snapshot，以建立 checkpoint v2 schema history。
 
-MySQL 已支持源表、文件、进程内和 Kafka signal，并兼容 Debezium 的 `execute-snapshot`、`pause-snapshot`、`resume-snapshot`、`stop-snapshot` 控制。增量快照按 chunk 执行；优先按主键排序，并将活动进度持久化到 connector state，checkpoint 重启后可继续当前集合。Kafka 使用现有的单 partition、与 checkpoint 绑定的 `rustium-signal-kafka` channel 以及同一 Debezium topic/key 合约。Java 专用 truststore/keystore 转换和更广的 DDL/类型样例仍作为后续门槛。启用 `binlog_row_value_options=PARTIAL_JSON` 时，如果 diff 没有完整 before image，仍会明确标记为 unavailable，而不会猜测结果。
+MySQL 已支持源表、文件、进程内和 Kafka signal，并兼容 Debezium 的 `execute-snapshot`、`pause-snapshot`、`resume-snapshot`、`stop-snapshot` 控制。增量快照要求目标表具有主键；每个集合会固定最大主键，并使用带类型的单列或复合主键 keyset 查询推进，不再使用 `LIMIT/OFFSET`。当前主键、最大主键、集合、暂停状态和有界的已完成 signal ID 历史都会持久化到 connector state。重启会从最后 checkpoint 的主键之后继续；已完成的 execute signal 重放会被忽略，包括 connector checkpoint 与 Kafka offset commit 之间的崩溃窗口。事件循环每轮最多执行一个 chunk，因此可以在 chunk 之间处理 binlog 和控制信号。Kafka 使用现有的单 partition、与 checkpoint 绑定的 `rustium-signal-kafka` channel 以及同一 Debezium topic/key 合约。Java 专用 truststore/keystore 转换、更广的 DDL/类型样例，以及并发写入下的 binlog window 去重仍是后续门槛。启用 `binlog_row_value_options=PARTIAL_JSON` 时，如果 diff 没有完整 before image，仍会明确标记为 unavailable，而不会猜测结果。
 
 MySQL 源表信号需要配置 `signal.data.collection=database.signal_table`，并让连接器用户对信号表具有 `SELECT` 权限；连接器不会向信号表写入数据。信号表必须提供 `id`、`type`、`data` 三列。文件信号每行一个 JSON envelope，读取后清空文件；进程内信号复用其他连接器的 `SignalSender` 和 HTTP 管理端点；Kafka signal 复用单 partition、与 checkpoint 绑定的 `rustium-signal-kafka` channel。
 
