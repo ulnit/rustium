@@ -410,16 +410,7 @@ fn parse_sqlserver(properties: &BTreeMap<String, String>) -> Result<Config> {
         ));
     }
     let poll_interval = duration_ms(properties, "poll.interval.ms", default_poll_interval())?;
-    let mut warnings = Vec::new();
-    if properties
-        .get("heartbeat.action.query")
-        .is_some_and(|query| !query.trim().is_empty())
-    {
-        warnings.push(
-            "heartbeat.action.query is not implemented by the Rustium SQL Server source and was ignored"
-                .into(),
-        );
-    }
+    let warnings = Vec::new();
     assemble_config(
         properties,
         SourceConfig::Sqlserver(SqlServerSourceConfig {
@@ -456,6 +447,17 @@ fn parse_sqlserver(properties: &BTreeMap<String, String>) -> Result<Config> {
                 .get("snapshot.isolation.mode")
                 .cloned()
                 .unwrap_or_else(default_sqlserver_snapshot_isolation),
+            heartbeat_interval: duration_ms(properties, "heartbeat.interval.ms", Duration::ZERO)?,
+            heartbeat_action_query: properties
+                .get("heartbeat.action.query")
+                .filter(|query| !query.trim().is_empty())
+                .cloned(),
+            heartbeat_topics_prefix: properties
+                .get("topic.heartbeat.prefix")
+                .or_else(|| properties.get("heartbeat.topics.prefix"))
+                .cloned()
+                .unwrap_or_else(default_heartbeat_topics_prefix),
+            heartbeat_topic_name: properties.get("topic.heartbeat.name").cloned(),
         }),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -1235,6 +1237,10 @@ table.include.list=dbo\.orders
 topic.prefix=inventory
 snapshot.isolation.mode=snapshot
 streaming.fetch.size=2048
+heartbeat.interval.ms=1000
+heartbeat.action.query=UPDATE dbo.heartbeat SET touched_at = SYSUTCDATETIME()
+topic.heartbeat.prefix=__sql-heartbeat
+topic.heartbeat.name=shared-sql-heartbeat
 "#,
         )
         .unwrap();
@@ -1242,6 +1248,16 @@ streaming.fetch.size=2048
         assert_eq!(source.databases, ["inventory"]);
         assert_eq!(source.streaming_fetch_size, 2048);
         assert_eq!(source.snapshot_isolation_mode, "snapshot");
+        assert_eq!(source.heartbeat_interval, Duration::from_secs(1));
+        assert_eq!(
+            source.heartbeat_action_query.as_deref(),
+            Some("UPDATE dbo.heartbeat SET touched_at = SYSUTCDATETIME()")
+        );
+        assert_eq!(source.heartbeat_topics_prefix, "__sql-heartbeat");
+        assert_eq!(
+            source.heartbeat_topic_name.as_deref(),
+            Some("shared-sql-heartbeat")
+        );
         assert!(config.format.tombstones_on_delete);
     }
 }

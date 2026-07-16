@@ -280,6 +280,14 @@ impl SourceConnector for SqlServerSource {
         let mut state = StreamingState::new(cursor, resume_position);
         let mut interval = tokio::time::interval(self.config.poll_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut heartbeat = heartbeat_timer(self.config.heartbeat_interval);
+        let mut heartbeat_connection = if self.config.heartbeat_interval.is_zero()
+            || self.config.heartbeat_action_query.is_none()
+        {
+            None
+        } else {
+            Some(connect(&self.config, self.database()).await?)
+        };
         info!(
             connector = %self.connector_name,
             database = %self.database(),
@@ -291,6 +299,9 @@ impl SourceConnector for SqlServerSource {
             tokio::select! {
                 _ = context.cancellation.cancelled() => {
                     client.close().await.map_err(sqlserver_error)?;
+                    if let Some(connection) = heartbeat_connection {
+                        connection.close().await.map_err(sqlserver_error)?;
+                    }
                     return Ok(());
                 }
                 changed = context.acknowledged.changed() => {
@@ -317,8 +328,115 @@ impl SourceConnector for SqlServerSource {
                         context.output.send(Ok(record)).await.map_err(|_| Error::Cancelled)?;
                     }
                 }
+                () = next_heartbeat(&mut heartbeat) => {
+                    if let Some(query) = self.config.heartbeat_action_query.clone() {
+                        let connection = heartbeat_connection.take().ok_or_else(|| {
+                            Error::Source("SQL Server heartbeat action connection is unavailable".into())
+                        })?;
+                        heartbeat_connection = Some(execute_heartbeat_action(connection, query).await?);
+                    }
+                    let position = sqlserver_position(
+                        self.database(),
+                        &state.cursor.commit_lsn,
+                        &state.cursor.change_lsn,
+                        COMMIT_SERIAL,
+                        false,
+                    );
+                    context.output.send(Ok(sqlserver_heartbeat_record(
+                        &self.connector_name,
+                        self.database(),
+                        position,
+                    ))).await.map_err(|_| Error::Cancelled)?;
+                }
             }
         }
+    }
+}
+
+fn heartbeat_timer(interval: std::time::Duration) -> Option<tokio::time::Interval> {
+    if interval.is_zero() {
+        return None;
+    }
+    let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    Some(timer)
+}
+
+async fn next_heartbeat(timer: &mut Option<tokio::time::Interval>) {
+    match timer {
+        Some(timer) => {
+            timer.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn execute_heartbeat_action(mut connection: SqlClient, query: String) -> Result<SqlClient> {
+    connection
+        .simple_query(&query)
+        .await
+        .map_err(sqlserver_error)?
+        .into_results()
+        .await
+        .map_err(sqlserver_error)?;
+    Ok(connection)
+}
+
+fn sqlserver_heartbeat_record(
+    connector_name: &str,
+    database: &str,
+    position: SourcePosition,
+) -> SourceRecord {
+    let observed_time = Utc::now();
+    let mut attributes = BTreeMap::new();
+    attributes.insert("rustium.heartbeat".into(), true.into());
+    let mut after = Row::new();
+    after.insert(
+        "ts_ms".into(),
+        DataValue::Int64(observed_time.timestamp_millis()),
+    );
+    let event = ChangeEvent {
+        id: EventId::deterministic(
+            connector_name,
+            database,
+            &position,
+            "__heartbeat",
+            u64::try_from(observed_time.timestamp_micros()).unwrap_or_default(),
+        ),
+        source: SourceMetadata {
+            connector: "sqlserver".into(),
+            connector_name: connector_name.into(),
+            database: database.into(),
+            schema: None,
+            table: None,
+            snapshot: false,
+            version: CONNECTOR_VERSION.into(),
+            attributes,
+        },
+        position: position.clone(),
+        transaction: None,
+        operation: Operation::Message,
+        before: None,
+        after: Some(after),
+        schema: EventSchema {
+            name: format!("{connector_name}.Heartbeat"),
+            version: 1,
+            fields: vec![FieldSchema {
+                name: "ts_ms".into(),
+                type_name: "int64".into(),
+                optional: false,
+                primary_key: false,
+            }],
+        },
+        source_time: None,
+        observed_time,
+    };
+    SourceRecord {
+        event: Some(event),
+        position,
+        boundary: RecordBoundary::Heartbeat,
+        connector_state: None,
+        signal_acknowledgements: Vec::new(),
     }
 }
 
@@ -1190,5 +1308,31 @@ mod tests {
         assert!(query.contains("TOP (513)"));
         assert!(query.contains("cdc.[dbo_orders_CT]"));
         assert!(query.contains("ORDER BY commit_lsn, change_lsn, operation"));
+    }
+
+    #[test]
+    fn builds_sqlserver_heartbeat_record_at_commit_position() {
+        let position = sqlserver_position(
+            "inventory",
+            &[1; LSN_SIZE],
+            &max_lsn_bytes(),
+            COMMIT_SERIAL,
+            false,
+        );
+        let record =
+            sqlserver_heartbeat_record("inventory-sqlserver", "inventory", position.clone());
+        let event = record.event.unwrap();
+        assert_eq!(record.boundary, RecordBoundary::Heartbeat);
+        assert_eq!(record.position, position);
+        assert_eq!(event.operation, Operation::Message);
+        assert_eq!(event.source.table, None);
+        assert_eq!(
+            event.source.attributes.get("rustium.heartbeat"),
+            Some(&true.into())
+        );
+        assert!(matches!(
+            event.after.unwrap().get("ts_ms"),
+            Some(DataValue::Int64(_))
+        ));
     }
 }

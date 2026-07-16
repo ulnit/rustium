@@ -128,6 +128,10 @@ async fn snapshots_and_streams_cdc_changes() {
         poll_interval: Duration::from_millis(250),
         streaming_fetch_size: 128,
         snapshot_isolation_mode: "snapshot".into(),
+        heartbeat_interval: Duration::ZERO,
+        heartbeat_action_query: None,
+        heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+        heartbeat_topic_name: None,
     };
     let mut source = SqlServerSource::new(
         "inventory-sqlserver",

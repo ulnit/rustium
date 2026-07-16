@@ -269,14 +269,24 @@ impl SourceConfig {
                     );
                 semantic
             }
-            Self::Sqlserver(config) => serde_json::json!({
+            Self::Sqlserver(config) => {
+                let mut semantic = serde_json::json!({
                 "type": "sqlserver",
                 "hostname": config.hostname,
                 "port": config.port,
                 "databases": config.databases,
                 "tables": config.tables,
                 "encrypt": config.encrypt,
-            }),
+                });
+                add_heartbeat_semantics(
+                    &mut semantic,
+                    config.heartbeat_interval,
+                    config.heartbeat_action_query.as_deref(),
+                    &config.heartbeat_topics_prefix,
+                    config.heartbeat_topic_name.as_deref(),
+                );
+                semantic
+            }
         }
     }
 }
@@ -777,6 +787,15 @@ pub struct SqlServerSourceConfig {
     pub streaming_fetch_size: usize,
     #[serde(default = "default_sqlserver_snapshot_isolation")]
     pub snapshot_isolation_mode: String,
+    #[serde(default)]
+    #[serde(with = "humantime_serde")]
+    pub heartbeat_interval: Duration,
+    #[serde(default)]
+    pub heartbeat_action_query: Option<String>,
+    #[serde(default = "default_heartbeat_topics_prefix")]
+    pub heartbeat_topics_prefix: String,
+    #[serde(default)]
+    pub heartbeat_topic_name: Option<String>,
 }
 
 impl SqlServerSourceConfig {
@@ -791,6 +810,11 @@ impl SqlServerSourceConfig {
                 "source.streaming_fetch_size must be greater than zero".into(),
             ));
         }
+        validate_heartbeat(
+            &self.heartbeat_topics_prefix,
+            self.heartbeat_topic_name.as_deref(),
+            self.heartbeat_action_query.as_deref(),
+        )?;
         if !matches!(
             self.snapshot_isolation_mode.as_str(),
             "exclusive" | "snapshot" | "repeatable_read" | "read_committed" | "read_uncommitted"

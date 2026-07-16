@@ -59,6 +59,10 @@ impl TestSettings {
             poll_interval: Duration::from_millis(250),
             streaming_fetch_size: 128,
             snapshot_isolation_mode: "repeatable_read".into(),
+            heartbeat_interval: Duration::ZERO,
+            heartbeat_action_query: None,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
         }
     }
 }
