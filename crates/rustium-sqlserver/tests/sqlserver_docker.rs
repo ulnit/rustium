@@ -147,6 +147,7 @@ async fn snapshots_and_streams_cdc_changes() {
                 geometry_value geometry NOT NULL, \
                 geography_value geography NOT NULL\
              ); \
+             EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'orders', @role_name=NULL, @supports_net_changes=0; \
              INSERT INTO dbo.orders VALUES \
                 (1, N'Alice', 12.30, CONVERT(xml, N'<root><value>Rustium</value></root>'), \
                  hierarchyid::Parse('/1/2/'), geometry::STGeomFromText('POINT (1 2)', 4326), \
@@ -154,7 +155,6 @@ async fn snapshots_and_streams_cdc_changes() {
                 (2, N'Bob', 45.60, CONVERT(xml, N'<root><value>Rustium</value></root>'), \
                  hierarchyid::Parse('/1/2/'), geometry::STGeomFromText('POINT (1 2)', 4326), \
                  geography::STGeomFromText('POINT (1 2)', 4326)); \
-             EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'orders', @role_name=NULL, @supports_net_changes=0; \
              CREATE USER rustium FOR LOGIN rustium; \
              GRANT SELECT TO rustium; \
              GRANT VIEW DATABASE STATE TO rustium;",
@@ -168,7 +168,10 @@ async fn snapshots_and_streams_cdc_changes() {
     let mut capture_ready = false;
     for _ in 0..180 {
         let ready = match admin
-            .simple_query("SELECT sys.fn_cdc_get_min_lsn(N'dbo_orders') AS min_lsn")
+            .simple_query(
+                "SELECT sys.fn_cdc_get_min_lsn(N'dbo_orders') AS min_lsn, \
+                        sys.fn_cdc_get_max_lsn() AS max_lsn",
+            )
             .await
         {
             Ok(stream) => stream
@@ -176,8 +179,16 @@ async fn snapshots_and_streams_cdc_changes() {
                 .await
                 .ok()
                 .flatten()
-                .and_then(|row| row.get::<&[u8], _>("min_lsn").map(<[u8]>::to_vec))
-                .is_some_and(|lsn| lsn.len() == 10 && lsn.iter().any(|byte| *byte != 0)),
+                .and_then(|row| {
+                    let min_lsn = row.get::<&[u8], _>("min_lsn")?;
+                    let max_lsn = row.get::<&[u8], _>("max_lsn")?;
+                    Some(
+                        [min_lsn, max_lsn]
+                            .into_iter()
+                            .all(|lsn| lsn.len() == 10 && lsn.iter().any(|byte| *byte != 0)),
+                    )
+                })
+                .unwrap_or(false),
             Err(_) => false,
         };
         if ready {
