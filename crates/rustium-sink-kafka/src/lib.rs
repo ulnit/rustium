@@ -119,7 +119,9 @@ impl Sink for KafkaSink {
                 .client()
                 .fetch_metadata(None, Timeout::After(timeout))
                 .map(|_| ())
-                .map_err(|error| Error::Sink(format!("Kafka metadata request failed: {error}")))
+                .map_err(|error| {
+                    Error::RetryableSink(format!("Kafka metadata request failed: {error}"))
+                })
         })
         .await
         .map_err(|error| Error::Sink(format!("Kafka validation task failed: {error}")))?
@@ -144,7 +146,9 @@ impl Sink for KafkaSink {
             self.producer
                 .send(record, Timeout::After(self.delivery_timeout))
                 .await
-                .map_err(|(error, _)| Error::Sink(format!("Kafka delivery failed: {error}")))?;
+                .map_err(|(error, _)| {
+                    Error::RetryableSink(format!("Kafka delivery failed: {error}"))
+                })?;
         }
         Ok(())
     }
@@ -152,7 +156,7 @@ impl Sink for KafkaSink {
     async fn flush(&mut self) -> Result<()> {
         self.producer
             .flush(Timeout::After(self.delivery_timeout))
-            .map_err(|error| Error::Sink(format!("Kafka flush failed: {error}")))
+            .map_err(|error| Error::RetryableSink(format!("Kafka flush failed: {error}")))
     }
 }
 

@@ -8,7 +8,7 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, CheckpointStore, ConnectorIdentity,
@@ -23,6 +23,9 @@ pub struct RuntimeConfig {
     pub max_batch_size: usize,
     pub flush_interval: Duration,
     pub shutdown_timeout: Duration,
+    pub errors_max_retries: i32,
+    pub errors_retry_delay_initial: Duration,
+    pub errors_retry_delay_max: Duration,
     pub config_fingerprint: String,
 }
 
@@ -33,6 +36,9 @@ impl Default for RuntimeConfig {
             max_batch_size: 512,
             flush_interval: Duration::from_millis(100),
             shutdown_timeout: Duration::from_secs(30),
+            errors_max_retries: 10,
+            errors_retry_delay_initial: Duration::from_millis(300),
+            errors_retry_delay_max: Duration::from_secs(10),
             config_fingerprint: String::new(),
         }
     }
@@ -64,6 +70,7 @@ pub struct StatusSnapshot {
     pub source_lag_millis: Option<u64>,
     pub delivered_events: u64,
     pub failed_events: u64,
+    pub sink_retry_attempts: u64,
     pub queue_depth: usize,
 }
 
@@ -85,6 +92,7 @@ impl RuntimeStatus {
             source_lag_millis: None,
             delivered_events: 0,
             failed_events: 0,
+            sink_retry_attempts: 0,
             queue_depth: 0,
         })))
     }
@@ -110,6 +118,10 @@ impl RuntimeStatus {
 
     async fn increment_failed_events(&self, failed: usize) {
         self.0.write().await.failed_events += failed as u64;
+    }
+
+    async fn increment_sink_retry_attempts(&self) {
+        self.0.write().await.sink_retry_attempts += 1;
     }
 
     async fn checkpointed(
@@ -165,6 +177,20 @@ struct PendingBatch {
 struct EventTiming {
     source_time: Option<DateTime<Utc>>,
     observed_time: DateTime<Utc>,
+}
+
+struct RetryState {
+    attempts: u64,
+    delay: Duration,
+}
+
+impl RetryState {
+    fn new(initial_delay: Duration) -> Self {
+        Self {
+            attempts: 0,
+            delay: initial_delay,
+        }
+    }
 }
 
 impl PendingBatch {
@@ -228,7 +254,7 @@ impl ConnectorRuntime {
             .take()
             .ok_or_else(|| Error::Invariant("source connector already started".into()))?;
         source.validate().await?;
-        self.sink.validate().await?;
+        self.validate_sink_with_retry(&cancellation).await?;
 
         let initial_checkpoint = self.checkpoint_store.load(&self.identity.name).await?;
         if let Some(checkpoint) = &initial_checkpoint
@@ -291,6 +317,7 @@ impl ConnectorRuntime {
                             snapshot_completed,
                             &connector_state,
                             &ack_tx,
+                            &cancellation,
                         ).await?;
                     }
                     record = source_rx.recv() => {
@@ -303,14 +330,21 @@ impl ConnectorRuntime {
                             &mut snapshot_completed,
                             &mut connector_state,
                             &ack_tx,
+                            &cancellation,
                         ).await?;
                     }
                 }
             }
 
-            self.flush_batch(&mut pending, snapshot_completed, &connector_state, &ack_tx)
-                .await?;
-            self.sink.flush().await
+            self.flush_batch(
+                &mut pending,
+                snapshot_completed,
+                &connector_state,
+                &ack_tx,
+                &cancellation,
+            )
+            .await?;
+            self.flush_sink_with_retry(&cancellation).await
         }
         .await;
 
@@ -347,6 +381,7 @@ impl ConnectorRuntime {
         snapshot_completed: &mut bool,
         connector_state: &mut Option<ConnectorStateEnvelope>,
         ack_tx: &watch::Sender<Option<SourcePosition>>,
+        cancellation: &CancellationToken,
     ) -> Result<()> {
         if let Some(previous) = pending.highest_position.as_ref()
             && !record.position.is_after(previous)
@@ -399,20 +434,44 @@ impl ConnectorRuntime {
                 self.status
                     .transition(ConnectorState::Streaming, None)
                     .await;
-                self.flush_batch(pending, *snapshot_completed, connector_state, ack_tx)
-                    .await?;
+                self.flush_batch(
+                    pending,
+                    *snapshot_completed,
+                    connector_state,
+                    ack_tx,
+                    cancellation,
+                )
+                .await?;
             }
             RecordBoundary::TransactionCommit => {
-                self.flush_batch(pending, *snapshot_completed, connector_state, ack_tx)
-                    .await?;
+                self.flush_batch(
+                    pending,
+                    *snapshot_completed,
+                    connector_state,
+                    ack_tx,
+                    cancellation,
+                )
+                .await?;
             }
             RecordBoundary::Data if pending.encoded.len() >= self.config.max_batch_size => {
-                self.flush_batch(pending, *snapshot_completed, connector_state, ack_tx)
-                    .await?;
+                self.flush_batch(
+                    pending,
+                    *snapshot_completed,
+                    connector_state,
+                    ack_tx,
+                    cancellation,
+                )
+                .await?;
             }
             RecordBoundary::Heartbeat if pending.encoded.is_empty() => {
-                self.flush_batch(pending, *snapshot_completed, connector_state, ack_tx)
-                    .await?;
+                self.flush_batch(
+                    pending,
+                    *snapshot_completed,
+                    connector_state,
+                    ack_tx,
+                    cancellation,
+                )
+                .await?;
             }
             _ => {}
         }
@@ -425,6 +484,7 @@ impl ConnectorRuntime {
         snapshot_completed: bool,
         connector_state: &Option<ConnectorStateEnvelope>,
         ack_tx: &watch::Sender<Option<SourcePosition>>,
+        cancellation: &CancellationToken,
     ) -> Result<()> {
         let Some(position) = pending.highest_position.take() else {
             return Ok(());
@@ -436,7 +496,7 @@ impl ConnectorRuntime {
                 events: std::mem::take(&mut pending.encoded),
                 highest_position: position.clone(),
             };
-            if let Err(error) = self.sink.write(&batch).await {
+            if let Err(error) = self.write_sink_with_retry(&batch, cancellation).await {
                 error!(connector = %self.identity.name, %error, "sink delivery failed");
                 self.status.increment_failed_events(delivered).await;
                 return Err(error);
@@ -465,6 +525,99 @@ impl ConnectorRuntime {
             .await;
         Ok(())
     }
+
+    async fn validate_sink_with_retry(&mut self, cancellation: &CancellationToken) -> Result<()> {
+        let mut retry = RetryState::new(self.config.errors_retry_delay_initial);
+        loop {
+            match self.sink.validate().await {
+                Ok(()) => return Ok(()),
+                Err(error @ Error::RetryableSink(_)) => {
+                    if !self
+                        .wait_for_sink_retry("validation", &error, &mut retry, cancellation)
+                        .await?
+                    {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn write_sink_with_retry(
+        &mut self,
+        batch: &DeliveryBatch,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        let mut retry = RetryState::new(self.config.errors_retry_delay_initial);
+        loop {
+            match self.sink.write(batch).await {
+                Ok(()) => return Ok(()),
+                Err(error @ Error::RetryableSink(_)) => {
+                    if !self
+                        .wait_for_sink_retry("delivery", &error, &mut retry, cancellation)
+                        .await?
+                    {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn flush_sink_with_retry(&mut self, cancellation: &CancellationToken) -> Result<()> {
+        let mut retry = RetryState::new(self.config.errors_retry_delay_initial);
+        loop {
+            match self.sink.flush().await {
+                Ok(()) => return Ok(()),
+                Err(error @ Error::RetryableSink(_)) => {
+                    if !self
+                        .wait_for_sink_retry("flush", &error, &mut retry, cancellation)
+                        .await?
+                    {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn wait_for_sink_retry(
+        &mut self,
+        operation: &'static str,
+        error: &Error,
+        retry: &mut RetryState,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        if self.config.errors_max_retries >= 0
+            && retry.attempts >= self.config.errors_max_retries as u64
+        {
+            return Ok(false);
+        }
+        retry.attempts += 1;
+        self.status.increment_sink_retry_attempts().await;
+        warn!(
+            connector = %self.identity.name,
+            sink = self.sink.name(),
+            operation,
+            retry = retry.attempts,
+            max_retries = self.config.errors_max_retries,
+            delay_ms = retry.delay.as_millis(),
+            %error,
+            "retryable Sink operation failed; scheduling retry"
+        );
+        tokio::select! {
+            () = cancellation.cancelled() => return Err(Error::Cancelled),
+            () = tokio::time::sleep(retry.delay) => {}
+        }
+        retry.delay = retry
+            .delay
+            .saturating_mul(2)
+            .min(self.config.errors_retry_delay_max);
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -473,13 +626,14 @@ mod tests {
         collections::BTreeMap,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
 
     use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::Utc;
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::{
@@ -506,6 +660,11 @@ mod tests {
 
     struct StuckSource {
         dropped: Arc<AtomicBool>,
+    }
+
+    struct BurstSource {
+        sent: Arc<AtomicUsize>,
+        total: usize,
     }
 
     struct DropFlag(Arc<AtomicBool>);
@@ -628,6 +787,39 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl SourceConnector for BurstSource {
+        fn source_type(&self) -> &'static str {
+            "burst-test"
+        }
+
+        async fn validate(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn run(&mut self, mut context: SourceContext) -> Result<()> {
+            let mut last_position = None;
+            for serial in 1..=self.total {
+                let event = test_event(serial as u64);
+                last_position = Some(event.position.clone());
+                context
+                    .output
+                    .send(Ok(SourceRecord::data(event)))
+                    .await
+                    .map_err(|_| Error::Cancelled)?;
+                self.sent.fetch_add(1, Ordering::SeqCst);
+            }
+            while context.acknowledged.borrow().as_ref() != last_position.as_ref() {
+                context
+                    .acknowledged
+                    .changed()
+                    .await
+                    .map_err(|_| Error::Cancelled)?;
+            }
+            Ok(())
+        }
+    }
+
     struct UnusedEncoder;
 
     impl EventEncoder for UnusedEncoder {
@@ -703,6 +895,17 @@ mod tests {
         shutdown: Arc<AtomicBool>,
     }
 
+    struct RetryingSink {
+        failures: usize,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    struct BlockingSink {
+        blocked: bool,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
     #[async_trait]
     impl Sink for RecordingSink {
         fn name(&self) -> &'static str {
@@ -757,6 +960,65 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Sink for RetryingSink {
+        fn name(&self) -> &'static str {
+            "retrying"
+        }
+
+        fn durability(&self) -> Durability {
+            Durability::Durable
+        }
+
+        async fn validate(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn write(&mut self, _batch: &DeliveryBatch) -> Result<()> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt < self.failures {
+                Err(Error::RetryableSink(format!(
+                    "intentional retryable failure {}",
+                    attempt + 1
+                )))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Sink for BlockingSink {
+        fn name(&self) -> &'static str {
+            "blocking"
+        }
+
+        fn durability(&self) -> Durability {
+            Durability::Durable
+        }
+
+        async fn validate(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn write(&mut self, _batch: &DeliveryBatch) -> Result<()> {
+            if !self.blocked {
+                self.blocked = true;
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[derive(Default)]
     struct MemoryCheckpointStore {
         checkpoint: Mutex<Option<Checkpoint>>,
@@ -776,6 +1038,66 @@ mod tests {
         async fn delete(&self, _connector_name: &str) -> Result<()> {
             *self.checkpoint.lock().unwrap() = None;
             Ok(())
+        }
+    }
+
+    fn test_event(event_serial: u64) -> ChangeEvent {
+        let position = SourcePosition::MySql(MySqlPosition {
+            binlog_filename: "mysql-bin.000001".into(),
+            binlog_position: 1_000 + event_serial,
+            gtid_set: None,
+            server_id: 1,
+            event_serial,
+            snapshot: false,
+        });
+        ChangeEvent {
+            id: EventId::deterministic(
+                "runtime-test",
+                "mysql",
+                &position,
+                "app.orders",
+                event_serial,
+            ),
+            source: SourceMetadata {
+                connector: "mysql".into(),
+                connector_name: "runtime-test".into(),
+                database: "app".into(),
+                schema: None,
+                table: Some("orders".into()),
+                snapshot: false,
+                version: "test".into(),
+                attributes: BTreeMap::new(),
+            },
+            position,
+            transaction: None,
+            operation: Operation::Create,
+            before: None,
+            after: None,
+            schema: EventSchema {
+                name: "orders".into(),
+                version: 1,
+                fields: Vec::new(),
+            },
+            source_time: Some(Utc::now()),
+            observed_time: Utc::now(),
+        }
+    }
+
+    struct SingleEncoder;
+
+    impl EventEncoder for SingleEncoder {
+        fn content_type(&self) -> &'static str {
+            "application/test"
+        }
+
+        fn encode(&self, event: &ChangeEvent) -> Result<EncodedEvent> {
+            Ok(EncodedEvent {
+                id: event.id.clone(),
+                destination: "orders".into(),
+                key: Some(Bytes::from_static(b"1")),
+                payload: Some(Bytes::from_static(b"value")),
+                headers: BTreeMap::new(),
+            })
         }
     }
 
@@ -975,6 +1297,167 @@ mod tests {
         assert_eq!(status.last_source_event_at, Some(source_time));
         assert_eq!(status.last_event_observed_at, Some(observed_time));
         assert!(status.source_lag_millis.is_some_and(|lag| lag >= 2_000));
+    }
+
+    #[tokio::test]
+    async fn retries_the_same_sink_batch_before_checkpointing() {
+        let event = test_event(10);
+        let position = event.position.clone();
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let status = RuntimeStatus::new("runtime-retry-test");
+        let runtime = ConnectorRuntime::new(
+            ConnectorIdentity::new("runtime-retry-test"),
+            Box::new(StateSource {
+                record: SourceRecord {
+                    event: Some(event),
+                    position: position.clone(),
+                    boundary: RecordBoundary::TransactionCommit,
+                    connector_state: None,
+                    signal_acknowledgements: Vec::new(),
+                },
+            }),
+            Arc::new(SingleEncoder),
+            Box::new(RetryingSink {
+                failures: 2,
+                attempts: attempts.clone(),
+            }),
+            store.clone(),
+            RuntimeConfig {
+                errors_max_retries: 2,
+                errors_retry_delay_initial: Duration::from_millis(1),
+                errors_retry_delay_max: Duration::from_millis(2),
+                ..RuntimeConfig::default()
+            },
+            status.clone(),
+        );
+
+        runtime.run(CancellationToken::new()).await.unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            store
+                .checkpoint
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .source_position,
+            position
+        );
+        let status = status.snapshot().await;
+        assert_eq!(status.sink_retry_attempts, 2);
+        assert_eq!(status.delivered_events, 1);
+        assert_eq!(status.failed_events, 0);
+    }
+
+    #[tokio::test]
+    async fn exhausts_sink_retries_without_advancing_the_checkpoint() {
+        let event = test_event(11);
+        let position = event.position.clone();
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let status = RuntimeStatus::new("runtime-retry-exhaustion-test");
+        let runtime = ConnectorRuntime::new(
+            ConnectorIdentity::new("runtime-retry-exhaustion-test"),
+            Box::new(CancellableStateSource {
+                record: SourceRecord {
+                    event: Some(event),
+                    position,
+                    boundary: RecordBoundary::TransactionCommit,
+                    connector_state: None,
+                    signal_acknowledgements: Vec::new(),
+                },
+                cancelled: cancelled.clone(),
+            }),
+            Arc::new(SingleEncoder),
+            Box::new(RetryingSink {
+                failures: usize::MAX,
+                attempts: attempts.clone(),
+            }),
+            store.clone(),
+            RuntimeConfig {
+                errors_max_retries: 2,
+                errors_retry_delay_initial: Duration::from_millis(1),
+                errors_retry_delay_max: Duration::from_millis(2),
+                ..RuntimeConfig::default()
+            },
+            status.clone(),
+        );
+
+        let error = runtime.run(CancellationToken::new()).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("intentional retryable failure 3")
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(store.checkpoint.lock().unwrap().is_none());
+        assert!(cancelled.load(Ordering::SeqCst));
+        let status = status.snapshot().await;
+        assert_eq!(status.sink_retry_attempts, 2);
+        assert_eq!(status.delivered_events, 0);
+        assert_eq!(status.failed_events, 1);
+        assert_eq!(status.state, ConnectorState::Failed);
+    }
+
+    #[tokio::test]
+    async fn applies_bounded_backpressure_while_the_sink_is_blocked() {
+        let total = 16;
+        let sent = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let runtime = ConnectorRuntime::new(
+            ConnectorIdentity::new("runtime-backpressure-test"),
+            Box::new(BurstSource {
+                sent: sent.clone(),
+                total,
+            }),
+            Arc::new(SingleEncoder),
+            Box::new(BlockingSink {
+                blocked: false,
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            store.clone(),
+            RuntimeConfig {
+                channel_capacity: 2,
+                max_batch_size: 1,
+                flush_interval: Duration::from_secs(60),
+                ..RuntimeConfig::default()
+            },
+            RuntimeStatus::new("runtime-backpressure-test"),
+        );
+        let task = tokio::spawn(runtime.run(CancellationToken::new()));
+
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(sent.load(Ordering::SeqCst) <= 3);
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(sent.load(Ordering::SeqCst), total);
+        let checkpoint_position = store
+            .checkpoint
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .source_position
+            .clone();
+        let SourcePosition::MySql(position) = checkpoint_position else {
+            panic!("backpressure checkpoint used the wrong source position");
+        };
+        assert_eq!(position.event_serial, total as u64);
     }
 
     #[tokio::test]

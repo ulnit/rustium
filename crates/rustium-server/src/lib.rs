@@ -29,6 +29,7 @@ struct Metrics {
     registry: Registry,
     delivered_events: IntGauge,
     failed_events: IntGauge,
+    sink_retry_attempts: IntGauge,
     queue_depth: IntGauge,
     connector_state: IntGauge,
     source_lag_seconds: Gauge,
@@ -52,6 +53,11 @@ impl Metrics {
             "Current source-to-runtime queue depth",
         )
         .map_err(metrics_error)?;
+        let sink_retry_attempts = IntGauge::new(
+            "rustium_sink_retry_attempts",
+            "Number of retry attempts for retryable Sink operations",
+        )
+        .map_err(metrics_error)?;
         let connector_state = IntGauge::new(
             "rustium_connector_state",
             "Connector state as a numeric lifecycle value",
@@ -65,6 +71,7 @@ impl Metrics {
         for collector in [
             Box::new(delivered_events.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(failed_events.clone()),
+            Box::new(sink_retry_attempts.clone()),
             Box::new(queue_depth.clone()),
             Box::new(connector_state.clone()),
             Box::new(source_lag_seconds.clone()),
@@ -75,6 +82,7 @@ impl Metrics {
             registry,
             delivered_events,
             failed_events,
+            sink_retry_attempts,
             queue_depth,
             connector_state,
             source_lag_seconds,
@@ -191,6 +199,10 @@ async fn metrics(State(state): State<AppState>) -> Response {
         .set(i64::try_from(status.failed_events).unwrap_or(i64::MAX));
     state
         .metrics
+        .sink_retry_attempts
+        .set(i64::try_from(status.sink_retry_attempts).unwrap_or(i64::MAX));
+    state
+        .metrics
         .queue_depth
         .set(i64::try_from(status.queue_depth).unwrap_or(i64::MAX));
     state
@@ -281,5 +293,6 @@ mod tests {
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("rustium_source_lag_seconds NaN"));
+        assert!(body.contains("rustium_sink_retry_attempts 0"));
     }
 }

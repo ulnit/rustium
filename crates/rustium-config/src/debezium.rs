@@ -620,6 +620,21 @@ fn assemble_config(
             max_batch_size: usize_value(properties, "max.batch.size", default_batch_size())?,
             flush_interval: duration_ms(properties, "poll.interval.ms", default_flush_interval())?,
             shutdown_timeout: default_shutdown_timeout(),
+            errors_max_retries: i32_value(
+                properties,
+                "errors.max.retries",
+                default_errors_max_retries(),
+            )?,
+            errors_retry_delay_initial: duration_ms(
+                properties,
+                "errors.retry.delay.initial.ms",
+                default_errors_retry_delay_initial(),
+            )?,
+            errors_retry_delay_max: duration_ms(
+                properties,
+                "errors.retry.delay.max.ms",
+                default_errors_retry_delay_max(),
+            )?,
         },
         server: ServerConfig {
             bind: properties
@@ -805,6 +820,14 @@ fn u32_value(properties: &BTreeMap<String, String>, name: &str, default: u32) ->
     })
 }
 
+fn i32_value(properties: &BTreeMap<String, String>, name: &str, default: i32) -> Result<i32> {
+    properties.get(name).map_or(Ok(default), |value| {
+        value
+            .parse::<i32>()
+            .map_err(|error| Error::Configuration(format!("invalid {name}: {error}")))
+    })
+}
+
 fn bool_value(properties: &BTreeMap<String, String>, name: &str, default: bool) -> Result<bool> {
     properties.get(name).map_or(Ok(default), |value| {
         value.parse().map_err(|error| {
@@ -958,6 +981,9 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "rustium.log.format",
         "rustium.log.level",
         "rustium.metrics.enabled",
+        "errors.max.retries",
+        "errors.retry.delay.initial.ms",
+        "errors.retry.delay.max.ms",
     ];
     properties
         .keys()
@@ -1127,6 +1153,40 @@ read.only=true
         assert_eq!(source.signal_enabled_channels, ["file"]);
         assert!(source.signal_data_collection.is_none());
         assert!(source.read_only);
+    }
+
+    #[test]
+    fn maps_debezium_engine_retry_settings() {
+        let config = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+errors.max.retries=4
+errors.retry.delay.initial.ms=125
+errors.retry.delay.max.ms=2000
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.runtime.errors_max_retries, 4);
+        assert_eq!(
+            config.runtime.errors_retry_delay_initial,
+            Duration::from_millis(125)
+        );
+        assert_eq!(
+            config.runtime.errors_retry_delay_max,
+            Duration::from_secs(2)
+        );
+        assert!(
+            config
+                .compatibility_warnings
+                .iter()
+                .all(|warning| !warning.contains("errors."))
+        );
     }
 
     #[test]

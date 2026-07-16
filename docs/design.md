@@ -381,6 +381,8 @@ With `tombstones.on.delete=true`, which is the Debezium-compatible default, enco
 
 stdout is best-effort and intended for development; it prints tombstones as a `null` line. Kafka uses `librdkafka`, sends tombstones as a true null value, and requires `acks=all` or `-1` so `write` returns only after replica acknowledgement. Producer idempotence is always enabled. Rustium owns bootstrap, acknowledgement, compression, idempotence, and delivery-timeout properties; pass-through properties cannot replace these durability settings. Producer idempotence does not make source-to-Kafka delivery exactly-once.
 
+The shared runtime retries only failures explicitly classified as retryable by a Sink. It maps Debezium's `errors.max.retries`, `errors.retry.delay.initial.ms`, and `errors.retry.delay.max.ms`, with native equivalents under `runtime`; Rustium's finite defaults are 10 retries, 300 ms initial delay, and a 10 s ceiling. Backoff doubles after each attempt and cancellation interrupts the wait. Delivery holds and replays the same batch without checkpointing until success. This provides at-least-once progress without source-position gaps, while a partially delivered attempt can still produce duplicates. Each Source retains responsibility for reconnect and cursor reconstruction because that recovery depends on connector-specific durable state.
+
 ### 13. Control Plane and Observability
 
 Lifecycle states are created, starting, snapshotting, streaming, paused, failed, stopping, and stopped. The currently implemented API is:
@@ -394,14 +396,15 @@ Lifecycle states are created, starting, snapshotting, streaming, paused, failed,
 | `POST /v1/connector/signals` | bounded in-process signal submission when mutations and the channel are enabled |
 | `GET /metrics` | Prometheus metrics |
 
-Metrics expose connector state, delivered events, failed events, pipeline queue depth, and `rustium_source_lag_seconds`. Lag is recomputed from wall-clock time and the last durably checkpointed source timestamp; it is `NaN` when a source timestamp is unavailable. Encoding failures count one source event, while a failed Sink write counts every encoded event in that batch. Retained-log metrics remain release work.
+Metrics expose connector state, delivered events, failed events, pipeline queue depth, `rustium_sink_retry_attempts`, and `rustium_source_lag_seconds`. Lag is recomputed from wall-clock time and the last durably checkpointed source timestamp; it is `NaN` when a source timestamp is unavailable. Encoding failures count one source event, while an exhausted or non-retryable Sink write counts every encoded event in that batch. Retained-log metrics remain release work.
 
 ### 14. Error, Security, and Resource Policy
 
 - Configuration and capability errors fail before capture.
 - Unknown protocol/data errors stop the connector.
-- General source/sink retry orchestration is not implemented yet. MySQL has connector-local, finite, logged binlog reconnect handling.
-- Queues are bounded and backpressure blocks source output.
+- Retryable Sink operations use a shared, finite-by-default retry budget and cancellation-aware exponential backoff.
+- Source reconnect remains connector-owned; MySQL currently has finite, logged binlog reconnect handling.
+- Queues are bounded, and a blocked or retrying Sink propagates backpressure to source output.
 - Database and Kafka TLS are configuration-controlled.
 - The management server binds to loopback by default.
 - Mutating HTTP endpoints are disabled by default.
@@ -498,7 +501,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. Roadmap
 
-1. Add general bounded Source/Sink retry orchestration and long-running backpressure/reconnect gates.
+1. Add long-running backpressure/reconnect soak gates and connector-specific recovery for the remaining Sources.
 2. Add Schema Registry formats, packaging, security policy, operational runbooks, and stable upgrade migrations before `1.0`.
 3. Consider additional databases only after the current three connectors and shared runtime pass the `1.0` gates.
 
@@ -873,6 +876,8 @@ SQL Server 支持 Debezium 兼容的 source table、file、有界 in-process 和
 
 stdout 是 best-effort，仅用于开发，并将 tombstone 输出为一行 `null`。Kafka 使用 `librdkafka`，将 tombstone 发送为真正的 null value，并要求 `acks=all` 或 `-1`，使 `write` 只在副本确认后返回。Producer 幂等始终启用。Rustium 拥有 bootstrap、确认、压缩、幂等和投递超时参数，透传属性不能替换这些持久性设置。Producer 幂等并不会把 Source 到 Kafka 变为 exactly-once。
 
+共享 runtime 只重试 Sink 明确分类为可重试的失败。它映射 Debezium 的 `errors.max.retries`、`errors.retry.delay.initial.ms` 和 `errors.retry.delay.max.ms`，原生等价项位于 `runtime` 下；Rustium 的有限默认值为重试 10 次、初始等待 300 ms、上限 10 s。每次尝试后退避时间倍增，取消信号可以中断等待。投递会保留并重放同一批次，成功前不写 checkpoint。这提供不会跳过源位点的 at-least-once 进度，但部分投递成功的尝试仍可能产生重复。各 Source 继续负责重连和 cursor 重建，因为恢复依赖连接器特有的持久状态。
+
 ### 13. 控制平面与可观测性
 
 生命周期状态包括 created、starting、snapshotting、streaming、paused、failed、stopping 和 stopped。当前 API：
@@ -886,14 +891,15 @@ stdout 是 best-effort，仅用于开发，并将 tombstone 输出为一行 `nul
 | `POST /v1/connector/signals` | 启用变更端点和 channel 时有界提交 in-process 信号 |
 | `GET /metrics` | Prometheus 指标 |
 
-当前指标包括连接器状态、已投递事件、失败事件、流水线队列深度和 `rustium_source_lag_seconds`。lag 根据当前时间与最后一个已持久 checkpoint 的源时间戳动态计算；源时间戳不可用时为 `NaN`。编码失败计一个源事件，Sink 写入失败则统计该批次全部已编码事件。日志保留指标仍属于发布工作。
+当前指标包括连接器状态、已投递事件、失败事件、流水线队列深度、`rustium_sink_retry_attempts` 和 `rustium_source_lag_seconds`。lag 根据当前时间与最后一个已持久 checkpoint 的源时间戳动态计算；源时间戳不可用时为 `NaN`。编码失败计一个源事件，重试耗尽或不可重试的 Sink 写入失败则统计该批次全部已编码事件。日志保留指标仍属于发布工作。
 
 ### 14. 错误、安全与资源策略
 
 - 配置和能力错误在捕获前失败。
 - 未知协议/数据错误停止连接器。
-- 通用 Source/Sink 重试协调尚未实现。MySQL 已具备连接器内有限且记录日志的 binlog 重连处理。
-- 队列有界，背压会阻塞 Source 输出。
+- 可重试的 Sink 操作使用共享的、默认有限的重试预算和可被取消的指数退避。
+- Source 重连仍由连接器负责；MySQL 当前已具备有限且记录日志的 binlog 重连处理。
+- 队列有界，阻塞或重试中的 Sink 会将背压传回 Source 输出。
 - 数据库和 Kafka TLS 由配置控制。
 - 管理 Server 默认绑定 loopback。
 - 变更型 HTTP 端点默认禁用。
@@ -990,6 +996,6 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. 路线图
 
-1. 增加通用、有界的 Source/Sink 重试协调，以及长时间背压/重连门槛。
+1. 增加长时间背压/重连 soak 门槛，并为其余 Source 补齐连接器特有的恢复能力。
 2. 在 `1.0` 前补 Schema Registry 格式、打包、安全策略、运维手册和稳定升级迁移。
 3. 只有当当前三个连接器和共享运行时通过 `1.0` 门槛后，才考虑更多数据库。

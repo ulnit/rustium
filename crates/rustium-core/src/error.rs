@@ -10,6 +10,8 @@ pub enum Error {
     Encoding(String),
     #[error("sink error: {0}")]
     Sink(String),
+    #[error("retryable sink error: {0}")]
+    RetryableSink(String),
     #[error("state error: {0}")]
     State(String),
     #[error("runtime invariant violated: {0}")]

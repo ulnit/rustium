@@ -97,6 +97,22 @@ impl Config {
                 "runtime.max_batch_size must be between 1 and channel_capacity".into(),
             ));
         }
+        if self.runtime.errors_max_retries < -1 {
+            return Err(Error::Configuration(
+                "runtime.errors_max_retries must be -1, 0, or a positive integer".into(),
+            ));
+        }
+        if self.runtime.errors_retry_delay_initial.is_zero() {
+            return Err(Error::Configuration(
+                "runtime.errors_retry_delay_initial must be greater than zero".into(),
+            ));
+        }
+        if self.runtime.errors_retry_delay_max < self.runtime.errors_retry_delay_initial {
+            return Err(Error::Configuration(
+                "runtime.errors_retry_delay_max must be greater than or equal to errors_retry_delay_initial"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -1283,6 +1299,14 @@ pub struct RuntimeSettings {
     #[serde(default = "default_shutdown_timeout")]
     #[serde(with = "humantime_serde")]
     pub shutdown_timeout: Duration,
+    #[serde(default = "default_errors_max_retries")]
+    pub errors_max_retries: i32,
+    #[serde(default = "default_errors_retry_delay_initial")]
+    #[serde(with = "humantime_serde")]
+    pub errors_retry_delay_initial: Duration,
+    #[serde(default = "default_errors_retry_delay_max")]
+    #[serde(with = "humantime_serde")]
+    pub errors_retry_delay_max: Duration,
 }
 
 impl Default for RuntimeSettings {
@@ -1292,6 +1316,9 @@ impl Default for RuntimeSettings {
             max_batch_size: default_batch_size(),
             flush_interval: default_flush_interval(),
             shutdown_timeout: default_shutdown_timeout(),
+            errors_max_retries: default_errors_max_retries(),
+            errors_retry_delay_initial: default_errors_retry_delay_initial(),
+            errors_retry_delay_max: default_errors_retry_delay_max(),
         }
     }
 }
@@ -1547,6 +1574,15 @@ const fn default_flush_interval() -> Duration {
 const fn default_shutdown_timeout() -> Duration {
     Duration::from_secs(30)
 }
+const fn default_errors_max_retries() -> i32 {
+    10
+}
+const fn default_errors_retry_delay_initial() -> Duration {
+    Duration::from_millis(300)
+}
+const fn default_errors_retry_delay_max() -> Duration {
+    Duration::from_secs(10)
+}
 fn default_bind() -> String {
     "127.0.0.1:8080".into()
 }
@@ -1585,6 +1621,15 @@ sink:
         let config = Config::from_yaml(CONFIG).unwrap();
         assert_eq!(config.metadata.name, "orders-cdc");
         assert_eq!(config.runtime.max_batch_size, 512);
+        assert_eq!(config.runtime.errors_max_retries, 10);
+        assert_eq!(
+            config.runtime.errors_retry_delay_initial,
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            config.runtime.errors_retry_delay_max,
+            Duration::from_secs(10)
+        );
         assert!(config.format.tombstones_on_delete);
         assert!(
             config
@@ -1613,6 +1658,35 @@ sink:
             Config::from_yaml(&CONFIG.replace("sink:\n", "snapshot:\n  fetch_size: 0\nsink:\n"))
                 .unwrap_err();
         assert!(error.to_string().contains("snapshot.fetch_size"));
+    }
+
+    #[test]
+    fn validates_native_sink_retry_settings() {
+        let configured = Config::from_yaml(&format!(
+            "{CONFIG}\nruntime:\n  errors_max_retries: -1\n  errors_retry_delay_initial: 25ms\n  errors_retry_delay_max: 1s\n"
+        ))
+        .unwrap();
+        assert_eq!(configured.runtime.errors_max_retries, -1);
+        assert_eq!(
+            configured.runtime.errors_retry_delay_initial,
+            Duration::from_millis(25)
+        );
+
+        for (settings, expected) in [
+            ("errors_max_retries: -2", "errors_max_retries"),
+            (
+                "errors_retry_delay_initial: 0ms",
+                "errors_retry_delay_initial",
+            ),
+            (
+                "errors_retry_delay_initial: 2s\n  errors_retry_delay_max: 1s",
+                "errors_retry_delay_max",
+            ),
+        ] {
+            let error = Config::from_yaml(&format!("{CONFIG}\nruntime:\n  {settings}\n"))
+                .expect_err("invalid retry settings must fail");
+            assert!(error.to_string().contains(expected));
+        }
     }
 
     #[test]
