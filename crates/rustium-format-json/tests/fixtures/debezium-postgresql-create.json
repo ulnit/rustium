@@ -1,0 +1,37 @@
+{
+  "destination": "app.app.public.customers",
+  "key": {
+    "id": 1
+  },
+  "payload": {
+    "after": {
+      "attributes": {
+        "optional": null,
+        "region": "global"
+      },
+      "id": 1,
+      "name": "Alice"
+    },
+    "before": null,
+    "op": "c",
+    "source": {
+      "connector": "postgresql",
+      "db": "app",
+      "lsn": 42,
+      "name": "orders",
+      "schema": "public",
+      "sequence": "[\"44\",\"42\"]",
+      "snapshot": "false",
+      "table": "customers",
+      "ts_ms": 1700000000123,
+      "txId": 7,
+      "version": "0.1.0"
+    },
+    "transaction": {
+      "data_collection_order": 1,
+      "id": "7",
+      "total_order": 1
+    },
+    "ts_ms": 1700000001456
+  }
+}

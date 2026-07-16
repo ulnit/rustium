@@ -1,0 +1,37 @@
+{
+  "destination": "app.app.dbo.customers",
+  "key": {
+    "id": 1
+  },
+  "payload": {
+    "after": {
+      "attributes": {
+        "optional": null,
+        "region": "global"
+      },
+      "id": 1,
+      "name": "Alice"
+    },
+    "before": null,
+    "op": "c",
+    "source": {
+      "change_lsn": "0x0000002A000001000002",
+      "commit_lsn": "0x0000002A000001000001",
+      "connector": "sqlserver",
+      "db": "app",
+      "event_serial_no": 3,
+      "name": "orders",
+      "schema": "dbo",
+      "snapshot": "false",
+      "table": "customers",
+      "ts_ms": 1700000000123,
+      "version": "0.1.0"
+    },
+    "transaction": {
+      "data_collection_order": 1,
+      "id": "7",
+      "total_order": 1
+    },
+    "ts_ms": 1700000001456
+  }
+}

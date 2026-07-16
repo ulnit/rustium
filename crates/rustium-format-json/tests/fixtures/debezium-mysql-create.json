@@ -1,0 +1,41 @@
+{
+  "destination": "app.app.customers",
+  "key": {
+    "id": 1
+  },
+  "payload": {
+    "after": {
+      "attributes": {
+        "optional": null,
+        "region": "global"
+      },
+      "id": 1,
+      "name": "Alice"
+    },
+    "before": null,
+    "op": "c",
+    "source": {
+      "connector": "mysql",
+      "db": "app",
+      "file": "mysql-bin.000123",
+      "gtid": "24bc7850-2c16-11ef-8f32-0242ac120002:1-9",
+      "name": "orders",
+      "pos": 4567,
+      "query": null,
+      "row": 2,
+      "schema": null,
+      "server_id": 184,
+      "snapshot": "false",
+      "table": "customers",
+      "thread": null,
+      "ts_ms": 1700000000123,
+      "version": "0.1.0"
+    },
+    "transaction": {
+      "data_collection_order": 1,
+      "id": "7",
+      "total_order": 1
+    },
+    "ts_ms": 1700000001456
+  }
+}

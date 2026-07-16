@@ -566,11 +566,11 @@ const fn operation_name(operation: Operation) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
     use indexmap::indexmap;
     use rustium_core::{
-        DataValue, EventId, EventSchema, FieldSchema, PostgresPosition, SourceMetadata,
-        TransactionMetadata,
+        DataValue, EventId, EventSchema, FieldSchema, MySqlPosition, PostgresPosition,
+        SourceMetadata, SqlServerPosition, TransactionMetadata,
     };
 
     use super::*;
@@ -634,9 +634,81 @@ mod tests {
                     },
                 ],
             },
-            source_time: Some(Utc::now()),
-            observed_time: Utc::now(),
+            source_time: Some(
+                Utc.timestamp_millis_opt(1_700_000_000_123)
+                    .single()
+                    .unwrap(),
+            ),
+            observed_time: Utc
+                .timestamp_millis_opt(1_700_000_001_456)
+                .single()
+                .unwrap(),
         }
+    }
+
+    fn encoded_fixture(event: &ChangeEvent) -> serde_json::Value {
+        let encoded = DebeziumJsonEncoder::new(JsonEncoderConfig {
+            topic_prefix: "app".into(),
+            unavailable_value: "__unavailable".into(),
+            tombstones_on_delete: true,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
+        })
+        .encode(event)
+        .unwrap();
+        serde_json::json!({
+            "destination": encoded.destination,
+            "key": serde_json::from_slice::<serde_json::Value>(encoded.key.as_ref().unwrap()).unwrap(),
+            "payload": serde_json::from_slice::<serde_json::Value>(encoded.payload.as_ref().unwrap()).unwrap(),
+        })
+    }
+
+    fn golden_fixture(path: &str) -> serde_json::Value {
+        serde_json::from_str(path).unwrap()
+    }
+
+    #[test]
+    fn matches_debezium_json_golden_fixtures_for_prioritized_connectors() {
+        let postgres = event();
+        assert_eq!(
+            encoded_fixture(&postgres),
+            golden_fixture(include_str!(
+                "../tests/fixtures/debezium-postgresql-create.json"
+            ))
+        );
+
+        let mut mysql = event();
+        mysql.source.connector = "mysql".into();
+        mysql.source.schema = None;
+        mysql.position = SourcePosition::MySql(MySqlPosition {
+            binlog_filename: "mysql-bin.000123".into(),
+            binlog_position: 4_567,
+            gtid_set: Some("24bc7850-2c16-11ef-8f32-0242ac120002:1-9".into()),
+            server_id: 184,
+            event_serial: 2,
+            snapshot: false,
+        });
+        assert_eq!(
+            encoded_fixture(&mysql),
+            golden_fixture(include_str!("../tests/fixtures/debezium-mysql-create.json"))
+        );
+
+        let mut sqlserver = event();
+        sqlserver.source.connector = "sqlserver".into();
+        sqlserver.source.schema = Some("dbo".into());
+        sqlserver.position = SourcePosition::SqlServer(SqlServerPosition {
+            database: "app".into(),
+            commit_lsn: "0x0000002A000001000001".into(),
+            change_lsn: "0x0000002A000001000002".into(),
+            event_serial: 3,
+            snapshot: false,
+        });
+        assert_eq!(
+            encoded_fixture(&sqlserver),
+            golden_fixture(include_str!(
+                "../tests/fixtures/debezium-sqlserver-create.json"
+            ))
+        );
     }
 
     #[test]
