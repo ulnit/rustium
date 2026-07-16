@@ -2301,10 +2301,15 @@ async fn execute_heartbeat_action(mut connection: Conn, query: String) -> Result
 
 async fn connect_with_options(config: &MySqlSourceConfig, builder: OptsBuilder) -> Result<Conn> {
     let opts = Opts::from(builder);
-    tokio::time::timeout(config.connect_timeout, Conn::new(opts))
+    let mut connection = tokio::time::timeout(config.connect_timeout, Conn::new(opts))
         .await
         .map_err(|_| Error::Source("timed out connecting to MySQL".into()))?
-        .map_err(mysql_error)
+        .map_err(mysql_error)?;
+    connection
+        .query_drop("SET SESSION time_zone = '+00:00'")
+        .await
+        .map_err(mysql_error)?;
+    Ok(connection)
 }
 
 async fn current_binlog_coordinates(
@@ -2738,7 +2743,11 @@ fn convert_value(value: &Value, type_name: &str) -> DataValue {
     match value {
         Value::NULL => DataValue::Null,
         Value::Int(value) => {
-            if type_name.to_ascii_lowercase().starts_with("tinyint(1)") {
+            if base_type(type_name) == "enum" {
+                mysql_enum_label(type_name, u64::try_from(*value).unwrap_or_default())
+            } else if base_type(type_name) == "set" {
+                mysql_set_label(type_name, u64::try_from(*value).unwrap_or_default())
+            } else if type_name.to_ascii_lowercase().starts_with("tinyint(1)") {
                 DataValue::Boolean(*value != 0)
             } else if i32::try_from(*value).is_ok() {
                 DataValue::Int32(*value as i32)
@@ -2746,7 +2755,11 @@ fn convert_value(value: &Value, type_name: &str) -> DataValue {
                 DataValue::Int64(*value)
             }
         }
-        Value::UInt(value) => DataValue::UInt64(*value),
+        Value::UInt(value) => match base_type(type_name) {
+            "enum" => mysql_enum_label(type_name, *value),
+            "set" => mysql_set_label(type_name, *value),
+            _ => DataValue::UInt64(*value),
+        },
         Value::Float(value) => DataValue::Float64(f64::from(*value)),
         Value::Double(value) => DataValue::Float64(*value),
         Value::Bytes(value) => convert_bytes(value, type_name),
@@ -2782,6 +2795,30 @@ fn convert_value(value: &Value, type_name: &str) -> DataValue {
 
 fn convert_bytes(value: &[u8], type_name: &str) -> DataValue {
     let base = base_type(type_name);
+    if base == "enum" {
+        return String::from_utf8(value.to_vec())
+            .map_or_else(|_| DataValue::Bytes(value.to_vec()), DataValue::String);
+    }
+    if base == "set" {
+        if let Ok(text) = std::str::from_utf8(value)
+            && mysql_type_members(type_name).is_some_and(|members| {
+                text.is_empty()
+                    || text
+                        .split(',')
+                        .all(|member| members.iter().any(|candidate| candidate == member))
+            })
+        {
+            return DataValue::String(text.into());
+        }
+        let mask = value
+            .iter()
+            .take(std::mem::size_of::<u64>())
+            .enumerate()
+            .fold(0_u64, |mask, (index, byte)| {
+                mask | (u64::from(*byte) << (index * 8))
+            });
+        return mysql_set_label(type_name, mask);
+    }
     if matches!(
         base,
         "binary"
@@ -2840,6 +2877,68 @@ fn convert_bytes(value: &[u8], type_name: &str) -> DataValue {
             .map(DataValue::Timestamp)
             .unwrap_or_else(|| DataValue::Timestamp(value.into())),
         _ => DataValue::String(value.into()),
+    }
+}
+
+fn mysql_enum_label(type_name: &str, index: u64) -> DataValue {
+    let label = index
+        .checked_sub(1)
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| mysql_type_members(type_name)?.get(index).cloned())
+        .unwrap_or_default();
+    DataValue::String(label)
+}
+
+fn mysql_set_label(type_name: &str, mask: u64) -> DataValue {
+    let labels = mysql_type_members(type_name)
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, label)| ((mask >> index) & 1 == 1).then_some(label))
+        .collect::<Vec<_>>()
+        .join(",");
+    DataValue::String(labels)
+}
+
+fn mysql_type_members(type_name: &str) -> Option<Vec<String>> {
+    let (_, values) = type_name.split_once('(')?;
+    let values = values.strip_suffix(')')?;
+    let mut chars = values.chars().peekable();
+    let mut members = Vec::new();
+    loop {
+        while chars
+            .peek()
+            .is_some_and(|character| character.is_ascii_whitespace())
+        {
+            chars.next();
+        }
+        if chars.next()? != '\'' {
+            return None;
+        }
+        let mut value = String::new();
+        loop {
+            match chars.next()? {
+                '\\' => value.push(chars.next()?),
+                '\'' if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                    value.push('\'');
+                }
+                '\'' => break,
+                character => value.push(character),
+            }
+        }
+        members.push(value);
+        while chars
+            .peek()
+            .is_some_and(|character| character.is_ascii_whitespace())
+        {
+            chars.next();
+        }
+        match chars.next() {
+            Some(',') => {}
+            None => return Some(members),
+            _ => return None,
+        }
     }
 }
 
@@ -3077,6 +3176,18 @@ mod tests {
         assert_eq!(
             mysql_timestamp("1784114317.113641"),
             Some("2026-07-15 11:18:37.113641".into())
+        );
+        assert_eq!(
+            convert_value(&Value::Int(2), "enum('new','done')"),
+            DataValue::String("done".into())
+        );
+        assert_eq!(
+            convert_bytes(&[5], "set('a','b','c')"),
+            DataValue::String("a,c".into())
+        );
+        assert_eq!(
+            mysql_type_members(r"enum('plain','it\'s','a''b')"),
+            Some(vec!["plain".into(), "it's".into(), "a'b".into()])
         );
     }
 

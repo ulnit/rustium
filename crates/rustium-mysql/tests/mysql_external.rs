@@ -805,6 +805,180 @@ async fn reconstructs_partial_json_updates_from_before_images() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an external MySQL 8.0+ server with row binlog and GTID enabled"]
+async fn keeps_snapshot_and_binlog_type_conversion_identical() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_types_{}", &suffix[..12]);
+    let connector_name = format!("mysql-types-{}", &suffix[..12]);
+    let qualified_table = format!(
+        "{}.{}",
+        quote_identifier(&settings.database),
+        quote_identifier(&table_name)
+    );
+    let mut admin = connect_admin(&settings).await?;
+
+    let outcome: TestResult = async {
+        admin
+            .query_drop(format!(
+                "CREATE TABLE {qualified_table} (\
+                    id BIGINT PRIMARY KEY, \
+                    flag TINYINT(1) NOT NULL, \
+                    signed_value BIGINT NOT NULL, \
+                    unsigned_value BIGINT UNSIGNED NOT NULL, \
+                    amount DECIMAL(20,6) NOT NULL, \
+                    ratio_float FLOAT NOT NULL, \
+                    ratio_double DOUBLE NOT NULL, \
+                    bits BIT(8) NOT NULL, \
+                    bytes VARBINARY(8) NOT NULL, \
+                    day_value DATE NOT NULL, \
+                    time_value TIME(6) NOT NULL, \
+                    datetime_value DATETIME(6) NOT NULL, \
+                    timestamp_value TIMESTAMP(6) NOT NULL, \
+                    name_value VARCHAR(50) NOT NULL, \
+                    notes TEXT NOT NULL, \
+                    payload JSON NOT NULL, \
+                    choice ENUM('new','done') NOT NULL, \
+                    tags SET('a','b','c') NOT NULL, \
+                    optional_text VARCHAR(20) NULL\
+                 )"
+            ))
+            .await?;
+        let values = "1, -9223372036854775807, 9223372036854775810, 12345678901234.567890, \
+                      1.25, 12345.125, b'10100101', X'00FF10', '2026-07-16', \
+                      '12:34:56.123456', '2026-07-16 12:34:56.123456', \
+                      '2026-07-16 12:34:56.123456', 'Alice', 'type matrix', \
+                      JSON_OBJECT('active', true, 'count', 7), 'done', 'a,c', NULL";
+        admin
+            .query_drop(format!(
+                "INSERT INTO {qualified_table} VALUES (1, {values})"
+            ))
+            .await?;
+
+        let config = settings.source_config(&table_name);
+        let mut source = MySqlSource::new(
+            &connector_name,
+            config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None, None);
+        let snapshot_result: TestResult<(
+            SourcePosition,
+            ConnectorStateEnvelope,
+            rustium_core::Row,
+        )> = async {
+            let mut snapshot_values = None;
+            loop {
+                let record = receive(&mut output).await?;
+                if record.boundary == RecordBoundary::SnapshotComplete {
+                    let values = snapshot_values
+                        .take()
+                        .ok_or_else(|| test_error("MySQL type snapshot emitted no row"))?;
+                    let state = record.connector_state.ok_or_else(|| {
+                        test_error("MySQL type snapshot completion has no schema history")
+                    })?;
+                    break Ok((record.position, state, values));
+                }
+                let event = record
+                    .event
+                    .ok_or_else(|| test_error("MySQL type snapshot record has no event"))?;
+                require(
+                    event.operation == Operation::Read,
+                    "MySQL type snapshot event is not a read",
+                )?;
+                snapshot_values = event.after;
+            }
+        }
+        .await;
+        let (snapshot_position, schema_history, mut snapshot_values) =
+            finish_source(cancellation, source_task, snapshot_result).await?;
+
+        admin
+            .query_drop(format!(
+                "INSERT INTO {qualified_table} VALUES (2, {values})"
+            ))
+            .await?;
+        let checkpoint = Checkpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            connector_name: connector_name.clone(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: snapshot_position.clone(),
+            snapshot_completed: true,
+            config_fingerprint: "mysql-type-matrix-test".into(),
+            updated_at: SystemTime::now(),
+            connector_state: Some(schema_history),
+        };
+        let mut source = MySqlSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) =
+            start_source(source, Some(checkpoint), Some(snapshot_position));
+        let binlog_result: TestResult<rustium_core::Row> = async {
+            loop {
+                let record = receive(&mut output).await?;
+                let Some(event) = record.event else {
+                    continue;
+                };
+                if event.source.table.as_deref() != Some(table_name.as_str()) {
+                    continue;
+                }
+                let id = event
+                    .after
+                    .as_ref()
+                    .and_then(|row| row.get("id"))
+                    .and_then(mysql_integer);
+                if event.operation == Operation::Create && id == Some(2) {
+                    break event
+                        .after
+                        .ok_or_else(|| test_error("MySQL type binlog row has no after image"));
+                }
+            }
+        }
+        .await;
+        let mut binlog_values =
+            finish_source(cancellation, source_task, binlog_result).await?;
+        snapshot_values.shift_remove("id");
+        binlog_values.shift_remove("id");
+        require(
+            snapshot_values == binlog_values,
+            format!(
+                "MySQL snapshot/binlog type conversion differs: snapshot={snapshot_values:?}, binlog={binlog_values:?}"
+            ),
+        )
+    }
+    .await;
+
+    let cleanup_result = admin
+        .query_drop(format!("DROP TABLE IF EXISTS {qualified_table}"))
+        .await
+        .map_err(boxed_error);
+    let close_result = admin.disconnect().await.map_err(boxed_error);
+    match (outcome, cleanup_result, close_result) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), cleanup, close) => {
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("MySQL type matrix cleanup also failed: {cleanup_error}");
+            }
+            if let Err(close_error) = close {
+                eprintln!("MySQL type matrix close also failed: {close_error}");
+            }
+            Err(error)
+        }
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external MySQL 8.0+ server with row binlog and GTID enabled"]
 async fn snapshots_and_replays_destructive_ddl_from_checkpoint() -> TestResult {
     let settings = TestSettings::from_env()?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
