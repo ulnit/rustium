@@ -410,7 +410,59 @@ fn parse_sqlserver(properties: &BTreeMap<String, String>) -> Result<Config> {
         ));
     }
     let poll_interval = duration_ms(properties, "poll.interval.ms", default_poll_interval())?;
-    let warnings = Vec::new();
+    let signal_collections = csv_property(properties.get("signal.data.collection"));
+    if signal_collections.len() > 1 {
+        return Err(Error::Configuration(
+            "Rustium SQL Server currently accepts one table in signal.data.collection".into(),
+        ));
+    }
+    let signal_data_collection = signal_collections.into_iter().next();
+    let requested_signal_channels = {
+        let channels = csv_property(properties.get("signal.enabled.channels"));
+        if channels.is_empty() {
+            default_signal_enabled_channels()
+        } else {
+            channels
+        }
+    };
+    let mut signal_enabled_channels = Vec::new();
+    let mut warnings = Vec::new();
+    for channel in &requested_signal_channels {
+        let mapped = match channel.as_str() {
+            "source" | "file" | "in-process" | "kafka" => Some(channel.clone()),
+            "jmx" => Some("in-process".into()),
+            _ => None,
+        };
+        if let Some(mapped) = mapped
+            && !signal_enabled_channels.contains(&mapped)
+        {
+            signal_enabled_channels.push(mapped);
+        }
+    }
+    if signal_enabled_channels.is_empty() {
+        return Err(Error::Configuration(
+            "SQL Server signal.enabled.channels enables no implemented channel".into(),
+        ));
+    }
+    for channel in &requested_signal_channels {
+        match channel.as_str() {
+            "jmx" => warnings.push(
+                "signal.enabled.channels=jmx is JVM-specific; Rustium maps it to the bounded in-process channel and its SignalSender/HTTP management API".into(),
+            ),
+            "source" | "file" | "in-process" | "kafka" => {}
+            _ => warnings.push(format!("signal.enabled.channels={channel} is not implemented and was ignored")),
+        }
+    }
+    if bool_value(
+        properties,
+        "incremental.snapshot.allow.schema.changes",
+        false,
+    )? {
+        return Err(Error::Configuration(
+            "incremental.snapshot.allow.schema.changes=true is not implemented for SQL Server"
+                .into(),
+        ));
+    }
     assemble_config(
         properties,
         SourceConfig::Sqlserver(SqlServerSourceConfig {
@@ -458,6 +510,46 @@ fn parse_sqlserver(properties: &BTreeMap<String, String>) -> Result<Config> {
                 .cloned()
                 .unwrap_or_else(default_heartbeat_topics_prefix),
             heartbeat_topic_name: properties.get("topic.heartbeat.name").cloned(),
+            signal_data_collection,
+            signal_enabled_channels,
+            signal_file: properties
+                .get("signal.file")
+                .cloned()
+                .unwrap_or_else(default_signal_file),
+            signal_poll_interval: duration_ms(
+                properties,
+                "signal.poll.interval.ms",
+                default_signal_poll_interval(),
+            )?,
+            incremental_snapshot_chunk_size: usize_value(
+                properties,
+                "incremental.snapshot.chunk.size",
+                default_incremental_snapshot_chunk_size(),
+            )?,
+            incremental_snapshot_watermarking_strategy: properties
+                .get("incremental.snapshot.watermarking.strategy")
+                .cloned()
+                .unwrap_or_else(default_incremental_snapshot_watermarking_strategy),
+            signal_kafka_topic: properties.get("signal.kafka.topic").cloned(),
+            signal_kafka_bootstrap_servers: csv_property(
+                properties.get("signal.kafka.bootstrap.servers"),
+            ),
+            signal_kafka_group_id: properties
+                .get("signal.kafka.groupId")
+                .cloned()
+                .unwrap_or_else(default_signal_kafka_group_id),
+            signal_kafka_poll_timeout: duration_ms(
+                properties,
+                "signal.kafka.poll.timeout.ms",
+                default_signal_kafka_poll_timeout(),
+            )?,
+            signal_kafka_consumer_properties: properties
+                .iter()
+                .filter_map(|(key, value)| {
+                    key.strip_prefix("signal.consumer.")
+                        .map(|key| (key.to_string(), value.clone()))
+                })
+                .collect(),
         }),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -1241,6 +1333,16 @@ heartbeat.interval.ms=1000
 heartbeat.action.query=UPDATE dbo.heartbeat SET touched_at = SYSUTCDATETIME()
 topic.heartbeat.prefix=__sql-heartbeat
 topic.heartbeat.name=shared-sql-heartbeat
+signal.data.collection=inventory.dbo.rustium_signal
+signal.enabled.channels=jmx,file,kafka
+signal.file=sql-signals.jsonl
+signal.poll.interval.ms=250
+signal.kafka.bootstrap.servers=kafka:9092
+signal.kafka.groupId=sql-signals
+signal.consumer.enable.auto.commit=false
+incremental.snapshot.chunk.size=64
+incremental.snapshot.allow.schema.changes=false
+incremental.snapshot.watermarking.strategy=insert_insert
 "#,
         )
         .unwrap();
@@ -1257,6 +1359,31 @@ topic.heartbeat.name=shared-sql-heartbeat
         assert_eq!(
             source.heartbeat_topic_name.as_deref(),
             Some("shared-sql-heartbeat")
+        );
+        assert_eq!(
+            source.signal_data_collection.as_deref(),
+            Some("inventory.dbo.rustium_signal")
+        );
+        assert_eq!(
+            source.signal_enabled_channels,
+            ["in-process", "file", "kafka"]
+        );
+        assert_eq!(source.signal_file, "sql-signals.jsonl");
+        assert_eq!(source.signal_poll_interval, Duration::from_millis(250));
+        assert_eq!(source.incremental_snapshot_chunk_size, 64);
+        assert_eq!(source.signal_kafka_bootstrap_servers, ["kafka:9092"]);
+        assert_eq!(source.signal_kafka_group_id, "sql-signals");
+        assert_eq!(
+            source
+                .signal_kafka_consumer_properties
+                .get("enable.auto.commit"),
+            Some(&"false".into())
+        );
+        assert!(
+            config
+                .compatibility_warnings
+                .iter()
+                .any(|warning| warning.contains("signal.enabled.channels=jmx"))
         );
         assert!(config.format.tombstones_on_delete);
     }

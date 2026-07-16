@@ -6,8 +6,8 @@ use futures::TryStreamExt;
 use rustium_config::{SnapshotConfig, SnapshotMode, SqlServerSourceConfig};
 use rustium_core::{
     ChangeEvent, DataValue, Error, EventId, EventSchema, FieldSchema, Operation, RecordBoundary,
-    Result, Row, SourceConnector, SourceContext, SourceMetadata, SourcePosition, SourceRecord,
-    SqlServerPosition, TransactionMetadata,
+    Result, Row, SignalAcknowledgement, SignalRecord, SourceConnector, SourceContext,
+    SourceMetadata, SourcePosition, SourceRecord, SqlServerPosition, TransactionMetadata,
 };
 use tiberius::{
     AuthMethod, Client, ColumnData, Config as TdsConfig, EncryptionLevel, Row as TdsRow,
@@ -16,6 +16,10 @@ use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use tracing::info;
 
+use crate::state::{
+    IncrementalSnapshotProgress, SqlServerKeyValue, decode_connector_state, encode_connector_state,
+};
+
 const CONNECTOR_VERSION: &str = env!("CARGO_PKG_VERSION");
 const LSN_SIZE: usize = 10;
 const RAW_DELETE: i32 = 1;
@@ -23,6 +27,7 @@ const RAW_INSERT: i32 = 2;
 const RAW_UPDATE_BEFORE: i32 = 3;
 const RAW_UPDATE_AFTER: i32 = 4;
 const COMMIT_SERIAL: u64 = 5;
+const MAX_COMPLETED_SIGNAL_IDS: usize = 1_024;
 
 type SqlClient = Client<Compat<TcpStream>>;
 
@@ -57,8 +62,11 @@ impl CdcCursor {
         }
     }
 
-    fn from_position(position: &SqlServerPosition) -> Result<(Self, Option<SourcePosition>)> {
-        if position.snapshot || position.event_serial == COMMIT_SERIAL {
+    fn from_position(
+        position: &SqlServerPosition,
+        connector_state_boundary: bool,
+    ) -> Result<(Self, Option<SourcePosition>)> {
+        if position.snapshot || position.event_serial == COMMIT_SERIAL || connector_state_boundary {
             return Ok((Self::at_snapshot(parse_lsn(&position.commit_lsn)?), None));
         }
         Ok((
@@ -93,6 +101,333 @@ struct ActiveTransaction {
     source_time: Option<DateTime<Utc>>,
     total_order: u64,
     collection_order: HashMap<(String, String), u64>,
+}
+
+#[derive(Debug, Clone)]
+enum SnapshotSignal {
+    Execute {
+        id: String,
+        data_collections: Vec<String>,
+        additional_conditions: BTreeMap<String, String>,
+    },
+    Stop {
+        id: String,
+        data_collections: Vec<String>,
+    },
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
+    Unsupported {
+        id: String,
+        signal_type: String,
+    },
+}
+
+struct SqlServerIncrementalSnapshot {
+    progress: Option<IncrementalSnapshotProgress>,
+    completed_signal_ids: Vec<String>,
+    event_serial: u64,
+    state_dirty: bool,
+}
+
+impl SqlServerIncrementalSnapshot {
+    fn new(
+        progress: Option<IncrementalSnapshotProgress>,
+        completed_signal_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            progress,
+            completed_signal_ids,
+            event_serial: 0,
+            state_dirty: false,
+        }
+    }
+
+    fn progress(&self) -> Option<&IncrementalSnapshotProgress> {
+        self.progress.as_ref()
+    }
+
+    fn completed_signal_ids(&self) -> &[String] {
+        &self.completed_signal_ids
+    }
+
+    fn is_active(&self) -> bool {
+        self.progress
+            .as_ref()
+            .is_some_and(|progress| !progress.paused)
+    }
+
+    fn state_dirty(&self) -> bool {
+        self.state_dirty
+    }
+
+    fn latest_position(&self, base: &SourcePosition) -> Result<Option<SourcePosition>> {
+        if self.event_serial == 0 {
+            Ok(None)
+        } else {
+            sqlserver_incremental_position(base, self.event_serial).map(Some)
+        }
+    }
+
+    fn mark_checkpointed(&mut self) {
+        self.state_dirty = false;
+    }
+
+    fn remember_completed(&mut self, id: String) {
+        if let Some(index) = self
+            .completed_signal_ids
+            .iter()
+            .position(|candidate| candidate == &id)
+        {
+            self.completed_signal_ids.remove(index);
+        }
+        self.completed_signal_ids.push(id);
+        if self.completed_signal_ids.len() > MAX_COMPLETED_SIGNAL_IDS {
+            self.completed_signal_ids.remove(0);
+        }
+    }
+
+    fn parse_external_record(record: &SignalRecord) -> Result<SnapshotSignal> {
+        if record.id.trim().is_empty() || record.signal_type.trim().is_empty() {
+            return Err(Error::Source(
+                "SQL Server external signal requires non-empty id and type".into(),
+            ));
+        }
+        parse_snapshot_signal(&record.id, &record.signal_type, &record.data)
+    }
+
+    fn parse_row(row: &Row) -> Result<SnapshotSignal> {
+        let id = signal_text(row, "id")?;
+        let signal_type = signal_text(row, "type")?;
+        let data = signal_text(row, "data")?;
+        let value = serde_json::from_str::<serde_json::Value>(&data).map_err(|error| {
+            Error::Source(format!(
+                "SQL Server signal {id:?} has invalid JSON data: {error}"
+            ))
+        })?;
+        parse_snapshot_signal(&id, &signal_type, &value)
+    }
+
+    fn handle_signal(&mut self, signal: SnapshotSignal, source: &SqlServerSource) -> Result<()> {
+        match signal {
+            SnapshotSignal::Execute {
+                id,
+                data_collections,
+                additional_conditions,
+            } => {
+                if self.completed_signal_ids.contains(&id)
+                    || self
+                        .progress
+                        .as_ref()
+                        .is_some_and(|progress| progress.signal_id == id)
+                {
+                    return Ok(());
+                }
+                if self.progress.is_some() {
+                    tracing::warn!(%id, "SQL Server incremental snapshot is already active; execute signal ignored");
+                    return Ok(());
+                }
+                self.progress = Some(IncrementalSnapshotProgress {
+                    signal_id: id,
+                    data_collections: source.expand_data_collections(&data_collections)?,
+                    additional_conditions,
+                    current_collection: 0,
+                    last_key: None,
+                    maximum_key: None,
+                    chunk_sequence: 1,
+                    paused: false,
+                });
+                self.state_dirty = true;
+                Ok(())
+            }
+            SnapshotSignal::Stop {
+                id,
+                data_collections,
+            } => {
+                let Some(mut progress) = self.progress.take() else {
+                    return Ok(());
+                };
+                if data_collections.is_empty() {
+                    self.remember_completed(progress.signal_id);
+                    self.state_dirty = true;
+                    info!(%id, "SQL Server incremental snapshot stopped");
+                    return Ok(());
+                }
+                let patterns = compile_collection_patterns(&data_collections)?;
+                let original = progress.data_collections.clone();
+                let current = original.get(progress.current_collection).cloned();
+                let retained_before = original
+                    .iter()
+                    .take(progress.current_collection)
+                    .filter(|collection| !collection_matches_any(collection, &patterns))
+                    .count();
+                progress
+                    .data_collections
+                    .retain(|collection| !collection_matches_any(collection, &patterns));
+                if progress.data_collections.len() == original.len() {
+                    self.progress = Some(progress);
+                    return Ok(());
+                }
+                if current
+                    .as_ref()
+                    .is_some_and(|collection| collection_matches_any(collection, &patterns))
+                {
+                    progress.last_key = None;
+                    progress.maximum_key = None;
+                }
+                progress.current_collection = retained_before;
+                if progress.current_collection >= progress.data_collections.len() {
+                    self.remember_completed(progress.signal_id);
+                } else {
+                    self.progress = Some(progress);
+                }
+                self.state_dirty = true;
+                info!(%id, "SQL Server incremental snapshot collections stopped");
+                Ok(())
+            }
+            SnapshotSignal::Pause { id } => {
+                if let Some(progress) = &mut self.progress
+                    && !progress.paused
+                {
+                    progress.paused = true;
+                    self.state_dirty = true;
+                    info!(%id, "SQL Server incremental snapshot paused");
+                }
+                Ok(())
+            }
+            SnapshotSignal::Resume { id } => {
+                if let Some(progress) = &mut self.progress
+                    && progress.paused
+                {
+                    progress.paused = false;
+                    self.state_dirty = true;
+                    info!(%id, "SQL Server incremental snapshot resumed");
+                }
+                Ok(())
+            }
+            SnapshotSignal::Unsupported { id, signal_type } => {
+                tracing::warn!(%id, %signal_type, "unsupported SQL Server runtime signal ignored");
+                Ok(())
+            }
+        }
+    }
+
+    async fn run_next_chunk(
+        &mut self,
+        source: &SqlServerSource,
+        base_position: &SourcePosition,
+        output: &tokio::sync::mpsc::Sender<Result<SourceRecord>>,
+    ) -> Result<()> {
+        let Some(progress) = self.progress.clone() else {
+            return Ok(());
+        };
+        if progress.paused {
+            return Ok(());
+        }
+        let collection = progress
+            .data_collections
+            .get(progress.current_collection)
+            .cloned()
+            .ok_or_else(|| {
+                Error::State(format!(
+                    "SQL Server incremental snapshot collection index {} is outside {} collections",
+                    progress.current_collection,
+                    progress.data_collections.len()
+                ))
+            })?;
+        let capture = source.capture_for_collection(&collection).ok_or_else(|| {
+            Error::Source(format!(
+                "SQL Server incremental snapshot collection {collection:?} is not captured"
+            ))
+        })?;
+        let chunk = source.read_incremental_chunk(&capture, &progress).await?;
+        let row_count = chunk.rows.len();
+        let last_key = chunk.rows.last().map(|(_, key)| key.clone());
+        for (row, _) in chunk.rows {
+            self.event_serial = self.event_serial.saturating_add(1);
+            let position = sqlserver_incremental_position(base_position, self.event_serial)?;
+            let mut attributes = BTreeMap::new();
+            attributes.insert("rustium.snapshot.kind".into(), "incremental".into());
+            let event = ChangeEvent {
+                id: EventId::deterministic(
+                    &source.connector_name,
+                    source.database(),
+                    &position,
+                    &collection,
+                    self.event_serial,
+                ),
+                source: SourceMetadata {
+                    connector: "sqlserver".into(),
+                    connector_name: source.connector_name.clone(),
+                    database: source.database().into(),
+                    schema: Some(capture.schema.clone()),
+                    table: Some(capture.table.clone()),
+                    snapshot: true,
+                    version: CONNECTOR_VERSION.into(),
+                    attributes,
+                },
+                position: position.clone(),
+                transaction: None,
+                operation: Operation::Read,
+                before: None,
+                after: Some(row),
+                schema: capture.event_schema.clone(),
+                source_time: None,
+                observed_time: Utc::now(),
+            };
+            output
+                .send(Ok(SourceRecord::data(event)))
+                .await
+                .map_err(|_| Error::Cancelled)?;
+        }
+
+        let mut next = progress;
+        if next.maximum_key.is_none() {
+            next.maximum_key.clone_from(&chunk.maximum_key);
+        }
+        next.last_key = last_key;
+        let collection_complete = next.maximum_key.is_none()
+            || next.last_key.as_ref() == next.maximum_key.as_ref()
+            || row_count < source.config.incremental_snapshot_chunk_size;
+        if collection_complete {
+            next.current_collection = next.current_collection.saturating_add(1);
+            next.last_key = None;
+            next.maximum_key = None;
+        }
+        next.chunk_sequence = next.chunk_sequence.saturating_add(1);
+        if next.current_collection >= next.data_collections.len() {
+            self.remember_completed(next.signal_id);
+            self.progress = None;
+        } else {
+            self.progress = Some(next);
+        }
+
+        self.event_serial = self.event_serial.saturating_add(1);
+        let position = sqlserver_incremental_position(base_position, self.event_serial)?;
+        output
+            .send(Ok(SourceRecord {
+                event: None,
+                position,
+                boundary: RecordBoundary::TransactionCommit,
+                connector_state: Some(encode_connector_state(
+                    self.progress.as_ref(),
+                    &self.completed_signal_ids,
+                )?),
+                signal_acknowledgements: Vec::new(),
+            }))
+            .await
+            .map_err(|_| Error::Cancelled)?;
+        self.mark_checkpointed();
+        Ok(())
+    }
+}
+
+struct IncrementalChunk {
+    rows: Vec<(Row, Vec<SqlServerKeyValue>)>,
+    maximum_key: Option<Vec<SqlServerKeyValue>>,
 }
 
 pub struct SqlServerSource {
@@ -157,10 +492,26 @@ impl SqlServerSource {
         }
 
         let captures = discover_captures(&mut client, &self.config, &self.connector_name).await?;
-        if captures.is_empty() {
+        let signal_table = signal_table_key(&self.config);
+        if captures
+            .iter()
+            .all(|capture| signal_table.as_ref() == Some(&capture.key()))
+        {
             return Err(Error::Configuration(
                 "the SQL Server CDC capture instances and table filters select no tables".into(),
             ));
+        }
+        if let Some(signal_table) = signal_table {
+            let capture = captures
+                .iter()
+                .find(|capture| capture.key() == signal_table)
+                .ok_or_else(|| {
+                    Error::Configuration(format!(
+                        "SQL Server signal table {}.{} is not CDC-enabled",
+                        signal_table.0, signal_table.1
+                    ))
+                })?;
+            validate_signal_schema(capture)?;
         }
         current_max_lsn(&mut client).await?;
         client.close().await.map_err(sqlserver_error)?;
@@ -183,6 +534,8 @@ impl SqlServerSource {
         let anchor = current_max_lsn(&mut client).await?;
         let mut ordinal = 0_u64;
         let mut captures = self.captures.clone();
+        let signal_table = signal_table_key(&self.config);
+        captures.retain(|capture| signal_table.as_ref() != Some(&capture.key()));
         captures.sort_by_key(CaptureTable::key);
         for capture in &captures {
             snapshot_table(
@@ -230,6 +583,184 @@ impl SqlServerSource {
         client.close().await.map_err(sqlserver_error)?;
         Ok(anchor)
     }
+
+    fn capture_for_collection(&self, collection: &str) -> Option<CaptureTable> {
+        self.captures
+            .iter()
+            .find(|capture| format!("{}.{}", capture.schema, capture.table) == collection)
+            .cloned()
+    }
+
+    fn expand_data_collections(&self, patterns: &[String]) -> Result<Vec<String>> {
+        let patterns = compile_collection_patterns(patterns)?;
+        let signal_table = signal_table_key(&self.config);
+        let mut collections = self
+            .captures
+            .iter()
+            .filter(|capture| signal_table.as_ref() != Some(&capture.key()))
+            .filter_map(|capture| {
+                let short = format!("{}.{}", capture.schema, capture.table);
+                let qualified = format!("{}.{}", self.database(), short);
+                patterns
+                    .iter()
+                    .any(|pattern| pattern.is_match(&short) || pattern.is_match(&qualified))
+                    .then_some(short)
+            })
+            .collect::<Vec<_>>();
+        collections.sort();
+        collections.dedup();
+        if collections.is_empty() {
+            return Err(Error::Source(
+                "SQL Server incremental snapshot patterns select no captured tables".into(),
+            ));
+        }
+        Ok(collections)
+    }
+
+    async fn read_incremental_chunk(
+        &self,
+        capture: &CaptureTable,
+        progress: &IncrementalSnapshotProgress,
+    ) -> Result<IncrementalChunk> {
+        let key_fields = capture
+            .event_schema
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.primary_key)
+            .collect::<Vec<_>>();
+        if key_fields.is_empty() {
+            return Err(Error::Source(format!(
+                "SQL Server incremental snapshot table {}.{} requires a primary key",
+                capture.schema, capture.table
+            )));
+        }
+        let key_indices = key_fields
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+        let key_columns = key_fields
+            .iter()
+            .map(|(_, field)| format!("ct.{}", quote_identifier(&field.name)))
+            .collect::<Vec<_>>();
+        let collection = format!("{}.{}", capture.schema, capture.table);
+        let qualified_collection = format!("{}.{}", self.database(), collection);
+        let condition = progress
+            .additional_conditions
+            .iter()
+            .find_map(|(pattern, filter)| {
+                regex::Regex::new(&format!(r"^(?:{pattern})$"))
+                    .ok()
+                    .and_then(|pattern| {
+                        (pattern.is_match(&collection) || pattern.is_match(&qualified_collection))
+                            .then_some(filter)
+                    })
+            });
+        let table = format!(
+            "{}.{}",
+            quote_identifier(&capture.schema),
+            quote_identifier(&capture.table)
+        );
+        let mut client = connect(&self.config, self.database()).await?;
+        let maximum_key = match &progress.maximum_key {
+            Some(key) => Some(key.clone()),
+            None => {
+                let projections = key_fields
+                    .iter()
+                    .enumerate()
+                    .map(|(projection_index, (_, field))| {
+                        change_value_expression(projection_index, field)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let where_clause = condition
+                    .map(|condition| format!(" WHERE ({condition})"))
+                    .unwrap_or_default();
+                let ordering = key_columns
+                    .iter()
+                    .map(|column| format!("{column} DESC"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let row = client
+                    .simple_query(format!(
+                        "SELECT TOP (1) {projections} FROM {table} AS ct{where_clause} ORDER BY {ordering}"
+                    ))
+                    .await
+                    .map_err(sqlserver_error)?
+                    .into_row()
+                    .await
+                    .map_err(sqlserver_error)?;
+                row.map(|row| sqlserver_key_from_projection(&row, &key_fields))
+                    .transpose()?
+            }
+        };
+        let Some(maximum_key) = maximum_key else {
+            client.close().await.map_err(sqlserver_error)?;
+            return Ok(IncrementalChunk {
+                rows: Vec::new(),
+                maximum_key: None,
+            });
+        };
+
+        validate_key_width(&key_columns, &maximum_key, "maximum")?;
+        let mut predicates = Vec::new();
+        if let Some(condition) = condition {
+            predicates.push(format!("({condition})"));
+        }
+        if let Some(last_key) = &progress.last_key {
+            validate_key_width(&key_columns, last_key, "last")?;
+            predicates.push(sqlserver_key_predicate(&key_columns, last_key, true)?);
+        }
+        predicates.push(sqlserver_key_predicate(&key_columns, &maximum_key, false)?);
+        let projections = capture
+            .event_schema
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| change_value_expression(index, field))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT TOP ({}) {projections} FROM {table} AS ct WHERE {} ORDER BY {}",
+            self.config.incremental_snapshot_chunk_size,
+            predicates.join(" AND "),
+            key_columns.join(", ")
+        );
+        let rows = client
+            .simple_query(query)
+            .await
+            .map_err(sqlserver_error)?
+            .into_first_result()
+            .await
+            .map_err(sqlserver_error)?;
+        let rows = rows
+            .iter()
+            .map(|row| {
+                let converted = convert_tds_row(row, &capture.event_schema)?;
+                let key = key_indices
+                    .iter()
+                    .map(|index| {
+                        let field = &capture.event_schema.fields[*index];
+                        converted
+                            .get(&field.name)
+                            .ok_or_else(|| {
+                                Error::Source(format!(
+                                    "SQL Server incremental row is missing key {:?}",
+                                    field.name
+                                ))
+                            })
+                            .and_then(sqlserver_key_from_data_value)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((converted, key))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        client.close().await.map_err(sqlserver_error)?;
+        Ok(IncrementalChunk {
+            rows,
+            maximum_key: Some(maximum_key),
+        })
+    }
 }
 
 #[async_trait]
@@ -262,6 +793,22 @@ impl SourceConnector for SqlServerSource {
             ));
         }
 
+        let checkpoint_has_connector_state = !snapshot_needed
+            && checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.connector_state.as_ref())
+                .is_some();
+        let (incremental_progress, completed_signal_ids) = if !snapshot_needed {
+            checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.connector_state.as_ref())
+                .map(decode_connector_state)
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            (None, Vec::new())
+        };
+
         let (cursor, resume_position) = if snapshot_needed {
             (
                 CdcCursor::at_snapshot(self.run_snapshot(&context.output).await?),
@@ -275,7 +822,7 @@ impl SourceConnector for SqlServerSource {
                     self.database()
                 )));
             }
-            CdcCursor::from_position(position)?
+            CdcCursor::from_position(position, checkpoint_has_connector_state)?
         } else {
             (CdcCursor::at_snapshot(self.current_anchor().await?), None)
         };
@@ -283,9 +830,21 @@ impl SourceConnector for SqlServerSource {
         let mut client = connect(&self.config, self.database()).await?;
         validate_retention(&mut client, &self.captures, &cursor.commit_lsn).await?;
         let mut state = StreamingState::new(cursor, resume_position);
+        let mut incremental =
+            SqlServerIncrementalSnapshot::new(incremental_progress, completed_signal_ids);
+        let mut last_safe_position = checkpoint_position
+            .as_ref()
+            .filter(|position| {
+                matches!(position, SourcePosition::SqlServer(position) if !position.snapshot)
+            })
+            .cloned()
+            .unwrap_or_else(|| state.safe_position(self.database()));
         let mut interval = tokio::time::interval(self.config.poll_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut heartbeat = heartbeat_timer(self.config.heartbeat_interval);
+        let mut file_signal_poll = file_signal_timer(&self.config);
+        let mut incremental_tick = tokio::time::interval(std::time::Duration::from_millis(1));
+        incremental_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut heartbeat_connection = if self.config.heartbeat_interval.is_zero()
             || self.config.heartbeat_action_query.is_none()
         {
@@ -314,6 +873,74 @@ impl SourceConnector for SqlServerSource {
                         return Err(Error::Cancelled);
                     }
                 }
+                _ = incremental_tick.tick(),
+                    if incremental.is_active()
+                        && state.transaction.is_none()
+                        && state.cursor.commit_complete() => {
+                    let base = last_safe_position.clone();
+                    incremental.run_next_chunk(self, &base, &context.output).await?;
+                    if let Some(position) = incremental.latest_position(&base)? {
+                        last_safe_position = position;
+                    }
+                }
+                () = next_file_signal_poll(&mut file_signal_poll),
+                    if signal_channel_enabled(&self.config, "file")
+                        && state.transaction.is_none()
+                        && state.cursor.commit_complete() => {
+                    for line in crate::file_signal::read_and_clear(&self.config.signal_file).await? {
+                        let record = match serde_json::from_str::<SignalRecord>(&line) {
+                            Ok(record) => record,
+                            Err(error) => {
+                                tracing::warn!(%error, "invalid SQL Server file signal ignored");
+                                continue;
+                            }
+                        };
+                        let signal = match SqlServerIncrementalSnapshot::parse_external_record(&record) {
+                            Ok(signal) => signal,
+                            Err(error) => {
+                                tracing::warn!(%error, "invalid SQL Server file signal ignored");
+                                continue;
+                            }
+                        };
+                        incremental.handle_signal(signal, self)?;
+                    }
+                    if incremental.state_dirty() {
+                        emit_incremental_checkpoint(
+                            &context.output,
+                            incremental.progress(),
+                            incremental.completed_signal_ids(),
+                            &last_safe_position,
+                            None,
+                        ).await?;
+                        incremental.mark_checkpointed();
+                    }
+                }
+                delivery = context.signals.recv(),
+                    if (signal_channel_enabled(&self.config, "in-process")
+                        || signal_channel_enabled(&self.config, "kafka"))
+                        && state.transaction.is_none()
+                        && state.cursor.commit_complete() => {
+                    let delivery = delivery.ok_or_else(|| {
+                        Error::Source("SQL Server runtime signal channel closed".into())
+                    })?;
+                    let signal = match SqlServerIncrementalSnapshot::parse_external_record(delivery.record()) {
+                        Ok(signal) => signal,
+                        Err(error) => {
+                            tracing::warn!(%error, "invalid SQL Server runtime signal ignored");
+                            delivery.acknowledge();
+                            continue;
+                        }
+                    };
+                    incremental.handle_signal(signal, self)?;
+                    emit_incremental_checkpoint(
+                        &context.output,
+                        incremental.progress(),
+                        incremental.completed_signal_ids(),
+                        &last_safe_position,
+                        delivery.into_acknowledgement(),
+                    ).await?;
+                    incremental.mark_checkpointed();
+                }
                 _ = interval.tick() => {
                     let max_lsn = current_max_lsn(&mut client).await?;
                     if max_lsn < state.cursor.commit_lsn
@@ -331,28 +958,51 @@ impl SourceConnector for SqlServerSource {
                         &max_lsn,
                         self.config.streaming_fetch_size,
                     ).await?;
-                    for record in records {
+                    for mut record in records {
+                        if let Some(signal_row) = source_signal_row(&record, &self.config) {
+                            if signal_channel_enabled(&self.config, "source")
+                                && let Some(signal_row) = signal_row
+                            {
+                                let signal = SqlServerIncrementalSnapshot::parse_row(signal_row)?;
+                                incremental.handle_signal(signal, self)?;
+                            }
+                            continue;
+                        }
+                        if record.boundary == RecordBoundary::TransactionCommit
+                            && incremental.state_dirty()
+                        {
+                            record.connector_state = Some(encode_connector_state(
+                                incremental.progress(),
+                                incremental.completed_signal_ids(),
+                            )?);
+                        }
+                        let checkpointed = record.connector_state.is_some();
+                        let position = record.position.clone();
                         context.output.send(Ok(record)).await.map_err(|_| Error::Cancelled)?;
+                        if position.is_after(&last_safe_position)
+                            || position == last_safe_position
+                        {
+                            last_safe_position = position;
+                        }
+                        if checkpointed {
+                            incremental.mark_checkpointed();
+                        }
                     }
                 }
                 () = next_heartbeat(&mut heartbeat) => {
+                    if !state.cursor.commit_complete() {
+                        continue;
+                    }
                     if let Some(query) = self.config.heartbeat_action_query.clone() {
                         let connection = heartbeat_connection.take().ok_or_else(|| {
                             Error::Source("SQL Server heartbeat action connection is unavailable".into())
                         })?;
                         heartbeat_connection = Some(execute_heartbeat_action(connection, query).await?);
                     }
-                    let position = sqlserver_position(
-                        self.database(),
-                        &state.cursor.commit_lsn,
-                        &state.cursor.change_lsn,
-                        COMMIT_SERIAL,
-                        false,
-                    );
                     context.output.send(Ok(sqlserver_heartbeat_record(
                         &self.connector_name,
                         self.database(),
-                        position,
+                        last_safe_position.clone(),
                     ))).await.map_err(|_| Error::Cancelled)?;
                 }
             }
@@ -376,6 +1026,370 @@ async fn next_heartbeat(timer: &mut Option<tokio::time::Interval>) {
         }
         None => std::future::pending::<()>().await,
     }
+}
+
+fn signal_channel_enabled(config: &SqlServerSourceConfig, channel: &str) -> bool {
+    config
+        .signal_enabled_channels
+        .iter()
+        .any(|enabled| enabled == channel)
+}
+
+fn signal_table_key(config: &SqlServerSourceConfig) -> Option<(String, String)> {
+    let parts = config
+        .signal_data_collection
+        .as_deref()?
+        .split('.')
+        .collect::<Vec<_>>();
+    match parts.as_slice() {
+        [schema, table] | [_, schema, table] => Some(((*schema).into(), (*table).into())),
+        _ => None,
+    }
+}
+
+fn validate_signal_schema(capture: &CaptureTable) -> Result<()> {
+    let expected = ["id", "type", "data"];
+    if capture.event_schema.fields.len() != expected.len()
+        || capture
+            .event_schema
+            .fields
+            .iter()
+            .zip(expected)
+            .any(|(field, expected)| {
+                field.name != expected
+                    || !matches!(
+                        base_type(&field.type_name),
+                        "char" | "varchar" | "nchar" | "nvarchar" | "text" | "ntext"
+                    )
+            })
+    {
+        return Err(Error::Configuration(format!(
+            "SQL Server signal table {}.{} must contain exactly text-compatible id, type, and data columns in that order",
+            capture.schema, capture.table
+        )));
+    }
+    Ok(())
+}
+
+fn source_signal_row<'a>(
+    record: &'a SourceRecord,
+    config: &SqlServerSourceConfig,
+) -> Option<Option<&'a Row>> {
+    let signal = signal_table_key(config)?;
+    let event = record.event.as_ref()?;
+    if event.source.schema.as_deref() != Some(signal.0.as_str())
+        || event.source.table.as_deref() != Some(signal.1.as_str())
+    {
+        return None;
+    }
+    Some(
+        (event.operation == Operation::Create)
+            .then_some(event.after.as_ref())
+            .flatten(),
+    )
+}
+
+fn file_signal_timer(config: &SqlServerSourceConfig) -> Option<tokio::time::Interval> {
+    if !signal_channel_enabled(config, "file") {
+        return None;
+    }
+    let mut timer = tokio::time::interval_at(
+        tokio::time::Instant::now() + config.signal_poll_interval,
+        config.signal_poll_interval,
+    );
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    Some(timer)
+}
+
+async fn next_file_signal_poll(timer: &mut Option<tokio::time::Interval>) {
+    match timer {
+        Some(timer) => {
+            timer.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn signal_text(row: &Row, name: &str) -> Result<String> {
+    match row.get(name) {
+        Some(DataValue::String(value)) => Ok(value.clone()),
+        Some(DataValue::Json(value)) => Ok(value.to_string()),
+        Some(DataValue::Bytes(value)) => String::from_utf8(value.clone()).map_err(|error| {
+            Error::Source(format!(
+                "SQL Server signal column {name} is not UTF-8: {error}"
+            ))
+        }),
+        Some(value) => Ok(value.to_json("__rustium_unavailable").to_string()),
+        None => Err(Error::Source(format!(
+            "SQL Server signal table is missing column {name:?}"
+        ))),
+    }
+}
+
+fn parse_snapshot_signal(
+    id: &str,
+    signal_type: &str,
+    data: &serde_json::Value,
+) -> Result<SnapshotSignal> {
+    match signal_type {
+        "execute-snapshot" => {
+            let snapshot_type = data.get("type").and_then(serde_json::Value::as_str);
+            if snapshot_type.is_some_and(|kind| !kind.eq_ignore_ascii_case("incremental")) {
+                return Err(Error::Source(format!(
+                    "SQL Server execute-snapshot signal {id:?} supports only type=incremental"
+                )));
+            }
+            let collections = data_collections(data);
+            if collections.is_empty() {
+                return Err(Error::Source(format!(
+                    "SQL Server execute-snapshot signal {id:?} has no data-collections"
+                )));
+            }
+            compile_collection_patterns(&collections)?;
+            let mut additional_conditions = BTreeMap::new();
+            if let Some(values) = data
+                .get("additional-conditions")
+                .and_then(serde_json::Value::as_array)
+            {
+                for value in values {
+                    let collection = value
+                        .get("data-collection")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            Error::Source(format!(
+                                "SQL Server execute-snapshot signal {id:?} has an invalid additional-condition"
+                            ))
+                        })?;
+                    let filter = value
+                        .get("filter")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            Error::Source(format!(
+                                "SQL Server execute-snapshot signal {id:?} has an invalid additional-condition"
+                            ))
+                        })?;
+                    compile_collection_patterns(&[collection.into()])?;
+                    additional_conditions.insert(collection.into(), filter.into());
+                }
+            }
+            Ok(SnapshotSignal::Execute {
+                id: id.into(),
+                data_collections: collections,
+                additional_conditions,
+            })
+        }
+        "stop-snapshot" => Ok(SnapshotSignal::Stop {
+            id: id.into(),
+            data_collections: data_collections(data),
+        }),
+        "pause-snapshot" => Ok(SnapshotSignal::Pause { id: id.into() }),
+        "resume-snapshot" => Ok(SnapshotSignal::Resume { id: id.into() }),
+        other => Ok(SnapshotSignal::Unsupported {
+            id: id.into(),
+            signal_type: other.into(),
+        }),
+    }
+}
+
+fn data_collections(data: &serde_json::Value) -> Vec<String> {
+    data.get("data-collections")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn compile_collection_patterns(patterns: &[String]) -> Result<Vec<regex::Regex>> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            regex::Regex::new(&format!(r"^(?:{pattern})$")).map_err(|error| {
+                Error::Source(format!(
+                    "invalid SQL Server snapshot collection pattern {pattern:?}: {error}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn collection_matches_any(collection: &str, patterns: &[regex::Regex]) -> bool {
+    patterns.iter().any(|pattern| pattern.is_match(collection))
+}
+
+fn validate_key_width(columns: &[String], key: &[SqlServerKeyValue], boundary: &str) -> Result<()> {
+    if columns.len() != key.len() {
+        return Err(Error::State(format!(
+            "SQL Server incremental snapshot {boundary} key has {} values for {} primary-key columns",
+            key.len(),
+            columns.len()
+        )));
+    }
+    Ok(())
+}
+
+fn sqlserver_key_from_projection(
+    row: &TdsRow,
+    key_fields: &[(usize, &FieldSchema)],
+) -> Result<Vec<SqlServerKeyValue>> {
+    key_fields
+        .iter()
+        .enumerate()
+        .map(|(projection_index, (_, field))| {
+            convert_tds_value(row, projection_index, &field.type_name)
+                .and_then(|value| sqlserver_key_from_data_value(&value))
+        })
+        .collect()
+}
+
+fn sqlserver_key_from_data_value(value: &DataValue) -> Result<SqlServerKeyValue> {
+    match value {
+        DataValue::Boolean(value) => Ok(SqlServerKeyValue::Boolean(*value)),
+        DataValue::Int32(value) => Ok(SqlServerKeyValue::Int32(*value)),
+        DataValue::Int64(value) => Ok(SqlServerKeyValue::Int64(*value)),
+        DataValue::UInt64(value) => Ok(SqlServerKeyValue::UInt64(*value)),
+        DataValue::Float64(value) if value.is_finite() => {
+            Ok(SqlServerKeyValue::Float64(value.to_bits()))
+        }
+        DataValue::Decimal(value) => Ok(SqlServerKeyValue::Decimal(value.clone())),
+        DataValue::String(value) => Ok(SqlServerKeyValue::String(value.clone())),
+        DataValue::Bytes(value) => Ok(SqlServerKeyValue::Bytes(value.clone())),
+        DataValue::Date(value) => Ok(SqlServerKeyValue::Date(value.clone())),
+        DataValue::Time(value) => Ok(SqlServerKeyValue::Time(value.clone())),
+        DataValue::Timestamp(value) => Ok(SqlServerKeyValue::Timestamp(value.clone())),
+        DataValue::Uuid(value) => Ok(SqlServerKeyValue::Uuid(*value)),
+        DataValue::Null => Err(Error::Source(
+            "SQL Server incremental snapshot primary key contains NULL".into(),
+        )),
+        other => Err(Error::Source(format!(
+            "SQL Server incremental snapshot primary key has unsupported value {other:?}"
+        ))),
+    }
+}
+
+fn sqlserver_key_literal(value: &SqlServerKeyValue) -> Result<String> {
+    match value {
+        SqlServerKeyValue::Boolean(value) => Ok(u8::from(*value).to_string()),
+        SqlServerKeyValue::Int32(value) => Ok(value.to_string()),
+        SqlServerKeyValue::Int64(value) => Ok(value.to_string()),
+        SqlServerKeyValue::UInt64(value) => Ok(value.to_string()),
+        SqlServerKeyValue::Float64(bits) => {
+            let value = f64::from_bits(*bits);
+            if value.is_finite() {
+                Ok(value.to_string())
+            } else {
+                Err(Error::State(
+                    "SQL Server incremental snapshot key contains a non-finite float".into(),
+                ))
+            }
+        }
+        SqlServerKeyValue::Decimal(value) => {
+            let unsigned = value
+                .strip_prefix('-')
+                .or_else(|| value.strip_prefix('+'))
+                .unwrap_or(value);
+            let mut parts = unsigned.split('.');
+            let whole = parts.next().unwrap_or_default();
+            let fraction = parts.next();
+            if whole.is_empty()
+                || !whole.chars().all(|character| character.is_ascii_digit())
+                || fraction.is_some_and(|fraction| {
+                    fraction.is_empty()
+                        || !fraction.chars().all(|character| character.is_ascii_digit())
+                })
+                || parts.next().is_some()
+            {
+                return Err(Error::State(format!(
+                    "SQL Server incremental snapshot has invalid decimal key {value:?}"
+                )));
+            }
+            Ok(value.clone())
+        }
+        SqlServerKeyValue::Bytes(value) => Ok(format!("0x{}", hex::encode(value))),
+        SqlServerKeyValue::String(value)
+        | SqlServerKeyValue::Date(value)
+        | SqlServerKeyValue::Time(value)
+        | SqlServerKeyValue::Timestamp(value) => Ok(format!("N'{}'", quote_literal(value))),
+        SqlServerKeyValue::Uuid(value) => Ok(format!("N'{value}'")),
+    }
+}
+
+fn sqlserver_key_predicate(
+    columns: &[String],
+    key: &[SqlServerKeyValue],
+    greater: bool,
+) -> Result<String> {
+    validate_key_width(columns, key, if greater { "last" } else { "maximum" })?;
+    let literals = key
+        .iter()
+        .map(sqlserver_key_literal)
+        .collect::<Result<Vec<_>>>()?;
+    let mut terms = Vec::new();
+    for index in 0..columns.len() {
+        let mut comparisons = (0..index)
+            .map(|prefix| format!("{} = {}", columns[prefix], literals[prefix]))
+            .collect::<Vec<_>>();
+        comparisons.push(format!(
+            "{} {} {}",
+            columns[index],
+            if greater { ">" } else { "<" },
+            literals[index]
+        ));
+        terms.push(format!("({})", comparisons.join(" AND ")));
+    }
+    if !greater {
+        terms.push(format!(
+            "({})",
+            columns
+                .iter()
+                .zip(&literals)
+                .map(|(column, literal)| format!("{column} = {literal}"))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        ));
+    }
+    Ok(format!("({})", terms.join(" OR ")))
+}
+
+fn sqlserver_incremental_position(
+    base: &SourcePosition,
+    event_serial: u64,
+) -> Result<SourcePosition> {
+    let SourcePosition::SqlServer(position) = base else {
+        return Err(Error::State(
+            "SQL Server incremental snapshot requires a SQL Server position".into(),
+        ));
+    };
+    Ok(SourcePosition::SqlServer(SqlServerPosition {
+        database: position.database.clone(),
+        commit_lsn: position.commit_lsn.clone(),
+        change_lsn: position.change_lsn.clone(),
+        event_serial: position.event_serial.saturating_add(event_serial),
+        snapshot: false,
+    }))
+}
+
+async fn emit_incremental_checkpoint(
+    output: &tokio::sync::mpsc::Sender<Result<SourceRecord>>,
+    progress: Option<&IncrementalSnapshotProgress>,
+    completed_signal_ids: &[String],
+    position: &SourcePosition,
+    acknowledgement: Option<SignalAcknowledgement>,
+) -> Result<()> {
+    output
+        .send(Ok(SourceRecord {
+            event: None,
+            position: position.clone(),
+            boundary: RecordBoundary::Heartbeat,
+            connector_state: Some(encode_connector_state(progress, completed_signal_ids)?),
+            signal_acknowledgements: acknowledgement.into_iter().collect(),
+        }))
+        .await
+        .map_err(|_| Error::Cancelled)
 }
 
 async fn execute_heartbeat_action(mut connection: SqlClient, query: String) -> Result<SqlClient> {
@@ -524,6 +1538,16 @@ impl StreamingState {
             self.resume_position = None;
             false
         }
+    }
+
+    fn safe_position(&self, database: &str) -> SourcePosition {
+        sqlserver_position(
+            database,
+            &self.cursor.commit_lsn,
+            &self.cursor.change_lsn,
+            COMMIT_SERIAL,
+            false,
+        )
     }
 }
 
@@ -742,10 +1766,12 @@ async fn discover_captures(
         .map_err(sqlserver_error)?;
     let mut captures = Vec::new();
     let mut selected_tables = HashMap::new();
+    let signal_table = signal_table_key(config);
     for row in rows {
         let schema = required_string(&row, "schema_name")?;
         let table = required_string(&row, "table_name")?;
-        if !config.tables.includes(&schema, &table) {
+        let is_signal = signal_table.as_ref() == Some(&(schema.clone(), table.clone()));
+        if !config.tables.includes(&schema, &table) && !is_signal {
             continue;
         }
         if selected_tables
@@ -1361,6 +2387,44 @@ mod tests {
         assert!(query.contains("TOP (513)"));
         assert!(query.contains("cdc.[dbo_orders_CT]"));
         assert!(query.contains("ORDER BY commit_lsn, change_lsn, operation"));
+    }
+
+    #[test]
+    fn builds_composite_sqlserver_keyset_predicates() {
+        let columns = vec!["ct.[tenant_id]".into(), "ct.[id]".into()];
+        let key = vec![SqlServerKeyValue::Int32(7), SqlServerKeyValue::Int64(42)];
+        assert_eq!(
+            sqlserver_key_predicate(&columns, &key, true).unwrap(),
+            "((ct.[tenant_id] > 7) OR (ct.[tenant_id] = 7 AND ct.[id] > 42))"
+        );
+        assert_eq!(
+            sqlserver_key_predicate(&columns, &key, false).unwrap(),
+            "((ct.[tenant_id] < 7) OR (ct.[tenant_id] = 7 AND ct.[id] < 42) OR (ct.[tenant_id] = 7 AND ct.[id] = 42))"
+        );
+    }
+
+    #[test]
+    fn validates_sqlserver_signal_table_layout() {
+        let capture = CaptureTable {
+            schema: "dbo".into(),
+            table: "rustium_signal".into(),
+            capture_instance: "dbo_rustium_signal".into(),
+            source_object_id: 42,
+            event_schema: EventSchema {
+                name: "signal".into(),
+                version: 1,
+                fields: ["id", "type", "data"]
+                    .into_iter()
+                    .map(|name| FieldSchema {
+                        name: name.into(),
+                        type_name: "nvarchar(max)".into(),
+                        optional: false,
+                        primary_key: name == "id",
+                    })
+                    .collect(),
+            },
+        };
+        assert!(validate_signal_schema(&capture).is_ok());
     }
 
     #[test]

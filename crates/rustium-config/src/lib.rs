@@ -286,6 +286,23 @@ impl SourceConfig {
                     config.heartbeat_topic_name.as_deref(),
                 );
                 semantic
+                    .as_object_mut()
+                    .expect("source semantic is an object")
+                    .insert(
+                        "signals".into(),
+                        serde_json::json!({
+                            "data_collection": config.signal_data_collection,
+                            "enabled_channels": config.signal_enabled_channels,
+                            "file": config.signal_file,
+                            "poll_interval_ms": config.signal_poll_interval.as_millis(),
+                            "chunk_size": config.incremental_snapshot_chunk_size,
+                            "watermarking_strategy": config.incremental_snapshot_watermarking_strategy,
+                            "kafka_topic": config.signal_kafka_topic,
+                            "kafka_bootstrap_servers": config.signal_kafka_bootstrap_servers,
+                            "kafka_group_id": config.signal_kafka_group_id,
+                        }),
+                    );
+                semantic
             }
         }
     }
@@ -796,6 +813,30 @@ pub struct SqlServerSourceConfig {
     pub heartbeat_topics_prefix: String,
     #[serde(default)]
     pub heartbeat_topic_name: Option<String>,
+    #[serde(default)]
+    pub signal_data_collection: Option<String>,
+    #[serde(default = "default_signal_enabled_channels")]
+    pub signal_enabled_channels: Vec<String>,
+    #[serde(default = "default_signal_file")]
+    pub signal_file: String,
+    #[serde(default = "default_signal_poll_interval")]
+    #[serde(with = "humantime_serde")]
+    pub signal_poll_interval: Duration,
+    #[serde(default = "default_incremental_snapshot_chunk_size")]
+    pub incremental_snapshot_chunk_size: usize,
+    #[serde(default = "default_incremental_snapshot_watermarking_strategy")]
+    pub incremental_snapshot_watermarking_strategy: String,
+    #[serde(default)]
+    pub signal_kafka_topic: Option<String>,
+    #[serde(default)]
+    pub signal_kafka_bootstrap_servers: Vec<String>,
+    #[serde(default = "default_signal_kafka_group_id")]
+    pub signal_kafka_group_id: String,
+    #[serde(default = "default_signal_kafka_poll_timeout")]
+    #[serde(with = "humantime_serde")]
+    pub signal_kafka_poll_timeout: Duration,
+    #[serde(default)]
+    pub signal_kafka_consumer_properties: BTreeMap<String, String>,
 }
 
 impl SqlServerSourceConfig {
@@ -815,6 +856,88 @@ impl SqlServerSourceConfig {
             self.heartbeat_topic_name.as_deref(),
             self.heartbeat_action_query.as_deref(),
         )?;
+        if self.incremental_snapshot_chunk_size == 0 {
+            return Err(Error::Configuration(
+                "source.incremental_snapshot_chunk_size must be greater than zero".into(),
+            ));
+        }
+        if self.incremental_snapshot_watermarking_strategy != "insert_insert" {
+            return Err(Error::Configuration(
+                "source.incremental_snapshot_watermarking_strategy currently supports only insert_insert"
+                    .into(),
+            ));
+        }
+        if self.signal_poll_interval.is_zero() {
+            return Err(Error::Configuration(
+                "source.signal_poll_interval must be greater than zero".into(),
+            ));
+        }
+        if self.signal_enabled_channels.iter().any(|channel| {
+            channel.trim().is_empty()
+                || !matches!(channel.as_str(), "source" | "file" | "in-process" | "kafka")
+        }) {
+            return Err(Error::Configuration(
+                "source.signal_enabled_channels currently supports source, file, in-process, and kafka for SQL Server"
+                    .into(),
+            ));
+        }
+        if self
+            .signal_enabled_channels
+            .iter()
+            .any(|channel| channel == "file")
+            && self.signal_file.trim().is_empty()
+        {
+            return Err(Error::Configuration(
+                "source.signal_file must not be empty when the file signal channel is enabled"
+                    .into(),
+            ));
+        }
+        if let Some(collection) = &self.signal_data_collection {
+            validate_sqlserver_signal_collection(collection, &self.databases[0])?;
+        }
+        if self
+            .signal_enabled_channels
+            .iter()
+            .any(|channel| channel == "kafka")
+        {
+            if self.signal_kafka_bootstrap_servers.is_empty()
+                || self
+                    .signal_kafka_bootstrap_servers
+                    .iter()
+                    .any(|server| server.trim().is_empty())
+            {
+                return Err(Error::Configuration(
+                    "source.signal_kafka_bootstrap_servers must contain at least one server when the kafka signal channel is enabled"
+                        .into(),
+                ));
+            }
+            if self.signal_kafka_group_id.trim().is_empty() {
+                return Err(Error::Configuration(
+                    "source.signal_kafka_group_id must not be empty when the kafka signal channel is enabled"
+                        .into(),
+                ));
+            }
+            if self
+                .signal_kafka_topic
+                .as_deref()
+                .is_some_and(|topic| topic.trim().is_empty())
+            {
+                return Err(Error::Configuration(
+                    "source.signal_kafka_topic must not be empty when configured".into(),
+                ));
+            }
+            for property in ["enable.auto.commit", "enable.auto.offset.store"] {
+                if self
+                    .signal_kafka_consumer_properties
+                    .get(property)
+                    .is_some_and(|value| !value.eq_ignore_ascii_case("false"))
+                {
+                    return Err(Error::Configuration(format!(
+                        "source.signal_kafka_consumer_properties.{property} must be false so signal offsets follow Rustium checkpoints"
+                    )));
+                }
+            }
+        }
         if !matches!(
             self.snapshot_isolation_mode.as_str(),
             "exclusive" | "snapshot" | "repeatable_read" | "read_committed" | "read_uncommitted"
@@ -825,6 +948,29 @@ impl SqlServerSourceConfig {
         }
         validate_table_patterns(&self.tables)
     }
+}
+
+fn validate_sqlserver_signal_collection(collection: &str, database: &str) -> Result<()> {
+    let parts = collection.split('.').collect::<Vec<_>>();
+    let (schema, table) = match parts.as_slice() {
+        [schema, table] => (*schema, *table),
+        [configured_database, schema, table] if configured_database == &database => {
+            (*schema, *table)
+        }
+        [configured_database, _, _] => {
+            return Err(Error::Configuration(format!(
+                "source.signal_data_collection database {configured_database:?} does not match {database:?}"
+            )));
+        }
+        _ => {
+            return Err(Error::Configuration(
+                "source.signal_data_collection must be schema.table or database.schema.table for SQL Server"
+                    .into(),
+            ));
+        }
+    };
+    validate_name(schema, "source.signal_data_collection schema")?;
+    validate_name(table, "source.signal_data_collection table")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

@@ -132,6 +132,17 @@ async fn snapshots_and_streams_cdc_changes() {
         heartbeat_action_query: None,
         heartbeat_topics_prefix: "__debezium-heartbeat".into(),
         heartbeat_topic_name: None,
+        signal_data_collection: None,
+        signal_enabled_channels: vec!["source".into()],
+        signal_file: "file-signals.txt".into(),
+        signal_poll_interval: Duration::from_secs(5),
+        incremental_snapshot_chunk_size: 1_024,
+        incremental_snapshot_watermarking_strategy: "insert_insert".into(),
+        signal_kafka_topic: None,
+        signal_kafka_bootstrap_servers: Vec::new(),
+        signal_kafka_group_id: "kafka-signal".into(),
+        signal_kafka_poll_timeout: Duration::from_millis(100),
+        signal_kafka_consumer_properties: std::collections::BTreeMap::new(),
     };
     let mut source = SqlServerSource::new(
         "inventory-sqlserver",

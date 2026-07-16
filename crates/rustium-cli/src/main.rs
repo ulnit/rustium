@@ -139,6 +139,11 @@ fn in_process_signals_enabled(config: &Config) -> bool {
             .signal_enabled_channels
             .iter()
             .any(|channel| channel == "in-process")
+    }) || config.source.as_sqlserver().is_some_and(|source| {
+        source
+            .signal_enabled_channels
+            .iter()
+            .any(|channel| channel == "in-process")
     })
 }
 
@@ -171,6 +176,19 @@ fn build_kafka_signal_channel(config: &Config) -> Result<Option<KafkaSignalChann
             source.signal_kafka_consumer_properties.clone(),
         ))
     } else if let Some(source) = config.source.as_mysql()
+        && source
+            .signal_enabled_channels
+            .iter()
+            .any(|channel| channel == "kafka")
+    {
+        Some((
+            source.signal_kafka_bootstrap_servers.clone(),
+            source.signal_kafka_topic.clone(),
+            source.signal_kafka_group_id.clone(),
+            source.signal_kafka_poll_timeout,
+            source.signal_kafka_consumer_properties.clone(),
+        ))
+    } else if let Some(source) = config.source.as_sqlserver()
         && source
             .signal_enabled_channels
             .iter()
@@ -270,7 +288,10 @@ fn build_encoder(config: &Config) -> Arc<dyn EventEncoder> {
             source.heartbeat_topics_prefix.clone(),
             source.heartbeat_topic_name.clone(),
         ),
-        SourceConfig::Sqlserver(_) => ("__debezium-heartbeat".into(), None),
+        SourceConfig::Sqlserver(source) => (
+            source.heartbeat_topics_prefix.clone(),
+            source.heartbeat_topic_name.clone(),
+        ),
     };
     let encoder_config = JsonEncoderConfig {
         topic_prefix: config.sink.topic_prefix().into(),

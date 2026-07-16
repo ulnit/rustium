@@ -14,14 +14,19 @@ chrono.workspace = true
 futures.workspace = true
 hex.workspace = true
 indexmap.workspace = true
+regex.workspace = true
 rustium-config = { path = "../rustium-config" }
 rustium-core = { path = "../rustium-core" }
+serde.workspace = true
 serde_json.workspace = true
 tiberius.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

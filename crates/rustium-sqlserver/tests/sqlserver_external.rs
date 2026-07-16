@@ -6,8 +6,8 @@ use std::{
 
 use rustium_config::{SnapshotConfig, SnapshotMode, SqlServerSourceConfig, TableSelection};
 use rustium_core::{
-    Checkpoint, DataValue, Operation, RecordBoundary, SourceConnector, SourceContext,
-    SourcePosition, SourceRecord, SqlServerPosition,
+    Checkpoint, ConnectorStateEnvelope, DataValue, Operation, RecordBoundary, SignalRecord,
+    SignalSender, SourceConnector, SourceContext, SourcePosition, SourceRecord, SqlServerPosition,
 };
 use rustium_sqlserver::SqlServerSource;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
@@ -63,6 +63,17 @@ impl TestSettings {
             heartbeat_action_query: None,
             heartbeat_topics_prefix: "__debezium-heartbeat".into(),
             heartbeat_topic_name: None,
+            signal_data_collection: None,
+            signal_enabled_channels: vec!["source".into()],
+            signal_file: "file-signals.txt".into(),
+            signal_poll_interval: Duration::from_secs(5),
+            incremental_snapshot_chunk_size: 1_024,
+            incremental_snapshot_watermarking_strategy: "insert_insert".into(),
+            signal_kafka_topic: None,
+            signal_kafka_bootstrap_servers: Vec::new(),
+            signal_kafka_group_id: "kafka-signal".into(),
+            signal_kafka_poll_timeout: Duration::from_millis(100),
+            signal_kafka_consumer_properties: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -625,6 +636,320 @@ async fn orders_concurrent_transactions_by_commit_lsn() -> TestResult {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external SQL Server 2017+ instance with CDC and SQL Server Agent enabled"]
+async fn resumes_incremental_snapshot_with_persisted_keyset() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_incremental_{}", &suffix[..12]);
+    let capture_instance = format!("rustium_inc_cap_{}", &suffix[..12]);
+    let connector_name = format!("sqlserver-incremental-{}", &suffix[..12]);
+    let signal_id = format!("sqlserver-signal-{}", &suffix[..12]);
+    let mut client = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        execute_batch(
+            &mut client,
+            &format!(
+                "CREATE TABLE dbo.{table_name} (id bigint NOT NULL PRIMARY KEY, value nvarchar(50) NOT NULL); \
+                 INSERT INTO dbo.{table_name} VALUES (1, N'one'), (2, N'two'), (3, N'three'); \
+                 EXEC sys.sp_cdc_enable_table \
+                    @source_schema=N'dbo', \
+                    @source_name=N'{table_name}', \
+                    @capture_instance=N'{capture_instance}', \
+                    @role_name=NULL, \
+                    @supports_net_changes=0;"
+            ),
+        )
+        .await?;
+        wait_for_capture_instance(&mut client, &capture_instance).await?;
+
+        let mut config = settings.source_config(&table_name);
+        config.signal_enabled_channels = vec!["in-process".into()];
+        config.incremental_snapshot_chunk_size = 1;
+        let mut source = SqlServerSource::new(
+            &connector_name,
+            config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, signal_sender, cancellation, source_task) =
+            start_source_with_signals(source, None);
+        signal_sender
+            .send(SignalRecord::new(
+                &signal_id,
+                "execute-snapshot",
+                serde_json::json!({
+                    "type": "incremental",
+                    "data-collections": [format!("dbo\\.{}", table_name)]
+                }),
+            ))
+            .await?;
+        let first_checkpoint: TestResult<(SourcePosition, ConnectorStateEnvelope)> = async {
+            let mut saw_first = false;
+            loop {
+                let record = receive(&mut output).await?;
+                if let Some(event) = &record.event
+                    && event
+                        .source
+                        .attributes
+                        .get("rustium.snapshot.kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("incremental")
+                {
+                    let id = event
+                        .after
+                        .as_ref()
+                        .and_then(|row| row.get("id"))
+                        .and_then(sqlserver_integer);
+                    require(
+                        id == Some(1),
+                        &format!("first SQL Server keyset chunk has id {id:?}, expected 1"),
+                    )?;
+                    saw_first = true;
+                }
+                if saw_first && record.boundary == RecordBoundary::TransactionCommit {
+                    let state = record.connector_state.ok_or_else(|| {
+                        test_error("SQL Server keyset chunk checkpoint has no connector state")
+                    })?;
+                    break Ok((record.position, state));
+                }
+            }
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        let first_checkpoint = combine_capture_and_stop(first_checkpoint, stop_result)?;
+
+        execute_batch(
+            &mut client,
+            &format!(
+                "DELETE FROM dbo.{table_name} WHERE id = 2; \
+                 INSERT INTO dbo.{table_name} VALUES (0, N'zero')"
+            ),
+        )
+        .await?;
+        let checkpoint = Checkpoint {
+            schema_version: 1,
+            connector_name: connector_name.clone(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: first_checkpoint.0.clone(),
+            snapshot_completed: true,
+            config_fingerprint: "sqlserver-keyset-test".into(),
+            updated_at: SystemTime::now(),
+            connector_state: Some(first_checkpoint.1),
+        };
+        let mut source = SqlServerSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, Some(checkpoint));
+        let resumed: TestResult = async {
+            let mut saw_last = false;
+            loop {
+                let record = receive(&mut output).await?;
+                if let Some(event) = &record.event
+                    && event
+                        .source
+                        .attributes
+                        .get("rustium.snapshot.kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("incremental")
+                {
+                    let id = event
+                        .after
+                        .as_ref()
+                        .and_then(|row| row.get("id"))
+                        .and_then(sqlserver_integer);
+                    require(
+                        id == Some(3),
+                        &format!(
+                            "resumed SQL Server keyset chunk has id {id:?}, expected only 3"
+                        ),
+                    )?;
+                    saw_last = true;
+                }
+                if saw_last && record.boundary == RecordBoundary::TransactionCommit {
+                    let state = record.connector_state.ok_or_else(|| {
+                        test_error("completed SQL Server keyset checkpoint has no state")
+                    })?;
+                    let completed = state
+                        .payload
+                        .get("completed_signal_ids")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| {
+                            test_error("completed SQL Server keyset state has no signal IDs")
+                        })?;
+                    require(
+                        completed.iter().any(|id| id.as_str() == Some(&signal_id)),
+                        "SQL Server keyset state did not persist the completed signal ID",
+                    )?;
+                    break Ok(());
+                }
+            }
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(resumed, stop_result)
+    }
+    .await;
+
+    let cleanup_result = cleanup(&mut client, &table_name, &capture_instance).await;
+    let close_result = client.close().await.map_err(boxed_error);
+    match (outcome, cleanup_result, close_result) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), cleanup, close) => {
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("SQL Server incremental cleanup also failed: {cleanup_error}");
+            }
+            if let Err(close_error) = close {
+                eprintln!("SQL Server incremental close also failed: {close_error}");
+            }
+            Err(error)
+        }
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external SQL Server 2017+ instance with CDC and SQL Server Agent enabled"]
+async fn runs_incremental_snapshot_from_source_signal_table() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_source_inc_{}", &suffix[..12]);
+    let signal_table = format!("rustium_signal_{}", &suffix[..12]);
+    let capture_instance = format!("rustium_src_cap_{}", &suffix[..12]);
+    let signal_capture = format!("rustium_sig_cap_{}", &suffix[..12]);
+    let connector_name = format!("sqlserver-source-signal-{}", &suffix[..12]);
+    let mut client = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        execute_batch(
+            &mut client,
+            &format!(
+                "CREATE TABLE dbo.{table_name} (id bigint NOT NULL PRIMARY KEY, value nvarchar(50) NOT NULL); \
+                 CREATE TABLE dbo.{signal_table} (id nvarchar(200) NOT NULL PRIMARY KEY, [type] nvarchar(64) NOT NULL, data nvarchar(max) NOT NULL); \
+                 INSERT INTO dbo.{table_name} VALUES (1, N'one'), (2, N'two'); \
+                 EXEC sys.sp_cdc_enable_table \
+                    @source_schema=N'dbo', @source_name=N'{table_name}', \
+                    @capture_instance=N'{capture_instance}', @role_name=NULL, @supports_net_changes=0; \
+                 EXEC sys.sp_cdc_enable_table \
+                    @source_schema=N'dbo', @source_name=N'{signal_table}', \
+                    @capture_instance=N'{signal_capture}', @role_name=NULL, @supports_net_changes=0;"
+            ),
+        )
+        .await?;
+        wait_for_capture_instance(&mut client, &capture_instance).await?;
+        wait_for_capture_instance(&mut client, &signal_capture).await?;
+
+        let mut config = settings.source_config(&table_name);
+        config.signal_data_collection = Some(format!(
+            "{}.dbo.{}",
+            settings.database, signal_table
+        ));
+        config.signal_enabled_channels = vec!["source".into()];
+        config.incremental_snapshot_chunk_size = 1;
+        let mut source = SqlServerSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let payload = serde_json::json!({
+            "type": "incremental",
+            "data-collections": [format!("dbo\\.{}", table_name)],
+            "additional-conditions": [{
+                "data-collection": format!("dbo\\.{}", table_name),
+                "filter": "id >= 2"
+            }]
+        })
+        .to_string()
+        .replace('\'', "''");
+        execute_batch(
+            &mut client,
+            &format!(
+                "INSERT INTO dbo.{signal_table} (id, [type], data) VALUES (\
+                    N'source-snapshot-1', N'execute-snapshot', \
+                    N'{payload}'\
+                 )"
+            ),
+        )
+        .await?;
+
+        let capture_result: TestResult = async {
+            let mut ids = Vec::new();
+            while ids.is_empty() {
+                let record = receive(&mut output).await?;
+                let Some(event) = record.event else {
+                    continue;
+                };
+                require(
+                    event.source.table.as_deref() != Some(signal_table.as_str()),
+                    "SQL Server source signal row leaked as a business event",
+                )?;
+                if event
+                    .source
+                    .attributes
+                    .get("rustium.snapshot.kind")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("incremental")
+                {
+                    continue;
+                }
+                ids.push(
+                    event
+                        .after
+                        .as_ref()
+                        .and_then(|row| row.get("id"))
+                        .and_then(sqlserver_integer)
+                        .ok_or_else(|| {
+                            test_error("SQL Server source-signaled snapshot row has no id")
+                        })?,
+                );
+            }
+            require(
+                ids == [2],
+                &format!("SQL Server source-signaled snapshot rows are incorrect: {ids:?}"),
+            )
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)
+    }
+    .await;
+
+    let cleanup_result = async {
+        cleanup(&mut client, &signal_table, &signal_capture).await?;
+        cleanup(&mut client, &table_name, &capture_instance).await
+    }
+    .await;
+    let close_result = client.close().await.map_err(boxed_error);
+    match (outcome, cleanup_result, close_result) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), cleanup, close) => {
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("SQL Server source signal cleanup also failed: {cleanup_error}");
+            }
+            if let Err(close_error) = close {
+                eprintln!("SQL Server source signal close also failed: {close_error}");
+            }
+            Err(error)
+        }
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
+    }
+}
+
 async fn run_initial_capture(
     client: &mut SqlClient,
     connector_name: &str,
@@ -830,6 +1155,35 @@ fn start_source(
             .await
     });
     (output_rx, cancellation, source_task)
+}
+
+fn start_source_with_signals(
+    mut source: SqlServerSource,
+    initial_checkpoint: Option<Checkpoint>,
+) -> (
+    mpsc::Receiver<rustium_core::Result<SourceRecord>>,
+    SignalSender,
+    CancellationToken,
+    JoinHandle<rustium_core::Result<()>>,
+) {
+    let (output_tx, output_rx) = mpsc::channel(64);
+    let (signal_sender, signals) = rustium_core::signal_channel(16);
+    let (ack_tx, ack_rx) = watch::channel(None);
+    let cancellation = CancellationToken::new();
+    let source_cancel = cancellation.clone();
+    let source_task = tokio::spawn(async move {
+        let _ack_tx = ack_tx;
+        source
+            .run(SourceContext {
+                output: output_tx,
+                acknowledged: ack_rx,
+                initial_checkpoint,
+                signals,
+                cancellation: source_cancel,
+            })
+            .await
+    });
+    (output_rx, signal_sender, cancellation, source_task)
 }
 
 async fn stop_source(
