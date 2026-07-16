@@ -905,7 +905,9 @@ impl MySqlSource {
                     ).await?;
                 }
                 delivery = context.signals.recv(),
-                    if signal_channel_enabled(&self.config, "in-process") && state.transaction.is_none() => {
+                    if (signal_channel_enabled(&self.config, "in-process")
+                        || signal_channel_enabled(&self.config, "kafka"))
+                        && state.transaction.is_none() => {
                     let delivery = delivery.ok_or_else(|| Error::Source("MySQL runtime signal channel closed".into()))?;
                     let signal = match MySqlIncrementalSnapshot::parse_external_record(delivery.record()) {
                         Ok(signal) => signal,
@@ -2555,6 +2557,11 @@ mod tests {
             signal_poll_interval: std::time::Duration::from_millis(500),
             incremental_snapshot_chunk_size: 1_024,
             incremental_snapshot_watermarking_strategy: "insert_insert".into(),
+            signal_kafka_topic: None,
+            signal_kafka_bootstrap_servers: Vec::new(),
+            signal_kafka_group_id: "kafka-signal".into(),
+            signal_kafka_poll_timeout: std::time::Duration::from_millis(100),
+            signal_kafka_consumer_properties: std::collections::BTreeMap::new(),
         }
     }
 

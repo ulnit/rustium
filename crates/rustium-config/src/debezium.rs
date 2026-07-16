@@ -234,8 +234,7 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
     let mut signal_enabled_channels = Vec::new();
     for channel in &requested_signal_channels {
         let mapped = match channel.as_str() {
-            "source" | "file" | "in-process" => Some(channel.clone()),
-            "kafka" => None,
+            "source" | "file" | "in-process" | "kafka" => Some(channel.clone()),
             "jmx" => Some("in-process".into()),
             _ => None,
         };
@@ -255,10 +254,7 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
             "jmx" => warnings.push(
                 "signal.enabled.channels=jmx is JVM-specific; Rustium maps it to the bounded in-process channel and its SignalSender/HTTP management API".into(),
             ),
-            "source" | "file" | "in-process" => {}
-            "kafka" => warnings.push(
-                "signal.enabled.channels=kafka is recognized for migration but the MySQL Kafka signal consumer is not implemented yet; the channel was ignored".into(),
-            ),
+            "source" | "file" | "in-process" | "kafka" => {}
             _ => warnings.push(format!("signal.enabled.channels={channel} is not implemented and was ignored")),
         }
     }
@@ -361,6 +357,26 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
                 .get("incremental.snapshot.watermarking.strategy")
                 .cloned()
                 .unwrap_or_else(default_incremental_snapshot_watermarking_strategy),
+            signal_kafka_topic: properties.get("signal.kafka.topic").cloned(),
+            signal_kafka_bootstrap_servers: csv_property(
+                properties.get("signal.kafka.bootstrap.servers"),
+            ),
+            signal_kafka_group_id: properties
+                .get("signal.kafka.groupId")
+                .cloned()
+                .unwrap_or_else(default_signal_kafka_group_id),
+            signal_kafka_poll_timeout: duration_ms(
+                properties,
+                "signal.kafka.poll.timeout.ms",
+                default_signal_kafka_poll_timeout(),
+            )?,
+            signal_kafka_consumer_properties: properties
+                .iter()
+                .filter_map(|(key, value)| {
+                    key.strip_prefix("signal.consumer.")
+                        .map(|key| (key.to_string(), value.clone()))
+                })
+                .collect(),
         }),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -1139,8 +1155,12 @@ database.hostname=mysql
 database.user=rustium
 database.password=secret
 topic.prefix=inventory
-signal.enabled.channels=file
+signal.enabled.channels=file,kafka
 signal.file=/run/rustium/signals.jsonl
+signal.kafka.topic=orders-signals
+signal.kafka.bootstrap.servers=kafka-1:9092,kafka-2:9092
+signal.kafka.groupId=orders-signal-group
+signal.kafka.poll.timeout.ms=75
 incremental.snapshot.chunk.size=128
 read.only=true
 signal.consumer.security.protocol=SASL_SSL
@@ -1148,8 +1168,15 @@ signal.consumer.security.protocol=SASL_SSL
         )
         .unwrap();
         let source = config.source.as_mysql().unwrap();
-        assert_eq!(source.signal_enabled_channels, ["file"]);
+        assert_eq!(source.signal_enabled_channels, ["file", "kafka"]);
         assert_eq!(source.signal_file, "/run/rustium/signals.jsonl");
+        assert_eq!(source.signal_kafka_topic.as_deref(), Some("orders-signals"));
+        assert_eq!(
+            source.signal_kafka_bootstrap_servers,
+            ["kafka-1:9092", "kafka-2:9092"]
+        );
+        assert_eq!(source.signal_kafka_group_id, "orders-signal-group");
+        assert_eq!(source.signal_kafka_poll_timeout, Duration::from_millis(75));
         assert_eq!(source.incremental_snapshot_chunk_size, 128);
     }
 

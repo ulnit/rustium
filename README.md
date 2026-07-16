@@ -431,7 +431,7 @@ Checkpoint v1 JSON remains readable, but a completed MySQL v1 checkpoint has no 
 
 MySQL supports source-table, file, and bounded in-process signaling for Debezium-compatible `execute-snapshot`, `pause-snapshot`, `resume-snapshot`, and `stop-snapshot` controls. Incremental snapshots are chunked, ordered by primary key when available, and persisted in connector state so a checkpoint restart resumes the active collection. Java-specific truststore/keystore conversion remains unsupported; wider DDL/type fixtures and an optional Kafka signal consumer are still tracked as follow-up work. When `binlog_row_value_options=PARTIAL_JSON` is enabled, a diff without a complete before image remains explicitly unavailable rather than being guessed.
 
-For MySQL source-table signaling, set `signal.data.collection=database.signal_table` and include the signal table in the connector user's `SELECT` scope. The table must expose `id`, `type`, and `data` columns; the connector does not write to it. File signaling consumes one JSON envelope per line and clears the file only after reading it. In-process signaling uses the same `SignalSender` and HTTP management route as the other connectors. MySQL `signal.enabled.channels=kafka` is accepted only as a migration warning and is not enabled until the connector has a native Kafka signal consumer.
+For MySQL source-table signaling, set `signal.data.collection=database.signal_table` and include the signal table in the connector user's `SELECT` scope. The table must expose `id`, `type`, and `data` columns; the connector does not write to it. File signaling consumes one JSON envelope per line and clears the file only after reading it. In-process signaling uses the same `SignalSender` and HTTP management route as the other connectors. Kafka signaling uses the existing single-partition, checkpoint-coupled `rustium-signal-kafka` channel and the same Debezium topic/key contract.
 
 ### SQL Server
 
@@ -953,7 +953,7 @@ DDL 默认解析失败即停止连接器。可使用 Debezium 兼容参数 `sche
 
 Checkpoint v1 JSON 仍可读取，但已完成的 MySQL v1 checkpoint 不含历史 schema 基线，因此会拒绝恢复。升级后需要重置该 checkpoint 并执行一次新的 initial snapshot，以建立 checkpoint v2 schema history。
 
-MySQL 已支持源表、文件和有界进程内信号，并兼容 Debezium 的 `execute-snapshot`、`pause-snapshot`、`resume-snapshot`、`stop-snapshot` 控制。增量快照按 chunk 执行；优先按主键排序，并将活动进度持久化到 connector state，checkpoint 重启后可继续当前集合。Java 专用 truststore/keystore 转换仍不支持；更广的 DDL/类型样例和可选 Kafka signal consumer 作为后续工作跟踪。启用 `binlog_row_value_options=PARTIAL_JSON` 时，如果 diff 没有完整 before image，仍会明确标记为 unavailable，而不会猜测结果。
+MySQL 已支持源表、文件、进程内和 Kafka signal，并兼容 Debezium 的 `execute-snapshot`、`pause-snapshot`、`resume-snapshot`、`stop-snapshot` 控制。增量快照按 chunk 执行；优先按主键排序，并将活动进度持久化到 connector state，checkpoint 重启后可继续当前集合。Kafka 使用现有的单 partition、与 checkpoint 绑定的 `rustium-signal-kafka` channel 以及同一 Debezium topic/key 合约。Java 专用 truststore/keystore 转换和更广的 DDL/类型样例仍作为后续门槛。启用 `binlog_row_value_options=PARTIAL_JSON` 时，如果 diff 没有完整 before image，仍会明确标记为 unavailable，而不会猜测结果。
 
 MySQL 源表信号需要配置 `signal.data.collection=database.signal_table`，并让连接器用户对信号表具有 `SELECT` 权限；连接器不会向信号表写入数据。信号表必须提供 `id`、`type`、`data` 三列。文件信号每行一个 JSON envelope，读取后清空文件；进程内信号复用其他连接器的 `SignalSender` 和 HTTP 管理端点。`signal.enabled.channels=kafka` 目前仅作为迁移兼容警告接受，在原生 Kafka signal consumer 完成前不会启用。
 

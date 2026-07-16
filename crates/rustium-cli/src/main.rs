@@ -157,28 +157,48 @@ async fn validate(config: Config) -> Result<()> {
 }
 
 fn build_kafka_signal_channel(config: &Config) -> Result<Option<KafkaSignalChannel>> {
-    let Some(source) = config.source.as_postgresql() else {
+    let settings = if let Some(source) = config.source.as_postgresql()
+        && source
+            .signal_enabled_channels
+            .iter()
+            .any(|channel| channel == "kafka")
+    {
+        Some((
+            source.signal_kafka_bootstrap_servers.clone(),
+            source.signal_kafka_topic.clone(),
+            source.signal_kafka_group_id.clone(),
+            source.signal_kafka_poll_timeout,
+            source.signal_kafka_consumer_properties.clone(),
+        ))
+    } else if let Some(source) = config.source.as_mysql()
+        && source
+            .signal_enabled_channels
+            .iter()
+            .any(|channel| channel == "kafka")
+    {
+        Some((
+            source.signal_kafka_bootstrap_servers.clone(),
+            source.signal_kafka_topic.clone(),
+            source.signal_kafka_group_id.clone(),
+            source.signal_kafka_poll_timeout,
+            source.signal_kafka_consumer_properties.clone(),
+        ))
+    } else {
+        None
+    };
+    let Some((bootstrap_servers, configured_topic, group_id, poll_timeout, properties)) = settings
+    else {
         return Ok(None);
     };
-    if !source
-        .signal_enabled_channels
-        .iter()
-        .any(|channel| channel == "kafka")
-    {
-        return Ok(None);
-    }
     let connector_key = config.sink.topic_prefix();
-    let topic = source
-        .signal_kafka_topic
-        .clone()
-        .unwrap_or_else(|| format!("{connector_key}-signal"));
+    let topic = configured_topic.unwrap_or_else(|| format!("{connector_key}-signal"));
     KafkaSignalChannel::new(
-        &source.signal_kafka_bootstrap_servers,
+        &bootstrap_servers,
         connector_key,
         topic,
-        &source.signal_kafka_group_id,
-        source.signal_kafka_poll_timeout,
-        &source.signal_kafka_consumer_properties,
+        &group_id,
+        poll_timeout,
+        &properties,
     )
     .map(Some)
 }

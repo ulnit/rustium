@@ -262,6 +262,9 @@ impl SourceConfig {
                             "poll_interval_ms": config.signal_poll_interval.as_millis(),
                             "chunk_size": config.incremental_snapshot_chunk_size,
                             "watermarking_strategy": config.incremental_snapshot_watermarking_strategy,
+                            "kafka_topic": config.signal_kafka_topic,
+                            "kafka_bootstrap_servers": config.signal_kafka_bootstrap_servers,
+                            "kafka_group_id": config.signal_kafka_group_id,
                         }),
                     );
                 semantic
@@ -555,6 +558,17 @@ pub struct MySqlSourceConfig {
     pub incremental_snapshot_chunk_size: usize,
     #[serde(default = "default_incremental_snapshot_watermarking_strategy")]
     pub incremental_snapshot_watermarking_strategy: String,
+    #[serde(default)]
+    pub signal_kafka_topic: Option<String>,
+    #[serde(default)]
+    pub signal_kafka_bootstrap_servers: Vec<String>,
+    #[serde(default = "default_signal_kafka_group_id")]
+    pub signal_kafka_group_id: String,
+    #[serde(default = "default_signal_kafka_poll_timeout")]
+    #[serde(with = "humantime_serde")]
+    pub signal_kafka_poll_timeout: Duration,
+    #[serde(default)]
+    pub signal_kafka_consumer_properties: BTreeMap<String, String>,
 }
 
 impl MySqlSourceConfig {
@@ -602,10 +616,10 @@ impl MySqlSourceConfig {
         }
         if self.signal_enabled_channels.iter().any(|channel| {
             channel.trim().is_empty()
-                || !matches!(channel.as_str(), "source" | "file" | "in-process")
+                || !matches!(channel.as_str(), "source" | "file" | "in-process" | "kafka")
         }) {
             return Err(Error::Configuration(
-                "source.signal_enabled_channels currently supports source, file, and in-process for MySQL".into(),
+                "source.signal_enabled_channels currently supports source, file, in-process, and kafka for MySQL".into(),
             ));
         }
         if self
@@ -630,6 +644,47 @@ impl MySqlSourceConfig {
             }
             validate_name(database, "source.signal_data_collection database")?;
             validate_name(table, "source.signal_data_collection table")?;
+        }
+        if self
+            .signal_enabled_channels
+            .iter()
+            .any(|channel| channel == "kafka")
+        {
+            if self.signal_kafka_bootstrap_servers.is_empty()
+                || self
+                    .signal_kafka_bootstrap_servers
+                    .iter()
+                    .any(|server| server.trim().is_empty())
+            {
+                return Err(Error::Configuration(
+                    "source.signal_kafka_bootstrap_servers must contain at least one server when the kafka signal channel is enabled".into(),
+                ));
+            }
+            if self.signal_kafka_group_id.trim().is_empty() {
+                return Err(Error::Configuration(
+                    "source.signal_kafka_group_id must not be empty when the kafka signal channel is enabled".into(),
+                ));
+            }
+            if self
+                .signal_kafka_topic
+                .as_deref()
+                .is_some_and(|topic| topic.trim().is_empty())
+            {
+                return Err(Error::Configuration(
+                    "source.signal_kafka_topic must not be empty when configured".into(),
+                ));
+            }
+            for property in ["enable.auto.commit", "enable.auto.offset.store"] {
+                if self
+                    .signal_kafka_consumer_properties
+                    .get(property)
+                    .is_some_and(|value| !value.eq_ignore_ascii_case("false"))
+                {
+                    return Err(Error::Configuration(format!(
+                        "source.signal_kafka_consumer_properties.{property} must be false so signal offsets follow Rustium checkpoints"
+                    )));
+                }
+            }
         }
         if !matches!(
             self.ssl_mode.as_str(),

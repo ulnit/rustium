@@ -135,6 +135,11 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
         signal_poll_interval: Duration::from_millis(500),
         incremental_snapshot_chunk_size: 1_024,
         incremental_snapshot_watermarking_strategy: "insert_insert".into(),
+        signal_kafka_topic: None,
+        signal_kafka_bootstrap_servers: Vec::new(),
+        signal_kafka_group_id: "kafka-signal".into(),
+        signal_kafka_poll_timeout: Duration::from_millis(100),
+        signal_kafka_consumer_properties: std::collections::BTreeMap::new(),
     };
     let mut source = MySqlSource::new(
         "inventory-mysql",
