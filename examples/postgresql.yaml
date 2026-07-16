@@ -33,6 +33,8 @@ source:
   signal_file: file-signals.txt
   signal_poll_interval: 5s
   read_only: false
+  hstore_handling_mode: json
+  interval_handling_mode: postgres
 
 snapshot:
   mode: initial

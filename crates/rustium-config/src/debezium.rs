@@ -196,6 +196,11 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 .get("hstore.handling.mode")
                 .map(|mode| mode.to_ascii_lowercase())
                 .unwrap_or_else(default_hstore_handling_mode),
+            interval_handling_mode: postgres_interval_handling_mode(
+                properties
+                    .get("interval.handling.mode")
+                    .map_or("numeric", String::as_str),
+            )?,
         })),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -1074,6 +1079,16 @@ fn publication_autocreate_mode(mode: &str) -> Result<PublicationAutoCreateMode> 
     }
 }
 
+fn postgres_interval_handling_mode(mode: &str) -> Result<String> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "numeric" => Ok("numeric".into()),
+        "string" => Ok("string".into()),
+        _ => Err(Error::Configuration(format!(
+            "interval.handling.mode={mode:?} must be numeric or string"
+        ))),
+    }
+}
+
 fn postgres_replica_identity_rules(
     value: Option<&String>,
 ) -> Result<Vec<PostgresReplicaIdentityRule>> {
@@ -1278,6 +1293,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "incremental.snapshot.watermarking.strategy",
         "read.only",
         "hstore.handling.mode",
+        "interval.handling.mode",
         "offset.storage.file.filename",
         "bootstrap.servers",
         "rustium.sink.type",
@@ -1377,6 +1393,7 @@ incremental.snapshot.allow.schema.changes=false
 incremental.snapshot.watermarking.strategy=insert_insert
 read.only=true
 hstore.handling.mode=map
+interval.handling.mode=string
 max.queue.size=4096
 max.batch.size=1000
 "#,
@@ -1428,6 +1445,7 @@ max.batch.size=1000
         );
         assert!(source.read_only);
         assert_eq!(source.hstore_handling_mode, "map");
+        assert_eq!(source.interval_handling_mode, "string");
         assert_eq!(
             source.publication_autocreate_mode,
             PublicationAutoCreateMode::Filtered
@@ -1523,6 +1541,16 @@ topic.prefix=app
                 .publication_autocreate_mode,
             PublicationAutoCreateMode::AllTables
         );
+    }
+
+    #[test]
+    fn validates_postgres_interval_handling_modes() {
+        assert_eq!(
+            postgres_interval_handling_mode("numeric").unwrap(),
+            "numeric"
+        );
+        assert_eq!(postgres_interval_handling_mode("STRING").unwrap(), "string");
+        assert!(postgres_interval_handling_mode("postgres").is_err());
     }
 
     #[test]

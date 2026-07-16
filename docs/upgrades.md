@@ -41,6 +41,8 @@ The additive PostgreSQL `source.publish_via_partition_root` flag defaults to fal
 
 The additive PostgreSQL `source.slot_failover` flag defaults to false and is omitted from semantic fingerprint material at that value. Enabling it changes the fingerprint and allows Rustium to create or update a managed logical slot with PostgreSQL 17 failover synchronization. Stop the connector before enabling it, verify that the target is a PostgreSQL 17+ primary, and confirm the role can manage the slot. Older servers and standby nodes retain a regular slot with a warning. External slot ownership rejects the option.
 
+The additive PostgreSQL `source.interval_handling_mode` field defaults to `postgres` and is omitted from semantic fingerprint material at that value, preserving the original PostgreSQL text contract. Debezium properties intentionally default `interval.handling.mode` to `numeric`. Changing to `numeric` or `string` changes the fingerprint and downstream field values, including interval array elements. Stop the connector, review schemas and consumers, and introduce the mode through the normal fingerprinted configuration-change procedure.
+
 ### Checkpoint migration
 
 Checkpoint JSON version 2 adds an optional connector-state envelope. Version 1 JSON without that field remains readable. PostgreSQL and MySQL cannot safely resume a completed version 1 checkpoint without persistent schema history, so they fail closed and require a backup, reset, and new initial snapshot. SQL Server's tested resume path does not depend on connector state and can read version 1 when the source cursor and CDC retention remain valid.
@@ -122,6 +124,8 @@ SQLite storage version 与 JSON checkpoint version 相互独立。Storage migrat
 新增的 PostgreSQL `source.publish_via_partition_root` 标志默认为 false，该值不会进入 semantic fingerprint 材料。启用后 fingerprint 会变化，partition change 的 collection identity 也会改变。Rustium 要求既有 publication 的 `pubviaroot` 值与配置完全一致，因此应先 alter 或重建 publication，再校验变更后的 connector，并审查下游 topic 与 schema subject 是否适配 root-table identity。
 
 新增的 PostgreSQL `source.slot_failover` 标志默认为 false，该值不会进入 semantic fingerprint 材料。启用后 fingerprint 会变化，并允许 Rustium 使用 PostgreSQL 17 failover 同步创建或更新 managed logical slot。启用前应停止 connector，确认目标是 PostgreSQL 17+ 主库，并确认账号有权管理该 slot。旧版本和 standby 节点会记录 warning 并保留普通 slot；external slot ownership 会拒绝该选项。
+
+新增的 PostgreSQL `source.interval_handling_mode` 字段默认为 `postgres`，该值不会进入 semantic fingerprint material，从而保持原 PostgreSQL 文本契约。Debezium properties 有意将 `interval.handling.mode` 默认设为 `numeric`。切换到 `numeric` 或 `string` 会改变 fingerprint 和下游字段值，包括 interval array element。应先停止 connector，审查 schema 和 consumer，再通过正常的 fingerprint 配置变更流程引入该模式。
 
 ### Checkpoint 迁移
 

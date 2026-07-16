@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use crate::{
     schema_history::{IncrementalSnapshotProgress, TableSchema},
-    source::{convert_text_with_hstore_mode, query_table_schema},
+    source::{convert_text_with_modes, query_table_schema},
 };
 
 const EXECUTE_SNAPSHOT: &str = "execute-snapshot";
@@ -819,10 +819,11 @@ fn prepare_chunk(
                     result
                         .get_value(row_index, column_index)
                         .map_or(DataValue::Null, |value| {
-                            convert_text_with_hstore_mode(
+                            convert_text_with_modes(
                                 &value,
                                 &field.type_name,
                                 &input.catalog_config.hstore_handling_mode,
+                                &input.catalog_config.interval_handling_mode,
                             )
                         });
                 Ok((field.name.clone(), value))

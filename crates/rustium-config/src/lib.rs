@@ -273,6 +273,15 @@ impl SourceConfig {
                         "hstore_handling_mode".into(),
                         config.hstore_handling_mode.clone().into(),
                     );
+                if config.interval_handling_mode != default_postgres_interval_handling_mode() {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "interval_handling_mode".into(),
+                            config.interval_handling_mode.clone().into(),
+                        );
+                }
                 semantic
             }
             Self::Mysql(config) => {
@@ -435,6 +444,8 @@ pub struct PostgresSourceConfig {
     pub read_only: bool,
     #[serde(default = "default_hstore_handling_mode")]
     pub hstore_handling_mode: String,
+    #[serde(default = "default_postgres_interval_handling_mode")]
+    pub interval_handling_mode: String,
 }
 
 impl PostgresSourceConfig {
@@ -511,6 +522,14 @@ impl PostgresSourceConfig {
         if !matches!(self.hstore_handling_mode.as_str(), "json" | "map") {
             return Err(Error::Configuration(
                 "source.hstore_handling_mode must be json or map".into(),
+            ));
+        }
+        if !matches!(
+            self.interval_handling_mode.as_str(),
+            "postgres" | "numeric" | "string"
+        ) {
+            return Err(Error::Configuration(
+                "source.interval_handling_mode must be postgres, numeric, or string".into(),
             ));
         }
         if self.signal_poll_interval.is_zero() {
@@ -1804,6 +1823,9 @@ fn default_incremental_snapshot_watermarking_strategy() -> String {
 fn default_hstore_handling_mode() -> String {
     "json".into()
 }
+fn default_postgres_interval_handling_mode() -> String {
+    "postgres".into()
+}
 fn default_signal_enabled_channels() -> Vec<String> {
     vec!["source".into()]
 }
@@ -1936,6 +1958,14 @@ sink:
                 .source
                 .as_postgresql()
                 .unwrap()
+                .interval_handling_mode,
+            "postgres"
+        );
+        assert_eq!(
+            config
+                .source
+                .as_postgresql()
+                .unwrap()
                 .publication_autocreate_mode,
             PublicationAutoCreateMode::Disabled
         );
@@ -1954,6 +1984,10 @@ sink:
         assert!(
             config.source.semantic_config()["slot_failover"].is_null(),
             "disabled failover slots must preserve the old fingerprint shape"
+        );
+        assert!(
+            config.source.semantic_config()["interval_handling_mode"].is_null(),
+            "the native PostgreSQL interval mode must preserve the old fingerprint shape"
         );
     }
 
@@ -2035,6 +2069,34 @@ sink:
         ))
         .unwrap_err();
         assert!(external.to_string().contains("only for a managed"));
+    }
+
+    #[test]
+    fn parses_native_postgresql_interval_handling_mode() {
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  interval_handling_mode: numeric\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .interval_handling_mode,
+            "numeric"
+        );
+        assert_ne!(
+            Config::from_yaml(CONFIG).unwrap().fingerprint(),
+            configured.fingerprint()
+        );
+
+        let invalid = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  interval_handling_mode: invalid\n",
+        ))
+        .unwrap_err();
+        assert!(invalid.to_string().contains("postgres, numeric, or string"));
     }
 
     #[test]

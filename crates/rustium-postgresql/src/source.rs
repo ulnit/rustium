@@ -1495,12 +1495,22 @@ impl StreamingState {
             return Ok(None);
         }
 
-        let before = old_data
-            .as_ref()
-            .map(|row| convert_row(row, &event_schema, &config.hstore_handling_mode));
-        let mut after = new_data
-            .as_ref()
-            .map(|row| convert_row(row, &event_schema, &config.hstore_handling_mode));
+        let before = old_data.as_ref().map(|row| {
+            convert_row(
+                row,
+                &event_schema,
+                &config.hstore_handling_mode,
+                &config.interval_handling_mode,
+            )
+        });
+        let mut after = new_data.as_ref().map(|row| {
+            convert_row(
+                row,
+                &event_schema,
+                &config.hstore_handling_mode,
+                &config.interval_handling_mode,
+            )
+        });
         if let Some(after) = &mut after {
             fill_unavailable(after, before.as_ref(), &event_schema);
         }
@@ -1666,10 +1676,11 @@ fn snapshot_table(
                     let value = result.get_value(row_index, column_index).map_or(
                         DataValue::Null,
                         |value| {
-                            convert_text_with_hstore_mode(
+                            convert_text_with_modes(
                                 &value,
                                 &field.type_name,
                                 &config.hstore_handling_mode,
+                                &config.interval_handling_mode,
                             )
                         },
                     );
@@ -2146,7 +2157,12 @@ pub(crate) fn query_table_schema(
     }))
 }
 
-fn convert_row(row: &RowData, schema: &EventSchema, hstore_handling_mode: &str) -> Row {
+fn convert_row(
+    row: &RowData,
+    schema: &EventSchema,
+    hstore_handling_mode: &str,
+    interval_handling_mode: &str,
+) -> Row {
     row.iter()
         .map(|(name, value)| {
             let type_name = schema
@@ -2156,13 +2172,23 @@ fn convert_row(row: &RowData, schema: &EventSchema, hstore_handling_mode: &str) 
                 .map_or("text", |field| field.type_name.as_str());
             (
                 name.to_string(),
-                convert_value(value, type_name, hstore_handling_mode),
+                convert_value(
+                    value,
+                    type_name,
+                    hstore_handling_mode,
+                    interval_handling_mode,
+                ),
             )
         })
         .collect()
 }
 
-fn convert_value(value: &ColumnValue, type_name: &str, hstore_handling_mode: &str) -> DataValue {
+fn convert_value(
+    value: &ColumnValue,
+    type_name: &str,
+    hstore_handling_mode: &str,
+    interval_handling_mode: &str,
+) -> DataValue {
     match value {
         ColumnValue::Null => DataValue::Null,
         ColumnValue::Binary(value) => DataValue::Bytes(value.to_vec()),
@@ -2170,24 +2196,35 @@ fn convert_value(value: &ColumnValue, type_name: &str, hstore_handling_mode: &st
             let Ok(value) = std::str::from_utf8(value) else {
                 return DataValue::Bytes(value.to_vec());
             };
-            convert_text_with_hstore_mode(value, type_name, hstore_handling_mode)
+            convert_text_with_modes(
+                value,
+                type_name,
+                hstore_handling_mode,
+                interval_handling_mode,
+            )
         }
     }
 }
 
 #[cfg(test)]
 pub(crate) fn convert_text(value: &str, type_name: &str) -> DataValue {
-    convert_text_with_hstore_mode(value, type_name, "json")
+    convert_text_with_modes(value, type_name, "json", "postgres")
 }
 
-pub(crate) fn convert_text_with_hstore_mode(
+pub(crate) fn convert_text_with_modes(
     value: &str,
     type_name: &str,
     hstore_handling_mode: &str,
+    interval_handling_mode: &str,
 ) -> DataValue {
     if let Some(element_type) = type_name.trim().strip_suffix("[]") {
-        return parse_postgres_array(value, element_type, hstore_handling_mode)
-            .unwrap_or_else(|| DataValue::String(value.into()));
+        return parse_postgres_array(
+            value,
+            element_type,
+            hstore_handling_mode,
+            interval_handling_mode,
+        )
+        .unwrap_or_else(|| DataValue::String(value.into()));
     }
     let base_type = unqualified_base_type(type_name);
     match base_type {
@@ -2217,6 +2254,8 @@ pub(crate) fn convert_text_with_hstore_mode(
         "timestamp" | "timestamp without time zone" | "timestamp with time zone" => {
             DataValue::Timestamp(value.into())
         }
+        "interval" => convert_interval(value, interval_handling_mode)
+            .unwrap_or_else(|| DataValue::String(value.into())),
         "bytea" if value.starts_with("\\x") => hex_decode(&value[2..])
             .map_or_else(|| DataValue::String(value.into()), DataValue::Bytes),
         "hstore" => parse_hstore(value).map_or_else(
@@ -2244,6 +2283,309 @@ fn unqualified_base_type(type_name: &str) -> &str {
         .unwrap_or(type_name)
         .trim()
         .trim_matches('"')
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct PostgresInterval {
+    years: i32,
+    months: i32,
+    days: i32,
+    hours: i32,
+    minutes: i32,
+    seconds: f64,
+}
+
+impl PostgresInterval {
+    fn duration_micros(self) -> i64 {
+        const DAYS_PER_MONTH_AVG: f64 = 365.25 / 12.0;
+        let months = i64::from(self.years) * 12 + i64::from(self.months);
+        let days = months as f64 * DAYS_PER_MONTH_AVG + f64::from(self.days);
+        let seconds = (((days * 24.0 + f64::from(self.hours)) * 60.0 + f64::from(self.minutes))
+            * 60.0)
+            + self.seconds;
+        (seconds * 1_000_000.0) as i64
+    }
+
+    fn debezium_iso_string(self) -> String {
+        let seconds = if self.seconds == 0.0 {
+            "0".into()
+        } else {
+            self.seconds.to_string()
+        };
+        format!(
+            "P{}Y{}M{}DT{}H{}M{}S",
+            self.years, self.months, self.days, self.hours, self.minutes, seconds
+        )
+    }
+
+    fn checked_neg(self) -> Option<Self> {
+        Some(Self {
+            years: self.years.checked_neg()?,
+            months: self.months.checked_neg()?,
+            days: self.days.checked_neg()?,
+            hours: self.hours.checked_neg()?,
+            minutes: self.minutes.checked_neg()?,
+            seconds: -self.seconds,
+        })
+    }
+}
+
+fn convert_interval(value: &str, interval_handling_mode: &str) -> Option<DataValue> {
+    if interval_handling_mode == "postgres" {
+        return Some(DataValue::String(value.into()));
+    }
+    let interval = parse_interval(value)?;
+    match interval_handling_mode {
+        "numeric" => Some(DataValue::Int64(interval.duration_micros())),
+        "string" => Some(DataValue::String(interval.debezium_iso_string())),
+        _ => None,
+    }
+}
+
+fn parse_interval(value: &str) -> Option<PostgresInterval> {
+    let value = value.trim();
+    if value.starts_with('P') {
+        parse_iso_interval(value)
+    } else if value.starts_with('@') {
+        parse_verbose_interval(value)
+    } else if value
+        .chars()
+        .any(|character| character.is_ascii_alphabetic())
+    {
+        parse_postgres_interval(value)
+    } else {
+        parse_sql_standard_interval(value)
+    }
+}
+
+fn parse_iso_interval(value: &str) -> Option<PostgresInterval> {
+    let body = value.strip_prefix('P')?;
+    if body.is_empty() {
+        return None;
+    }
+    let mut interval = PostgresInterval::default();
+    let mut in_time = false;
+    let mut token_start = 0;
+    let mut seen = [false; 6];
+    let mut any_component = false;
+
+    for (index, character) in body.char_indices() {
+        if character == 'T' {
+            if in_time || index != token_start {
+                return None;
+            }
+            in_time = true;
+            token_start = index + 1;
+            continue;
+        }
+        let component = match (in_time, character) {
+            (false, 'Y') => Some(0),
+            (false, 'M') => Some(1),
+            (false, 'D') => Some(2),
+            (true, 'H') => Some(3),
+            (true, 'M') => Some(4),
+            (true, 'S') => Some(5),
+            _ if character.is_ascii_digit() || matches!(character, '+' | '-' | '.') => None,
+            _ => return None,
+        };
+        let Some(component) = component else {
+            continue;
+        };
+        if seen[component] || token_start == index {
+            return None;
+        }
+        let token = &body[token_start..index];
+        match component {
+            0 => interval.years = token.parse().ok()?,
+            1 => interval.months = token.parse().ok()?,
+            2 => interval.days = token.parse().ok()?,
+            3 => interval.hours = token.parse().ok()?,
+            4 => interval.minutes = token.parse().ok()?,
+            5 => interval.seconds = parse_interval_seconds(token)?,
+            _ => return None,
+        }
+        seen[component] = true;
+        any_component = true;
+        token_start = index + character.len_utf8();
+    }
+    (any_component && token_start == body.len()).then_some(interval)
+}
+
+fn parse_verbose_interval(value: &str) -> Option<PostgresInterval> {
+    let mut body = value.strip_prefix('@')?.trim();
+    let ago = body.ends_with(" ago");
+    if ago {
+        body = body.strip_suffix(" ago")?.trim_end();
+    }
+    if body == "0" {
+        return Some(PostgresInterval::default());
+    }
+    let tokens = body.split_whitespace().collect::<Vec<_>>();
+    if tokens.is_empty() || !tokens.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut interval = PostgresInterval::default();
+    let mut seen = [false; 6];
+    for pair in tokens.chunks_exact(2) {
+        let component = interval_unit(pair[1])?;
+        if seen[component] {
+            return None;
+        }
+        set_interval_component(&mut interval, component, pair[0])?;
+        seen[component] = true;
+    }
+    if ago {
+        interval.checked_neg()
+    } else {
+        Some(interval)
+    }
+}
+
+fn parse_postgres_interval(value: &str) -> Option<PostgresInterval> {
+    let mut tokens = value.split_whitespace().collect::<Vec<_>>();
+    let mut interval = PostgresInterval::default();
+    if tokens.last().is_some_and(|token| token.contains(':')) {
+        let (hours, minutes, seconds) = parse_interval_clock(tokens.pop()?, None)?;
+        interval.hours = hours;
+        interval.minutes = minutes;
+        interval.seconds = seconds;
+    }
+    if tokens.is_empty() {
+        return Some(interval);
+    }
+    if !tokens.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut seen = [false; 3];
+    for pair in tokens.chunks_exact(2) {
+        let component = interval_unit(pair[1])?;
+        if component > 2 || seen[component] {
+            return None;
+        }
+        set_interval_component(&mut interval, component, pair[0])?;
+        seen[component] = true;
+    }
+    Some(interval)
+}
+
+fn parse_sql_standard_interval(value: &str) -> Option<PostgresInterval> {
+    if value == "0" {
+        return Some(PostgresInterval::default());
+    }
+    let tokens = value.split_whitespace().collect::<Vec<_>>();
+    if tokens.is_empty() || tokens.len() > 3 {
+        return None;
+    }
+    let mut interval = PostgresInterval::default();
+    let mut index = 0;
+    if looks_like_year_month(tokens[index]) {
+        (interval.years, interval.months) = parse_year_month(tokens[index])?;
+        index += 1;
+    }
+    let mut negative_day = false;
+    if index < tokens.len() && !tokens[index].contains(':') {
+        negative_day = tokens[index].starts_with('-');
+        interval.days = tokens[index].parse().ok()?;
+        index += 1;
+    }
+    if index < tokens.len() {
+        if index + 1 != tokens.len() {
+            return None;
+        }
+        let inherited_sign = negative_day.then_some(-1);
+        let (hours, minutes, seconds) = parse_interval_clock(tokens[index], inherited_sign)?;
+        interval.hours = hours;
+        interval.minutes = minutes;
+        interval.seconds = seconds;
+        index += 1;
+    }
+    (index == tokens.len()).then_some(interval)
+}
+
+fn looks_like_year_month(value: &str) -> bool {
+    let unsigned = value
+        .strip_prefix('+')
+        .or_else(|| value.strip_prefix('-'))
+        .unwrap_or(value);
+    unsigned.split_once('-').is_some_and(|(years, months)| {
+        !years.is_empty()
+            && !months.is_empty()
+            && years.bytes().all(|byte| byte.is_ascii_digit())
+            && months.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn parse_year_month(value: &str) -> Option<(i32, i32)> {
+    let (sign, unsigned) = if let Some(value) = value.strip_prefix('-') {
+        (-1, value)
+    } else {
+        (1, value.strip_prefix('+').unwrap_or(value))
+    };
+    let (years, months) = unsigned.split_once('-')?;
+    if months.contains('-') {
+        return None;
+    }
+    Some((
+        years.parse::<i32>().ok()?.checked_mul(sign)?,
+        months.parse::<i32>().ok()?.checked_mul(sign)?,
+    ))
+}
+
+fn parse_interval_clock(value: &str, inherited_sign: Option<i32>) -> Option<(i32, i32, f64)> {
+    let (sign, unsigned) = if let Some(value) = value.strip_prefix('-') {
+        (-1, value)
+    } else if let Some(value) = value.strip_prefix('+') {
+        (1, value)
+    } else {
+        (inherited_sign.unwrap_or(1), value)
+    };
+    let mut components = unsigned.split(':');
+    let hours = components.next()?.parse::<i32>().ok()?;
+    let minutes = components.next()?.parse::<i32>().ok()?;
+    let seconds = parse_interval_seconds(components.next()?)?;
+    if components.next().is_some() || !(0..60).contains(&minutes) || !(0.0..60.0).contains(&seconds)
+    {
+        return None;
+    }
+    Some((
+        hours.checked_mul(sign)?,
+        minutes.checked_mul(sign)?,
+        seconds * f64::from(sign),
+    ))
+}
+
+fn interval_unit(value: &str) -> Option<usize> {
+    match value {
+        "year" | "years" => Some(0),
+        "mon" | "mons" => Some(1),
+        "day" | "days" => Some(2),
+        "hour" | "hours" => Some(3),
+        "min" | "mins" => Some(4),
+        "sec" | "secs" => Some(5),
+        _ => None,
+    }
+}
+
+fn set_interval_component(
+    interval: &mut PostgresInterval,
+    component: usize,
+    value: &str,
+) -> Option<()> {
+    match component {
+        0 => interval.years = value.parse().ok()?,
+        1 => interval.months = value.parse().ok()?,
+        2 => interval.days = value.parse().ok()?,
+        3 => interval.hours = value.parse().ok()?,
+        4 => interval.minutes = value.parse().ok()?,
+        5 => interval.seconds = parse_interval_seconds(value)?,
+        _ => return None,
+    }
+    Some(())
+}
+
+fn parse_interval_seconds(value: &str) -> Option<f64> {
+    let seconds = value.parse::<f64>().ok()?;
+    seconds.is_finite().then_some(seconds)
 }
 
 fn hstore_value(values: BTreeMap<String, Option<String>>, hstore_handling_mode: &str) -> DataValue {
@@ -2408,6 +2750,7 @@ fn parse_postgres_array(
     value: &str,
     element_type: &str,
     hstore_handling_mode: &str,
+    interval_handling_mode: &str,
 ) -> Option<DataValue> {
     let start = value.find('{')?;
     let dimensions = &value[..start];
@@ -2429,6 +2772,7 @@ fn parse_postgres_array(
         delimiter,
         element_type,
         hstore_handling_mode,
+        interval_handling_mode,
     };
     let parsed = parser.parse_array()?;
     parser.skip_whitespace();
@@ -2441,6 +2785,7 @@ struct PostgresArrayParser<'a> {
     delimiter: u8,
     element_type: &'a str,
     hstore_handling_mode: &'a str,
+    interval_handling_mode: &'a str,
 }
 
 impl PostgresArrayParser<'_> {
@@ -2481,10 +2826,11 @@ impl PostgresArrayParser<'_> {
                     b'"' => {
                         self.index += 1;
                         let value = std::str::from_utf8(&value).ok()?;
-                        return Some(convert_text_with_hstore_mode(
+                        return Some(convert_text_with_modes(
                             value,
                             self.element_type,
                             self.hstore_handling_mode,
+                            self.interval_handling_mode,
                         ));
                     }
                     b'\\' => {
@@ -2521,10 +2867,11 @@ impl PostgresArrayParser<'_> {
         if value == "NULL" {
             Some(DataValue::Null)
         } else {
-            Some(convert_text_with_hstore_mode(
+            Some(convert_text_with_modes(
                 value,
                 self.element_type,
                 self.hstore_handling_mode,
+                self.interval_handling_mode,
             ))
         }
     }
@@ -2717,6 +3064,102 @@ mod tests {
     }
 
     #[test]
+    fn converts_all_postgresql_interval_styles_with_debezium_modes() {
+        let positive = PostgresInterval {
+            years: 1,
+            months: 2,
+            days: 3,
+            hours: 4,
+            minutes: 5,
+            seconds: 6.789,
+        };
+        for value in [
+            "1 year 2 mons 3 days 04:05:06.789",
+            "@ 1 year 2 mons 3 days 4 hours 5 mins 6.789 secs",
+            "+1-2 +3 +4:05:06.789",
+            "P1Y2M3DT4H5M6.789S",
+        ] {
+            assert_eq!(parse_interval(value), Some(positive), "value={value}");
+            assert_eq!(
+                convert_text_with_modes(value, "interval", "json", "numeric"),
+                DataValue::Int64(37_091_106_789_000),
+                "value={value}"
+            );
+            assert_eq!(
+                convert_text_with_modes(value, "interval", "json", "string"),
+                DataValue::String("P1Y2M3DT4H5M6.789S".into()),
+                "value={value}"
+            );
+        }
+
+        let negative = PostgresInterval {
+            years: -1,
+            months: -2,
+            days: -3,
+            hours: -4,
+            minutes: -5,
+            seconds: -6.789,
+        };
+        for value in [
+            "-1 years -2 mons -3 days -04:05:06.789",
+            "@ 1 year 2 mons 3 days 4 hours 5 mins 6.789 secs ago",
+            "-1-2 -3 -4:05:06.789",
+            "P-1Y-2M-3DT-4H-5M-6.789S",
+        ] {
+            assert_eq!(parse_interval(value), Some(negative), "value={value}");
+            assert_eq!(
+                convert_text_with_modes(value, "interval", "json", "numeric"),
+                DataValue::Int64(-37_091_106_789_000),
+                "value={value}"
+            );
+        }
+
+        let mixed = PostgresInterval {
+            years: 0,
+            months: 10,
+            days: 3,
+            hours: -4,
+            minutes: -5,
+            seconds: -6.789,
+        };
+        for value in [
+            "10 mons 3 days -04:05:06.789",
+            "@ 10 mons 3 days -4 hours -5 mins -6.789 secs",
+            "+0-10 +3 -4:05:06.789",
+            "P10M3DT-4H-5M-6.789S",
+        ] {
+            assert_eq!(parse_interval(value), Some(mixed), "value={value}");
+        }
+    }
+
+    #[test]
+    fn preserves_legacy_and_malformed_interval_text_and_converts_arrays() {
+        let value = "2 days 03:04:05.006";
+        assert_eq!(
+            convert_text_with_modes(value, "interval", "json", "postgres"),
+            DataValue::String(value.into())
+        );
+        assert_eq!(
+            convert_text_with_modes("not an interval", "interval", "json", "numeric"),
+            DataValue::String("not an interval".into())
+        );
+        assert_eq!(
+            convert_text_with_modes(r#"{"1 day","2 days"}"#, "interval[]", "json", "numeric",),
+            DataValue::Array(vec![
+                DataValue::Int64(86_400_000_000),
+                DataValue::Int64(172_800_000_000),
+            ])
+        );
+        assert_eq!(
+            convert_text_with_modes(r#"{"1 day","2 days"}"#, "interval[]", "json", "string",),
+            DataValue::Array(vec![
+                DataValue::String("P0Y0M1DT0H0M0S".into()),
+                DataValue::String("P0Y0M2DT0H0M0S".into()),
+            ])
+        );
+    }
+
+    #[test]
     fn converts_postgres_text_and_multidimensional_arrays() {
         assert_eq!(
             convert_text(
@@ -2763,7 +3206,7 @@ mod tests {
             }))
         );
         assert_eq!(
-            convert_text_with_hstore_mode(value, "hstore", "map"),
+            convert_text_with_modes(value, "hstore", "map", "postgres"),
             DataValue::Map(BTreeMap::from([
                 ("alpha".into(), DataValue::String("one".into())),
                 (
@@ -2970,6 +3413,7 @@ mod tests {
             incremental_snapshot_watermarking_strategy: "insert_insert".into(),
             read_only: false,
             hstore_handling_mode: "json".into(),
+            interval_handling_mode: "postgres".into(),
         };
         let mut source = PostgresSource::new(
             "inventory-postgresql",

@@ -97,6 +97,7 @@ impl TestSettings {
             incremental_snapshot_watermarking_strategy: "insert_insert".into(),
             read_only: false,
             hstore_handling_mode: "json".into(),
+            interval_handling_mode: "postgres".into(),
         }
     }
 }
@@ -1630,6 +1631,224 @@ async fn keeps_snapshot_and_streaming_type_conversion_identical() -> TestResult 
         eprintln!("PostgreSQL type test cleanup also failed: {cleanup_error}");
     }
     outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ role administrator with logical replication enabled"]
+async fn converts_debezium_interval_modes_across_postgresql_styles() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let role_name = format!("rustium_pg_interval_role_{}", &suffix[..8]);
+    let role_password = format!("rustium-interval-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE ROLE {role_name} LOGIN REPLICATION PASSWORD '{role_password}'; \
+                 GRANT USAGE ON SCHEMA public TO {role_name};"
+            ))
+            .await?;
+
+        for (style_index, style) in ["postgres", "postgres_verbose", "sql_standard", "iso_8601"]
+            .into_iter()
+            .enumerate()
+        {
+            client
+                .batch_execute(&format!(
+                    "ALTER ROLE {role_name} SET IntervalStyle TO '{style}'"
+                ))
+                .await?;
+            for (mode_index, mode) in ["numeric", "string"].into_iter().enumerate() {
+                run_interval_mode_case(
+                    &settings,
+                    &client,
+                    IntervalTestCase {
+                        role_name: &role_name,
+                        role_password: &role_password,
+                        suffix: &suffix,
+                        style_index,
+                        mode_index,
+                        mode,
+                    },
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    let role_cleanup = client
+        .batch_execute(&format!(
+            "DROP OWNED BY {role_name}; DROP ROLE IF EXISTS {role_name};"
+        ))
+        .await;
+    connection_task.abort();
+    if let Err(cleanup_error) = role_cleanup {
+        if outcome.is_ok() {
+            return Err(cleanup_error.into());
+        }
+        eprintln!("PostgreSQL interval role cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
+struct IntervalTestCase<'a> {
+    role_name: &'a str,
+    role_password: &'a str,
+    suffix: &'a str,
+    style_index: usize,
+    mode_index: usize,
+    mode: &'a str,
+}
+
+async fn run_interval_mode_case(
+    settings: &TestSettings,
+    client: &Client,
+    case: IntervalTestCase<'_>,
+) -> TestResult {
+    let IntervalTestCase {
+        role_name,
+        role_password,
+        suffix,
+        style_index,
+        mode_index,
+        mode,
+    } = case;
+    let table_name = format!(
+        "rustium_pg_interval_{style_index}_{mode_index}_{}",
+        &suffix[..8]
+    );
+    let publication = format!(
+        "rustium_interval_pub_{style_index}_{mode_index}_{}",
+        &suffix[..8]
+    );
+    let slot_name = format!(
+        "rustium_interval_slot_{style_index}_{mode_index}_{}",
+        &suffix[..8]
+    );
+    let connector_name = format!(
+        "postgresql-interval-{style_index}-{mode_index}-{}",
+        &suffix[..8]
+    );
+
+    let outcome: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (\
+                    id BIGINT PRIMARY KEY, \
+                    duration INTERVAL NOT NULL, \
+                    durations INTERVAL[] NOT NULL\
+                 ); \
+                 GRANT SELECT ON public.{table_name} TO {role_name}; \
+                 INSERT INTO public.{table_name} VALUES (\
+                    1, \
+                    '1 year 2 mons 3 days 04:05:06.789'::interval, \
+                    ARRAY['1 day'::interval, '2 days'::interval]\
+                 ); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        config.username = role_name.into();
+        config.password = role_password.into();
+        config.interval_handling_mode = mode.into();
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let capture_result: TestResult = async {
+            let snapshot = receive(&mut output).await?;
+            require(
+                snapshot
+                    .event
+                    .as_ref()
+                    .is_some_and(|event| interval_event_matches(event, mode, 1)),
+                "PostgreSQL interval snapshot conversion is incorrect",
+            )?;
+            let completion = receive(&mut output).await?;
+            require(
+                completion.boundary == RecordBoundary::SnapshotComplete,
+                "PostgreSQL interval snapshot did not complete",
+            )?;
+            wait_for_active_slot(client, &slot_name).await?;
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO public.{table_name} VALUES (\
+                            2, \
+                            '1 year 2 mons 3 days 04:05:06.789'::interval, \
+                            ARRAY['1 day'::interval, '2 days'::interval]\
+                         )"
+                    ),
+                    &[],
+                )
+                .await?;
+            loop {
+                let record = receive(&mut output).await?;
+                let Some(event) = record.event else {
+                    continue;
+                };
+                require(
+                    interval_event_matches(&event, mode, 2),
+                    "PostgreSQL interval WAL conversion is incorrect",
+                )?;
+                break;
+            }
+            Ok(())
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)
+    }
+    .await;
+
+    let cleanup_result = cleanup(client, &publication, &slot_name, &[&table_name]).await;
+    match (outcome, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+fn interval_event_matches(event: &rustium_core::ChangeEvent, mode: &str, id: i64) -> bool {
+    let Some(row) = event.after.as_ref() else {
+        return false;
+    };
+    let expected_duration = if mode == "numeric" {
+        DataValue::Int64(37_091_106_789_000)
+    } else {
+        DataValue::String("P1Y2M3DT4H5M6.789S".into())
+    };
+    let expected_durations = if mode == "numeric" {
+        DataValue::Array(vec![
+            DataValue::Int64(86_400_000_000),
+            DataValue::Int64(172_800_000_000),
+        ])
+    } else {
+        DataValue::Array(vec![
+            DataValue::String("P0Y0M1DT0H0M0S".into()),
+            DataValue::String("P0Y0M2DT0H0M0S".into()),
+        ])
+    };
+    event.operation
+        == if id == 1 {
+            Operation::Read
+        } else {
+            Operation::Create
+        }
+        && row.get("id") == Some(&DataValue::Int64(id))
+        && row.get("duration") == Some(&expected_duration)
+        && row.get("durations") == Some(&expected_durations)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
