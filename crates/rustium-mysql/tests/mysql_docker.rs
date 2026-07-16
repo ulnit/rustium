@@ -335,7 +335,7 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
         .connector_state
         .expect("DDL commit should carry updated MySQL schema history");
     assert_eq!(ddl_state.format, "rustium.mysql.schema-history");
-    assert_eq!(ddl_state.version, 1);
+    assert_eq!(ddl_state.version, 3);
 
     let new_record = tokio::time::timeout(Duration::from_secs(20), resumed_rx.recv())
         .await
