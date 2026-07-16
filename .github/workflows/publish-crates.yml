@@ -52,7 +52,7 @@ jobs:
             rustium-sink-stdout \
             rustium-sqlserver \
             rustium-state; do
-            cargo package -p "$package" --locked --allow-dirty --list | grep -Fxq README.md
+            cargo package -p "$package" --locked --allow-dirty --list | grep -Fx README.md >/dev/null
           done
 
   publish-core:
