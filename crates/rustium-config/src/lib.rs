@@ -195,6 +195,15 @@ impl SourceConfig {
                     "slot_name": config.slot_name,
                     "tables": config.tables,
                 });
+                if config.publication_autocreate_mode != PublicationAutoCreateMode::Disabled {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "publication_autocreate_mode".into(),
+                            serde_json::json!(config.publication_autocreate_mode),
+                        );
+                }
                 add_heartbeat_semantics(
                     &mut semantic,
                     config.heartbeat_interval,
@@ -349,6 +358,8 @@ pub struct PostgresSourceConfig {
     pub username: String,
     pub password: String,
     pub publication: String,
+    #[serde(default)]
+    pub publication_autocreate_mode: PublicationAutoCreateMode,
     #[serde(default = "default_slot_name")]
     pub slot_name: String,
     #[serde(default)]
@@ -1065,6 +1076,16 @@ pub enum SlotOwnership {
     #[default]
     Managed,
     External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationAutoCreateMode {
+    #[default]
+    Disabled,
+    AllTables,
+    Filtered,
+    NoTables,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1835,6 +1856,18 @@ sink:
         assert_eq!(
             config.source.as_postgresql().unwrap().hstore_handling_mode,
             "json"
+        );
+        assert_eq!(
+            config
+                .source
+                .as_postgresql()
+                .unwrap()
+                .publication_autocreate_mode,
+            PublicationAutoCreateMode::Disabled
+        );
+        assert!(
+            config.source.semantic_config()["publication_autocreate_mode"].is_null(),
+            "the native default must preserve the pre-autocreate fingerprint shape"
         );
     }
 

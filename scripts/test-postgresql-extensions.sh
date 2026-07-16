@@ -83,3 +83,12 @@ RUSTIUM_POSTGRES_TEST_DATABASE="$database" \
 cargo test -p rustium-postgresql --test postgresql_external --locked -- \
     filters_initial_snapshot_without_narrowing_streaming \
     --ignored --exact --nocapture
+
+RUSTIUM_POSTGRES_TEST_HOST=127.0.0.1 \
+RUSTIUM_POSTGRES_TEST_PORT="$port" \
+RUSTIUM_POSTGRES_TEST_USER=postgres \
+RUSTIUM_POSTGRES_TEST_PASSWORD="$password" \
+RUSTIUM_POSTGRES_TEST_DATABASE="$database" \
+cargo test -p rustium-postgresql --test postgresql_external --locked -- \
+    manages_debezium_publication_autocreate_modes \
+    --ignored --exact --nocapture

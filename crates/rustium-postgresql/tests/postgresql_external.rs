@@ -15,7 +15,8 @@ use rdkafka::{
     util::Timeout,
 };
 use rustium_config::{
-    PostgresSourceConfig, SlotOwnership, SnapshotConfig, SnapshotMode, TableSelection,
+    PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode,
+    TableSelection,
 };
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
@@ -67,6 +68,7 @@ impl TestSettings {
             username: self.user.clone(),
             password: self.password.clone(),
             publication: publication.into(),
+            publication_autocreate_mode: PublicationAutoCreateMode::Disabled,
             slot_name: slot_name.into(),
             slot_ownership: SlotOwnership::Managed,
             tables: TableSelection {
@@ -498,6 +500,223 @@ async fn snapshots_streams_and_resumes_from_checkpoint() -> TestResult {
         eprintln!("PostgreSQL test cleanup also failed: {cleanup_error}");
     }
     outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn manages_debezium_publication_autocreate_modes() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let first_table = format!("rustium_pg_pub_first_{}", &suffix[..10]);
+    let second_table = format!("rustium_pg_pub_second_{}", &suffix[..10]);
+    let dynamic_table = format!("rustium_pg_pub_dynamic_{}", &suffix[..10]);
+    let disabled_publication = format!("rustium_pg_pub_disabled_{}", &suffix[..10]);
+    let all_publication = format!("rustium_pg_pub_all_{}", &suffix[..10]);
+    let filtered_publication = format!("rustium_pg_pub_filtered_{}", &suffix[..10]);
+    let conflicting_publication = format!("rustium_pg_pub_conflict_{}", &suffix[..10]);
+    let dynamic_publication = format!("rustium_pg_pub_empty_{}", &suffix[..10]);
+    let dynamic_slot = format!("rustium_pg_pub_slot_{}", &suffix[..10]);
+    let connector_name = format!("postgresql-publication-{}", &suffix[..10]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{first_table} (id BIGINT PRIMARY KEY, value TEXT NOT NULL); \
+                 CREATE TABLE public.{second_table} (id BIGINT PRIMARY KEY, value TEXT NOT NULL); \
+                 CREATE TABLE public.{dynamic_table} (id BIGINT PRIMARY KEY, value TEXT NOT NULL);"
+            ))
+            .await?;
+
+        let mut disabled_config =
+            settings.source_config(&disabled_publication, "unused_disabled_slot", &first_table);
+        disabled_config.publication_autocreate_mode = PublicationAutoCreateMode::Disabled;
+        let mut disabled_source = PostgresSource::new(
+            format!("{connector_name}-disabled"),
+            disabled_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                ..SnapshotConfig::default()
+            },
+        );
+        let disabled_error = disabled_source.validate().await.unwrap_err();
+        require(
+            disabled_error
+                .to_string()
+                .contains("autocreation is disabled"),
+            "disabled mode did not reject a missing publication",
+        )?;
+
+        let mut all_config =
+            settings.source_config(&all_publication, "unused_all_slot", &first_table);
+        all_config.publication_autocreate_mode = PublicationAutoCreateMode::AllTables;
+        let mut all_source = PostgresSource::new(
+            format!("{connector_name}-all"),
+            all_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                ..SnapshotConfig::default()
+            },
+        );
+        all_source.validate().await?;
+        let all_tables = client
+            .query_one(
+                "SELECT puballtables FROM pg_catalog.pg_publication WHERE pubname = $1",
+                &[&all_publication],
+            )
+            .await?
+            .get::<_, bool>(0);
+        require(all_tables, "all_tables mode did not create FOR ALL TABLES")?;
+
+        let mut filtered_config =
+            settings.source_config(&filtered_publication, "unused_filtered_slot", &first_table);
+        filtered_config.publication_autocreate_mode = PublicationAutoCreateMode::Filtered;
+        let mut filtered_source = PostgresSource::new(
+            format!("{connector_name}-filtered-create"),
+            filtered_config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                ..SnapshotConfig::default()
+            },
+        );
+        filtered_source.validate().await?;
+        require(
+            publication_tables(&client, &filtered_publication).await?
+                == [format!("public.{first_table}")],
+            "filtered mode did not create the exact selected publication table set",
+        )?;
+
+        filtered_config.tables = TableSelection {
+            include: vec![format!(r"public\.{second_table}")],
+            exclude: Vec::new(),
+        };
+        let mut updated_source = PostgresSource::new(
+            format!("{connector_name}-filtered-update"),
+            filtered_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                ..SnapshotConfig::default()
+            },
+        );
+        updated_source.validate().await?;
+        require(
+            publication_tables(&client, &filtered_publication).await?
+                == [format!("public.{second_table}")],
+            "filtered mode did not replace an existing publication table set",
+        )?;
+
+        client
+            .batch_execute(&format!(
+                "CREATE PUBLICATION {conflicting_publication} FOR ALL TABLES"
+            ))
+            .await?;
+        let mut conflicting_config = settings.source_config(
+            &conflicting_publication,
+            "unused_conflicting_slot",
+            &first_table,
+        );
+        conflicting_config.publication_autocreate_mode = PublicationAutoCreateMode::Filtered;
+        let mut conflicting_source = PostgresSource::new(
+            format!("{connector_name}-filtered-conflict"),
+            conflicting_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                ..SnapshotConfig::default()
+            },
+        );
+        let conflicting_error = conflicting_source.validate().await.unwrap_err();
+        require(
+            conflicting_error
+                .to_string()
+                .contains("is FOR ALL TABLES and cannot be updated"),
+            "filtered mode did not reject an existing FOR ALL TABLES publication",
+        )?;
+
+        let mut dynamic_config =
+            settings.source_config(&dynamic_publication, &dynamic_slot, &dynamic_table);
+        dynamic_config.publication_autocreate_mode = PublicationAutoCreateMode::NoTables;
+        let mut dynamic_source = PostgresSource::new(
+            format!("{connector_name}-no-tables"),
+            dynamic_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        dynamic_source.validate().await?;
+        require(
+            publication_tables(&client, &dynamic_publication)
+                .await?
+                .is_empty(),
+            "no_tables mode did not create an empty publication",
+        )?;
+
+        let (mut output, cancellation, source_task) = start_source(dynamic_source, None);
+        let capture_result: TestResult = async {
+            let completion = receive(&mut output).await?;
+            require(
+                completion.boundary == RecordBoundary::SnapshotComplete,
+                "no_tables mode emitted snapshot data for an empty publication",
+            )?;
+            wait_for_active_slot(&client, &dynamic_slot).await?;
+            client
+                .batch_execute(&format!(
+                    "ALTER PUBLICATION {dynamic_publication} ADD TABLE public.{dynamic_table}; \
+                     INSERT INTO public.{dynamic_table} VALUES (1, 'dynamic');"
+                ))
+                .await?;
+
+            loop {
+                let record = receive(&mut output).await?;
+                if record.boundary != RecordBoundary::Data {
+                    continue;
+                }
+                let event = record
+                    .event
+                    .ok_or_else(|| test_error("dynamic publication data record has no event"))?;
+                require(
+                    event.operation == Operation::Create,
+                    "dynamic publication event was not a create",
+                )?;
+                require(
+                    event.after.as_ref().and_then(|row| row.get("value"))
+                        == Some(&DataValue::String("dynamic".into())),
+                    "dynamic publication event payload is incorrect",
+                )?;
+                break;
+            }
+            Ok(())
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)
+    }
+    .await;
+
+    let publication_cleanup = client
+        .batch_execute(&format!(
+            "DROP PUBLICATION IF EXISTS {disabled_publication}; \
+             DROP PUBLICATION IF EXISTS {all_publication}; \
+             DROP PUBLICATION IF EXISTS {filtered_publication}; \
+             DROP PUBLICATION IF EXISTS {conflicting_publication};"
+        ))
+        .await
+        .map_err(|error| -> Box<dyn StdError + Send + Sync> { Box::new(error) });
+    let resource_cleanup = cleanup(
+        &client,
+        &dynamic_publication,
+        &dynamic_slot,
+        &[&first_table, &second_table, &dynamic_table],
+    )
+    .await;
+    connection_task.abort();
+
+    match (outcome, publication_cleanup, resource_cleanup) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), _, _) => Err(error),
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3498,6 +3717,21 @@ async fn type_name_exists(client: &Client, name: Option<&str>) -> TestResult<boo
         .query_one("SELECT to_regtype($1) IS NOT NULL", &[&name])
         .await?
         .get(0))
+}
+
+async fn publication_tables(client: &Client, publication: &str) -> TestResult<Vec<String>> {
+    Ok(client
+        .query(
+            "SELECT schemaname || '.' || tablename \
+             FROM pg_catalog.pg_publication_tables \
+             WHERE pubname = $1 \
+             ORDER BY schemaname, tablename",
+            &[&publication],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect())
 }
 
 fn qualified_name(schema: &str, name: &str) -> String {

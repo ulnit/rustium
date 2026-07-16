@@ -12,7 +12,9 @@ use pg_walstream::{
     RetryConfig, RowData, StreamingMode, parse_lsn,
     sql_builder::{quote_ident, quote_literal},
 };
-use rustium_config::{PostgresSourceConfig, SlotOwnership, SnapshotConfig, SnapshotMode};
+use rustium_config::{
+    PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode,
+};
 use rustium_core::{
     ChangeEvent, DataValue, Error, EventId, EventSchema, FieldSchema, Operation, PostgresPosition,
     RecordBoundary, Result, RetryPolicy, Row, SignalAcknowledgement, SourceConnector,
@@ -95,19 +97,7 @@ impl PostgresSource {
                     "PostgreSQL wal_level must be logical; found {wal_level:?}"
                 )));
             }
-            let publication = quote_literal(&config.publication).map_err(pg_error)?;
-            let publication_exists = scalar(
-                &mut connection,
-                &format!(
-                    "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = {publication})"
-                ),
-            )?;
-            if publication_exists != "t" {
-                return Err(Error::Configuration(format!(
-                    "publication {:?} does not exist",
-                    config.publication
-                )));
-            }
+            ensure_publication(&mut connection, &config)?;
             validate_signal_table(&mut connection, &config)?;
 
             let slot = quote_literal(&config.slot_name).map_err(pg_error)?;
@@ -135,7 +125,9 @@ impl PostgresSource {
         .await
         .map_err(|error| Error::Source(format!("PostgreSQL validation task failed: {error}")))??;
 
-        if schemas.is_empty() {
+        if schemas.is_empty()
+            && self.config.publication_autocreate_mode != PublicationAutoCreateMode::NoTables
+        {
             return Err(Error::Configuration(
                 "the publication and table filters select no tables".into(),
             ));
@@ -240,6 +232,21 @@ impl PostgresSource {
         })
         .await
         .map_err(|error| Error::Source(format!("relation schema task failed: {error}")))?
+    }
+
+    async fn discover_runtime_table_schema(
+        &self,
+        schema: String,
+        table: String,
+    ) -> Result<TableSchema> {
+        let connection_url = self.config.connection_url(false)?;
+        let config = self.config.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connect(&connection_url)?;
+            discover_table_schema(&mut connection, &config, &schema, &table)
+        })
+        .await
+        .map_err(|error| Error::Source(format!("runtime schema task failed: {error}")))?
     }
 
     async fn run_snapshot(
@@ -662,6 +669,37 @@ impl SourceConnector for PostgresSource {
                                 "PostgreSQL table schema refreshed"
                             );
                         }
+                    }
+                    let uncached_table = match &event.event_type {
+                        EventType::Insert { schema, table, .. }
+                        | EventType::Update { schema, table, .. }
+                        | EventType::Delete { schema, table, .. }
+                            if self.config.tables.includes(schema, table)
+                                && !is_signal_table(&self.config, schema, table)
+                                && !state
+                                    .schemas
+                                    .contains_key(&(schema.to_string(), table.to_string())) =>
+                        {
+                            Some((schema.to_string(), table.to_string()))
+                        }
+                        _ => None,
+                    };
+                    if let Some((schema_name, table_name)) = uncached_table {
+                        let discovered = self
+                            .discover_runtime_table_schema(
+                                schema_name.clone(),
+                                table_name.clone(),
+                            )
+                            .await?;
+                        let version = state
+                            .refresh_schema(discovered)
+                            .expect("an uncached PostgreSQL table changes schema state");
+                        info!(
+                            schema = %schema_name,
+                            table = %table_name,
+                            version,
+                            "PostgreSQL table schema discovered from the streaming catalog"
+                        );
                     }
                     let event_lsn = event.lsn.value();
                     let transaction_id = match &event.event_type {
@@ -1635,6 +1673,109 @@ fn discover_tables(
     Ok(schemas)
 }
 
+fn ensure_publication(
+    connection: &mut PgReplicationConnection,
+    config: &PostgresSourceConfig,
+) -> Result<()> {
+    let publication_literal = quote_literal(&config.publication).map_err(pg_error)?;
+    let publication_identifier = quote_ident(&config.publication).map_err(pg_error)?;
+    let result = connection
+        .exec(&format!(
+            "SELECT puballtables::text FROM pg_catalog.pg_publication WHERE pubname = {publication_literal}"
+        ))
+        .map_err(pg_error)?;
+
+    if result.ntuples() == 0 {
+        let statement = match config.publication_autocreate_mode {
+            PublicationAutoCreateMode::Disabled => {
+                return Err(Error::Configuration(format!(
+                    "publication {:?} does not exist and publication autocreation is disabled",
+                    config.publication
+                )));
+            }
+            PublicationAutoCreateMode::AllTables => {
+                format!("CREATE PUBLICATION {publication_identifier} FOR ALL TABLES")
+            }
+            PublicationAutoCreateMode::Filtered => {
+                let tables = selected_publication_tables(connection, config)?;
+                format!(
+                    "CREATE PUBLICATION {publication_identifier} FOR TABLE {}",
+                    qualified_publication_tables(&tables)?
+                )
+            }
+            PublicationAutoCreateMode::NoTables => {
+                format!("CREATE PUBLICATION {publication_identifier}")
+            }
+        };
+        connection.exec(&statement).map_err(pg_error)?;
+        return Ok(());
+    }
+
+    if config.publication_autocreate_mode == PublicationAutoCreateMode::Filtered {
+        let all_tables = required_value(&result, 0, 0, "publication all-tables state")?;
+        if all_tables == "true" || all_tables == "t" {
+            return Err(Error::Configuration(format!(
+                "publication {:?} is FOR ALL TABLES and cannot be updated in filtered mode",
+                config.publication
+            )));
+        }
+        let tables = selected_publication_tables(connection, config)?;
+        connection
+            .exec(&format!(
+                "ALTER PUBLICATION {publication_identifier} SET TABLE {}",
+                qualified_publication_tables(&tables)?
+            ))
+            .map_err(pg_error)?;
+    }
+    Ok(())
+}
+
+fn selected_publication_tables(
+    connection: &mut PgReplicationConnection,
+    config: &PostgresSourceConfig,
+) -> Result<Vec<(String, String)>> {
+    let result = connection
+        .exec(
+            "SELECT n.nspname, c.relname \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind IN ('r', 'p') \
+               AND n.nspname <> 'information_schema' \
+               AND n.nspname !~ '^pg_' \
+             ORDER BY n.nspname, c.relname",
+        )
+        .map_err(pg_error)?;
+    let mut tables = Vec::new();
+    for index in 0..result.ntuples() {
+        let schema = required_value(&result, index, 0, "publication table schema")?;
+        let table = required_value(&result, index, 1, "publication table name")?;
+        if config.tables.includes(&schema, &table) || is_signal_table(config, &schema, &table) {
+            tables.push((schema, table));
+        }
+    }
+    if tables.is_empty() {
+        return Err(Error::Configuration(format!(
+            "publication.autocreate.mode=filtered selected no PostgreSQL tables for publication {:?}",
+            config.publication
+        )));
+    }
+    Ok(tables)
+}
+
+fn qualified_publication_tables(tables: &[(String, String)]) -> Result<String> {
+    tables
+        .iter()
+        .map(|(schema, table)| {
+            Ok(format!(
+                "{}.{}",
+                quote_ident(schema).map_err(pg_error)?,
+                quote_ident(table).map_err(pg_error)?
+            ))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|tables| tables.join(", "))
+}
+
 fn validate_signal_table(
     connection: &mut PgReplicationConnection,
     config: &PostgresSourceConfig,
@@ -2601,6 +2742,7 @@ mod tests {
             username: "rustium".into(),
             password: "secret".into(),
             publication: "orders_publication".into(),
+            publication_autocreate_mode: PublicationAutoCreateMode::Disabled,
             slot_name: "orders_slot".into(),
             slot_ownership: SlotOwnership::Managed,
             tables: TableSelection::default(),

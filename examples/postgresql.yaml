@@ -12,6 +12,7 @@ source:
   username: rustium
   password: ${POSTGRES_PASSWORD}
   publication: rustium_publication
+  publication_autocreate_mode: disabled
   slot_name: rustium_inventory
   slot_ownership: managed
   tables:

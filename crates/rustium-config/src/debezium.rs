@@ -111,6 +111,11 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 .get("publication.name")
                 .cloned()
                 .unwrap_or_else(|| "dbz_publication".into()),
+            publication_autocreate_mode: publication_autocreate_mode(
+                properties
+                    .get("publication.autocreate.mode")
+                    .map_or("all_tables", String::as_str),
+            )?,
             slot_name: properties
                 .get("slot.name")
                 .cloned()
@@ -1048,6 +1053,18 @@ fn snapshot_mode(mode: &str) -> Result<SnapshotMode> {
     }
 }
 
+fn publication_autocreate_mode(mode: &str) -> Result<PublicationAutoCreateMode> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "disabled" => Ok(PublicationAutoCreateMode::Disabled),
+        "all_tables" => Ok(PublicationAutoCreateMode::AllTables),
+        "filtered" => Ok(PublicationAutoCreateMode::Filtered),
+        "no_tables" => Ok(PublicationAutoCreateMode::NoTables),
+        _ => Err(Error::Configuration(format!(
+            "publication.autocreate.mode={mode:?} must be disabled, all_tables, filtered, or no_tables"
+        ))),
+    }
+}
+
 fn csv_property(value: Option<&String>) -> Vec<String> {
     value.map_or_else(Vec::new, |value| split_csv(value))
 }
@@ -1122,6 +1139,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "plugin.name",
         "slot.name",
         "publication.name",
+        "publication.autocreate.mode",
         "snapshot.mode",
         "snapshot.fetch.size",
         "snapshot.include.collection.list",
@@ -1253,6 +1271,7 @@ topic.prefix=app
 plugin.name=pgoutput
 slot.name=orders_slot
 publication.name=orders_pub
+publication.autocreate.mode=filtered
 table.include.list=public\\.(orders|customers)
 snapshot.mode=initial
 snapshot.include.collection.list=public\\.orders
@@ -1327,6 +1346,10 @@ max.batch.size=1000
         );
         assert!(source.read_only);
         assert_eq!(source.hstore_handling_mode, "map");
+        assert_eq!(
+            source.publication_autocreate_mode,
+            PublicationAutoCreateMode::Filtered
+        );
         assert_eq!(config.snapshot.include_collections, [r"public\.orders"]);
         assert!(!config.format.tombstones_on_delete);
         assert!(
@@ -1369,6 +1392,40 @@ incremental.snapshot.allow.schema.changes=true
         )
         .unwrap_err();
         assert!(schema_changes.to_string().contains("allow.schema.changes"));
+    }
+
+    #[test]
+    fn validates_postgres_publication_autocreate_modes() {
+        for (value, expected) in [
+            ("DISABLED", PublicationAutoCreateMode::Disabled),
+            ("All_Tables", PublicationAutoCreateMode::AllTables),
+            ("FILTERED", PublicationAutoCreateMode::Filtered),
+            ("No_Tables", PublicationAutoCreateMode::NoTables),
+        ] {
+            assert_eq!(publication_autocreate_mode(value).unwrap(), expected);
+        }
+        assert!(publication_autocreate_mode("invalid").is_err());
+
+        let config = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .source
+                .as_postgresql()
+                .unwrap()
+                .publication_autocreate_mode,
+            PublicationAutoCreateMode::AllTables
+        );
     }
 
     #[test]
