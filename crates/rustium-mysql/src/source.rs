@@ -2448,7 +2448,7 @@ async fn snapshot_table(
             .event_schema
             .fields
             .iter()
-            .filter(|field| base_type(&field.type_name) != "geometry")
+            .filter(|field| !is_mysql_spatial_type(&field.type_name))
             .map(|field| quote_identifier(&field.name))
             .collect::<Vec<_>>()
     } else {
@@ -2820,17 +2820,12 @@ fn convert_bytes(value: &[u8], type_name: &str) -> DataValue {
             });
         return mysql_set_label(type_name, mask);
     }
-    if matches!(
-        base,
-        "binary"
-            | "varbinary"
-            | "tinyblob"
-            | "blob"
-            | "mediumblob"
-            | "longblob"
-            | "bit"
-            | "geometry"
-    ) {
+    if is_mysql_spatial_type(type_name)
+        || matches!(
+            base,
+            "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" | "bit"
+        )
+    {
         return DataValue::Bytes(value.to_vec());
     }
     let Ok(value) = std::str::from_utf8(value) else {
@@ -3060,6 +3055,20 @@ fn base_type(type_name: &str) -> &str {
         .trim()
 }
 
+fn is_mysql_spatial_type(type_name: &str) -> bool {
+    matches!(
+        base_type(type_name),
+        "geometry"
+            | "point"
+            | "linestring"
+            | "polygon"
+            | "multipoint"
+            | "multilinestring"
+            | "multipolygon"
+            | "geometrycollection"
+    )
+}
+
 fn format_mysql_datetime(
     year: u16,
     month: u8,
@@ -3191,6 +3200,21 @@ mod tests {
             mysql_type_members(r"enum('plain','it\'s','a''b')"),
             Some(vec!["plain".into(), "it's".into(), "a'b".into()])
         );
+        for type_name in [
+            "geometry",
+            "point",
+            "linestring",
+            "polygon",
+            "multipoint",
+            "multilinestring",
+            "multipolygon",
+            "geometrycollection",
+        ] {
+            assert_eq!(
+                convert_bytes(&[0, 1, 2, 3], type_name),
+                DataValue::Bytes(vec![0, 1, 2, 3])
+            );
+        }
     }
 
     #[test]

@@ -831,6 +831,14 @@ async fn keeps_snapshot_and_binlog_type_conversion_identical() -> TestResult {
                     ratio_double DOUBLE NOT NULL, \
                     bits BIT(8) NOT NULL, \
                     bytes VARBINARY(8) NOT NULL, \
+                    geometry_value GEOMETRY NOT NULL, \
+                    point_value POINT NOT NULL, \
+                    linestring_value LINESTRING NOT NULL, \
+                    polygon_value POLYGON NOT NULL, \
+                    multipoint_value MULTIPOINT NOT NULL, \
+                    multilinestring_value MULTILINESTRING NOT NULL, \
+                    multipolygon_value MULTIPOLYGON NOT NULL, \
+                    geometrycollection_value GEOMETRYCOLLECTION NOT NULL, \
                     day_value DATE NOT NULL, \
                     time_value TIME(6) NOT NULL, \
                     datetime_value DATETIME(6) NOT NULL, \
@@ -845,7 +853,15 @@ async fn keeps_snapshot_and_binlog_type_conversion_identical() -> TestResult {
             ))
             .await?;
         let values = "1, -9223372036854775807, 9223372036854775810, 12345678901234.567890, \
-                      1.25, 12345.125, b'10100101', X'00FF10', '2026-07-16', \
+                      1.25, 12345.125, b'10100101', X'00FF10', \
+                      ST_GeomFromText('POINT(1 2)'), ST_GeomFromText('POINT(1 2)'), \
+                      ST_GeomFromText('LINESTRING(0 0,1 1)'), \
+                      ST_GeomFromText('POLYGON((0 0,1 0,1 1,0 0))'), \
+                      ST_GeomFromText('MULTIPOINT((0 0),(1 1))'), \
+                      ST_GeomFromText('MULTILINESTRING((0 0,1 1),(2 2,3 3))'), \
+                      ST_GeomFromText('MULTIPOLYGON(((0 0,1 0,1 1,0 0)))'), \
+                      ST_GeomFromText('GEOMETRYCOLLECTION(POINT(0 0),LINESTRING(0 0,1 1))'), \
+                      '2026-07-16', \
                       '12:34:56.123456', '2026-07-16 12:34:56.123456', \
                       '2026-07-16 12:34:56.123456', 'Alice', 'type matrix', \
                       JSON_OBJECT('active', true, 'count', 7), 'done', 'a,c', NULL";
@@ -1035,6 +1051,14 @@ async fn snapshots_and_replays_destructive_ddl_from_checkpoint() -> TestResult {
                  VALUES (3, 'Cara', 10.25)"
             ))
             .await?;
+        for ddl in [
+            format!("ALTER TABLE {qualified_table} ADD INDEX idx_amount (amount)"),
+            format!("ALTER TABLE {qualified_table} RENAME INDEX idx_amount TO idx_amount_lookup"),
+            format!("ALTER TABLE {qualified_table} ALTER COLUMN amount SET DEFAULT 0.00"),
+            format!("ALTER TABLE {qualified_table} DROP INDEX idx_amount_lookup"),
+        ] {
+            admin.query_drop(ddl).await?;
+        }
         admin
             .query_drop(format!(
                 "ALTER TABLE {qualified_table} \

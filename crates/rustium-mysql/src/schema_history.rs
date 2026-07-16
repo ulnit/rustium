@@ -10,7 +10,9 @@ use sqlparser::{
         RenameTableNameKind, Statement, TableConstraint,
     },
     dialect::MySqlDialect,
+    keywords::Keyword,
     parser::Parser,
+    tokenizer::{Token, Tokenizer},
 };
 
 pub(crate) const MYSQL_SCHEMA_HISTORY_FORMAT: &str = "rustium.mysql.schema-history";
@@ -198,6 +200,9 @@ pub(crate) fn apply_ddl(
     config: &MySqlSourceConfig,
     connector_name: &str,
 ) -> Result<bool> {
+    if is_standalone_rename_index_ddl(ddl) {
+        return Ok(false);
+    }
     let statements = Parser::parse_sql(&MySqlDialect {}, ddl)
         .map_err(|error| Error::Source(format!("could not parse MySQL DDL {ddl:?}: {error}")))?;
     let mut staged = schemas.clone();
@@ -213,6 +218,51 @@ pub(crate) fn apply_ddl(
     }
     *schemas = staged;
     Ok(changed)
+}
+
+fn is_standalone_rename_index_ddl(ddl: &str) -> bool {
+    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, ddl).tokenize() else {
+        return false;
+    };
+    let mut tokens = tokens
+        .into_iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    if tokens.last() == Some(&Token::SemiColon) {
+        tokens.pop();
+    }
+
+    let matches_operation = |tokens: &[Token]| {
+        matches!(tokens, [rename, index, old_name, to, new_name]
+            if token_is_keyword(rename, Keyword::RENAME)
+                && (token_is_keyword(index, Keyword::INDEX)
+                    || token_is_keyword(index, Keyword::KEY))
+                && matches!(old_name, Token::Word(_))
+                && token_is_keyword(to, Keyword::TO)
+                && matches!(new_name, Token::Word(_)))
+    };
+    match tokens.as_slice() {
+        [alter, table, database, Token::Period, table_name, rest @ ..]
+            if token_is_keyword(alter, Keyword::ALTER)
+                && token_is_keyword(table, Keyword::TABLE)
+                && matches!(database, Token::Word(_))
+                && matches!(table_name, Token::Word(_)) =>
+        {
+            matches_operation(rest)
+        }
+        [alter, table, table_name, rest @ ..]
+            if token_is_keyword(alter, Keyword::ALTER)
+                && token_is_keyword(table, Keyword::TABLE)
+                && matches!(table_name, Token::Word(_)) =>
+        {
+            matches_operation(rest)
+        }
+        _ => false,
+    }
+}
+
+fn token_is_keyword(token: &Token, keyword: Keyword) -> bool {
+    matches!(token, Token::Word(word) if word.keyword == keyword)
 }
 
 fn apply_statement(
@@ -947,5 +997,39 @@ mod tests {
         )
         .unwrap();
         assert!(schemas.is_empty());
+    }
+
+    #[test]
+    fn preserves_schema_across_mysql_index_and_default_ddl() {
+        let config = config();
+        let mut schemas = HashMap::new();
+        apply_ddl(
+            &mut schemas,
+            "CREATE TABLE orders (id BIGINT PRIMARY KEY, amount DECIMAL(10,2) NOT NULL)",
+            "inventory",
+            &config,
+            "inventory-mysql",
+        )
+        .unwrap();
+
+        for ddl in [
+            "ALTER TABLE orders ADD INDEX idx_amount (amount)",
+            "ALTER TABLE orders RENAME INDEX idx_amount TO idx_amount_lookup",
+            "ALTER TABLE orders ALTER COLUMN amount SET DEFAULT 0.00",
+            "ALTER TABLE orders DROP INDEX idx_amount_lookup",
+        ] {
+            assert!(
+                !apply_ddl(&mut schemas, ddl, "inventory", &config, "inventory-mysql",).unwrap()
+            );
+        }
+
+        let schema = &schemas
+            .get(&("inventory".into(), "orders".into()))
+            .unwrap()
+            .event_schema;
+        assert_eq!(schema.version, 1);
+        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(schema.fields[1].type_name, "decimal(10,2)");
+        assert!(!schema.fields[1].optional);
     }
 }
