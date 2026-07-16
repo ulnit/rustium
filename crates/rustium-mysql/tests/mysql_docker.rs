@@ -192,6 +192,8 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
         "GRANT SELECT, RELOAD, FLUSH_TABLES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'rustium'@'%'",
         "CREATE TABLE inventory.orders (id BIGINT PRIMARY KEY, customer VARCHAR(100) NOT NULL, amount DECIMAL(10,2) NOT NULL)",
         "INSERT INTO inventory.orders VALUES (1, 'Alice', 12.30), (2, 'Bob', 45.60)",
+        "CREATE TABLE inventory.audit (id BIGINT PRIMARY KEY, note VARCHAR(100) NOT NULL)",
+        "INSERT INTO inventory.audit VALUES (100, 'excluded from initial snapshot')",
         "CREATE TABLE inventory.rustium_signal (id VARCHAR(255) PRIMARY KEY, type VARCHAR(64) NOT NULL, data TEXT NOT NULL)",
         "INSERT INTO inventory.rustium_signal VALUES ('seed', 'execute-snapshot', '{\"type\":\"incremental\",\"data-collections\":[\"inventory\\\\.orders\"]}')",
     ] {
@@ -206,7 +208,7 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
         databases: vec!["inventory".into()],
         server_id: 5_401,
         tables: TableSelection {
-            include: vec![r"inventory\.orders".into()],
+            include: vec![r"inventory\.(orders|audit)".into()],
             exclude: Vec::new(),
         },
         ssl_mode: "disabled".into(),
@@ -248,6 +250,7 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
         SnapshotConfig {
             mode: SnapshotMode::Initial,
             fetch_size: 1,
+            include_collections: vec![r"inventory\.orders".into()],
         },
     )
     .with_retry_policy(RetryPolicy {
@@ -317,6 +320,7 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
         SnapshotConfig {
             mode: SnapshotMode::WhenNeeded,
             fetch_size: 1,
+            include_collections: vec![r"inventory\.orders".into()],
         },
     )
     .with_retry_policy(RetryPolicy {
@@ -354,6 +358,36 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
         recovery_snapshot_rows += 1;
     }
     assert_eq!(recovery_snapshot_rows, 2);
+
+    root.query_drop("INSERT INTO inventory.audit VALUES (101, 'streamed after snapshot')")
+        .await
+        .unwrap();
+    let mut streamed_audit = false;
+    loop {
+        let record = tokio::time::timeout(Duration::from_secs(20), output_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Some(event) = record.event {
+            if event.source.table.as_deref() == Some("audit") {
+                assert_eq!(event.operation, Operation::Create);
+                assert!(!event.source.snapshot);
+                assert_eq!(
+                    integer_value(event.after.as_ref().and_then(|row| row.get("id"))),
+                    Some(101)
+                );
+                streamed_audit = true;
+            }
+        }
+        if record.boundary == RecordBoundary::TransactionCommit {
+            break;
+        }
+    }
+    assert!(
+        streamed_audit,
+        "snapshot.include.collection.list narrowed MySQL streaming"
+    );
 
     for query in [
         "START TRANSACTION",
@@ -495,6 +529,7 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
         SnapshotConfig {
             mode: SnapshotMode::Initial,
             fetch_size: 1,
+            include_collections: Vec::new(),
         },
     );
     resumed_source.validate().await.unwrap();

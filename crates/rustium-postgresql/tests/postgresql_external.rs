@@ -146,6 +146,7 @@ async fn recovers_completed_snapshot_before_kafka_signal_offset_commit() -> Test
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         snapshot_source.validate().await?;
@@ -223,6 +224,7 @@ async fn recovers_completed_snapshot_before_kafka_signal_offset_commit() -> Test
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -346,6 +348,7 @@ async fn recovers_completed_snapshot_before_kafka_signal_offset_commit() -> Test
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -499,6 +502,126 @@ async fn snapshots_streams_and_resumes_from_checkpoint() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn filters_initial_snapshot_without_narrowing_streaming() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let snapshot_table = format!("rustium_pg_snapshot_filter_{}", &suffix[..10]);
+    let stream_table = format!("rustium_pg_stream_filter_{}", &suffix[..10]);
+    let publication = format!("rustium_pg_filter_pub_{}", &suffix[..10]);
+    let slot_name = format!("rustium_pg_filter_slot_{}", &suffix[..10]);
+    let connector_name = format!("postgresql-filter-{}", &suffix[..10]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{snapshot_table} (id BIGINT PRIMARY KEY, value TEXT NOT NULL); \
+                 CREATE TABLE public.{stream_table} (id BIGINT PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT INTO public.{snapshot_table} VALUES (1, 'one'), (2, 'two'); \
+                 INSERT INTO public.{stream_table} VALUES (100, 'excluded from initial snapshot'); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{snapshot_table}, public.{stream_table};"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &snapshot_table);
+        config.tables.include = vec![format!(
+            r"public\.({snapshot_table}|{stream_table})"
+        )];
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: vec![format!(r"public\.{snapshot_table}")],
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+
+        let capture: TestResult = async {
+            let mut snapshot_rows = 0;
+            loop {
+                let record = receive_with_context(
+                    &mut output,
+                    "waiting for the filtered PostgreSQL initial snapshot",
+                )
+                .await?;
+                if record.boundary == RecordBoundary::SnapshotComplete {
+                    break;
+                }
+                let event = record
+                    .event
+                    .ok_or_else(|| test_error("filtered snapshot record has no event"))?;
+                require(
+                    event.operation == Operation::Read
+                        && event.source.snapshot
+                        && event.source.table.as_deref() == Some(snapshot_table.as_str()),
+                    "PostgreSQL snapshot collection filter emitted an unexpected table",
+                )?;
+                snapshot_rows += 1;
+            }
+            require(
+                snapshot_rows == 2,
+                "PostgreSQL snapshot collection filter emitted the wrong row count",
+            )?;
+
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO public.{stream_table} (id, value) VALUES (101, 'streamed after snapshot')"
+                    ),
+                    &[],
+                )
+                .await?;
+            loop {
+                let record = receive_with_context(
+                    &mut output,
+                    "waiting for PostgreSQL streaming outside the snapshot filter",
+                )
+                .await?;
+                if let Some(event) = record.event
+                    && event.source.table.as_deref() == Some(stream_table.as_str())
+                {
+                    require(
+                        event.operation == Operation::Create && !event.source.snapshot,
+                        "PostgreSQL snapshot collection filter changed streaming semantics",
+                    )?;
+                    require(
+                        event.after.as_ref().and_then(|row| row.get("id"))
+                            == Some(&DataValue::Int64(101)),
+                        "PostgreSQL streaming row outside the snapshot filter changed",
+                    )?;
+                    break;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture, stop_result)
+    }
+    .await;
+
+    let cleanup_result = cleanup(
+        &client,
+        &publication,
+        &slot_name,
+        &[&snapshot_table, &stream_table],
+    )
+    .await;
+    connection_task.abort();
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL snapshot filter cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
 async fn emits_heartbeat_and_executes_action_query() -> TestResult {
     let settings = TestSettings::from_env()?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -537,6 +660,7 @@ async fn emits_heartbeat_and_executes_action_query() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -718,6 +842,7 @@ async fn keeps_snapshot_and_streaming_type_conversion_identical() -> TestResult 
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -950,6 +1075,7 @@ async fn keeps_installed_extension_types_identical_across_snapshot_and_wal() -> 
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -1126,6 +1252,7 @@ async fn reconnects_after_replication_backend_termination() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         )
         .with_retry_policy(RetryPolicy {
@@ -1163,6 +1290,7 @@ async fn reconnects_after_replication_backend_termination() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::WhenNeeded,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         )
         .with_retry_policy(RetryPolicy {
@@ -1306,6 +1434,7 @@ async fn rejects_checkpoint_resume_after_replication_slot_loss() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -1348,6 +1477,7 @@ async fn rejects_checkpoint_resume_after_replication_slot_loss() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         resumed_source.validate().await?;
@@ -1433,6 +1563,7 @@ async fn rejects_checkpoint_resume_after_wal_retention_invalidation() -> TestRes
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -1495,6 +1626,7 @@ async fn rejects_checkpoint_resume_after_wal_retention_invalidation() -> TestRes
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         resumed_source.validate().await?;
@@ -1569,6 +1701,7 @@ async fn runs_incremental_snapshot_from_file_signal() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -1708,6 +1841,7 @@ async fn runs_read_only_external_snapshots_without_signal_table() -> TestResult 
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -1907,6 +2041,7 @@ async fn resumes_signal_incremental_snapshot_from_chunk_checkpoint() -> TestResu
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -1962,6 +2097,7 @@ async fn resumes_signal_incremental_snapshot_from_chunk_checkpoint() -> TestResu
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         resumed_source.validate().await?;
@@ -2083,6 +2219,7 @@ async fn controls_and_deduplicates_filtered_incremental_snapshot() -> TestResult
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -2273,6 +2410,7 @@ async fn runs_incremental_snapshot_with_read_only_table_permissions() -> TestRes
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -2441,6 +2579,7 @@ async fn orders_incremental_chunks_by_unique_surrogate_key() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -2557,6 +2696,7 @@ async fn rejects_schema_change_inside_incremental_window() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -2890,6 +3030,7 @@ async fn run_initial_capture(
         SnapshotConfig {
             mode: SnapshotMode::Initial,
             fetch_size: 1,
+            include_collections: Vec::new(),
         },
     );
     source.validate().await?;
@@ -2992,6 +3133,7 @@ async fn run_resumed_capture(
         SnapshotConfig {
             mode: SnapshotMode::Initial,
             fetch_size: 1,
+            include_collections: Vec::new(),
         },
     );
     source.validate().await?;

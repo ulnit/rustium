@@ -130,6 +130,7 @@ async fn recovers_completed_snapshot_before_kafka_signal_offset_commit() -> Test
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -239,6 +240,7 @@ async fn recovers_completed_snapshot_before_kafka_signal_offset_commit() -> Test
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -340,7 +342,15 @@ async fn runs_incremental_snapshot_from_mysql_signal_channel() -> TestResult {
             updated_at: SystemTime::now(),
             connector_state: Some(schema_history),
         };
-        let mut source = MySqlSource::new(&connector_name, config, SnapshotConfig { mode: SnapshotMode::Never, fetch_size: 1 });
+        let mut source = MySqlSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
         source.validate().await?;
         let (mut output, signal_sender, cancellation, source_task) = start_source_with_signals(source, Some(checkpoint), Some(snapshot_position));
         signal_sender.send(SignalRecord::new(
@@ -437,6 +447,7 @@ async fn deduplicates_incremental_rows_changed_inside_the_binlog_window() -> Tes
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -605,6 +616,7 @@ async fn resumes_incremental_snapshot_with_persisted_keyset() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -679,6 +691,7 @@ async fn resumes_incremental_snapshot_with_persisted_keyset() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -842,6 +855,7 @@ async fn reconnects_under_bounded_output_backpressure() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         )
         .with_retry_policy(RetryPolicy {
@@ -1014,6 +1028,7 @@ async fn emits_periodic_heartbeat_from_safe_binlog_position() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -1158,6 +1173,7 @@ async fn reconstructs_partial_json_updates_from_before_images() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -1298,6 +1314,7 @@ async fn keeps_snapshot_and_binlog_type_conversion_identical() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -1354,6 +1371,7 @@ async fn keeps_snapshot_and_binlog_type_conversion_identical() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -1535,6 +1553,7 @@ async fn capture_snapshot(
         SnapshotConfig {
             mode: SnapshotMode::Initial,
             fetch_size: 1,
+            include_collections: Vec::new(),
         },
     );
     source.validate().await?;
@@ -1582,6 +1601,7 @@ async fn capture_replay(
         SnapshotConfig {
             mode: SnapshotMode::Initial,
             fetch_size: 1,
+            include_collections: Vec::new(),
         },
     );
     source.validate().await?;

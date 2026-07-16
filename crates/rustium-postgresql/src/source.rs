@@ -250,7 +250,8 @@ impl PostgresSource {
         let connection_url = self.config.connection_url(false)?;
         let config = self.config.clone();
         let connector_name = self.connector_name.clone();
-        let fetch_size = self.snapshot.fetch_size;
+        let snapshot_config = self.snapshot.clone();
+        let fetch_size = snapshot_config.fetch_size;
         tokio::task::spawn_blocking(move || {
             let mut connection = connect(&connection_url)?;
             connection
@@ -275,6 +276,9 @@ impl PostgresSource {
             let mut ordered_schemas = schemas.values().cloned().collect::<Vec<_>>();
             ordered_schemas.sort_by_key(TableSchema::key);
             for schema in &ordered_schemas {
+                if !snapshot_includes(&snapshot_config, &schema.schema, &schema.table) {
+                    continue;
+                }
                 snapshot_table(
                     &mut connection,
                     &config,
@@ -1704,6 +1708,10 @@ fn is_signal_table(config: &PostgresSourceConfig, schema: &str, table: &str) -> 
         })
 }
 
+fn snapshot_includes(snapshot: &SnapshotConfig, schema: &str, table: &str) -> bool {
+    snapshot.includes_collection(&format!("{schema}.{table}"))
+}
+
 fn discover_table_schema(
     connection: &mut PgReplicationConnection,
     config: &PostgresSourceConfig,
@@ -2276,6 +2284,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn qualifies_postgresql_snapshot_collection_filters() {
+        let snapshot = SnapshotConfig {
+            include_collections: vec![r"public\.orders".into()],
+            ..SnapshotConfig::default()
+        };
+        assert!(snapshot_includes(&snapshot, "public", "orders"));
+        assert!(!snapshot_includes(&snapshot, "archive", "orders"));
+        assert!(!snapshot_includes(&snapshot, "public", "orders_history"));
+    }
+
+    #[test]
     fn builds_heartbeat_at_the_safe_postgresql_position() {
         let position = postgres_streaming_position(512);
         let record = heartbeat_record("inventory-postgresql", "inventory", position.clone());
@@ -2611,6 +2630,7 @@ mod tests {
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         let position = SourcePosition::Postgres(PostgresPosition {

@@ -701,7 +701,10 @@ impl MySqlSource {
                     .await?;
             let mut ordered = schemas
                 .values()
-                .filter(|schema| is_business_table(&self.config, &schema.database, &schema.table))
+                .filter(|schema| {
+                    is_business_table(&self.config, &schema.database, &schema.table)
+                        && snapshot_includes(&self.snapshot, &schema.database, &schema.table)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             ordered.sort_by_key(TableSchema::key);
@@ -1567,6 +1570,10 @@ fn is_business_table(config: &MySqlSourceConfig, database: &str, table: &str) ->
         && signal_table_key(config).is_none_or(|(signal_database, signal_table)| {
             signal_database != database || signal_table != table
         })
+}
+
+fn snapshot_includes(snapshot: &SnapshotConfig, database: &str, table: &str) -> bool {
+    snapshot.includes_collection(&format!("{database}.{table}"))
 }
 
 fn validate_signal_schema(schema: &TableSchema) -> Result<()> {
@@ -3188,6 +3195,17 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn qualifies_mysql_snapshot_collection_filters() {
+        let snapshot = SnapshotConfig {
+            include_collections: vec![r"inventory\.orders".into()],
+            ..SnapshotConfig::default()
+        };
+        assert!(snapshot_includes(&snapshot, "inventory", "orders"));
+        assert!(!snapshot_includes(&snapshot, "archive", "orders"));
+        assert!(!snapshot_includes(&snapshot, "inventory", "orders_history"));
+    }
+
     fn test_mysql_config() -> MySqlSourceConfig {
         MySqlSourceConfig {
             hostname: "localhost".into(),
@@ -3410,6 +3428,7 @@ mod tests {
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         let schema = TableSchema {
@@ -3451,6 +3470,7 @@ mod tests {
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         let progress = IncrementalSnapshotProgress {
@@ -3636,6 +3656,7 @@ mod tests {
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         let position = mysql_position("mysql-bin.000001", 128, None, 184, 1, false);

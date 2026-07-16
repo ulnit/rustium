@@ -149,6 +149,7 @@ async fn recovers_completed_snapshot_before_kafka_signal_offset_commit() -> Test
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         snapshot_source.validate().await?;
@@ -216,6 +217,7 @@ async fn recovers_completed_snapshot_before_kafka_signal_offset_commit() -> Test
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -325,6 +327,7 @@ async fn recovers_completed_snapshot_before_kafka_signal_offset_commit() -> Test
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -571,6 +574,7 @@ async fn emits_heartbeat_and_executes_action_query() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -708,6 +712,7 @@ async fn rejects_checkpoint_older_than_cdc_retention() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -828,6 +833,7 @@ async fn keeps_snapshot_and_cdc_type_conversion_identical() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Initial,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -962,6 +968,7 @@ async fn orders_concurrent_transactions_by_commit_lsn() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -1095,6 +1102,7 @@ async fn resumes_incremental_snapshot_with_persisted_keyset() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -1169,6 +1177,7 @@ async fn resumes_incremental_snapshot_with_persisted_keyset() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -1291,6 +1300,7 @@ async fn deduplicates_incremental_rows_changed_inside_the_cdc_window() -> TestRe
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -1473,6 +1483,7 @@ async fn runs_incremental_snapshot_from_source_signal_table() -> TestResult {
             SnapshotConfig {
                 mode: SnapshotMode::Never,
                 fetch_size: 1,
+                include_collections: Vec::new(),
             },
         );
         source.validate().await?;
@@ -1576,6 +1587,7 @@ async fn run_forced_polling_recovery(
         SnapshotConfig {
             mode: SnapshotMode::Never,
             fetch_size: 1,
+            include_collections: Vec::new(),
         },
     )
     .with_retry_policy(RetryPolicy {
@@ -1675,6 +1687,7 @@ async fn run_initial_capture(
         SnapshotConfig {
             mode: SnapshotMode::Initial,
             fetch_size: 1,
+            include_collections: Vec::new(),
         },
     );
     source.validate().await?;
@@ -1762,6 +1775,7 @@ async fn run_resumed_capture(
         SnapshotConfig {
             mode: SnapshotMode::Initial,
             fetch_size: 1,
+            include_collections: Vec::new(),
         },
     );
     source.validate().await?;

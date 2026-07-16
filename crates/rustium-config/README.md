@@ -4,8 +4,12 @@ Versioned Rustium configuration models, validation, environment interpolation, s
 
 Use this crate when an embedded Rustium application needs the same strict configuration contract as the CLI. See the [project README](https://github.com/ulnit/rustium/blob/main/README.md).
 
+`snapshot.include.collection.list` maps to native `snapshot.include_collections` with anchored, connector-qualified, snapshot-only matching.
+
 ## 简体中文
 
 Rustium 的版本化配置模型、校验、环境变量插值、语义指纹，以及 PostgreSQL、MySQL、SQL Server、sink、格式和 runtime 的 Debezium 兼容 `.properties` 解析。
 
 嵌入 Rustium 的应用需要与 CLI 相同的严格配置契约时使用此 crate。详见[项目 README](https://github.com/ulnit/rustium/blob/main/README.md)。
+
+`snapshot.include.collection.list` 映射为原生 `snapshot.include_collections`，采用 anchored、连接器限定且仅作用于快照的匹配语义。

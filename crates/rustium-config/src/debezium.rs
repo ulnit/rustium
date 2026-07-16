@@ -194,6 +194,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 "snapshot.fetch.size",
                 default_snapshot_fetch_size(),
             )?,
+            include_collections: csv_property(properties.get("snapshot.include.collection.list")),
         },
         warnings,
     )
@@ -397,6 +398,7 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
                 "snapshot.fetch.size",
                 default_snapshot_fetch_size(),
             )?,
+            include_collections: csv_property(properties.get("snapshot.include.collection.list")),
         },
         warnings,
     )
@@ -570,6 +572,7 @@ fn parse_sqlserver(properties: &BTreeMap<String, String>) -> Result<Config> {
                 "snapshot.fetch.size",
                 default_snapshot_fetch_size(),
             )?,
+            include_collections: csv_property(properties.get("snapshot.include.collection.list")),
         },
         warnings,
     )
@@ -1121,6 +1124,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "publication.name",
         "snapshot.mode",
         "snapshot.fetch.size",
+        "snapshot.include.collection.list",
         "table.include.list",
         "table.exclude.list",
         "schema.include.list",
@@ -1251,6 +1255,7 @@ slot.name=orders_slot
 publication.name=orders_pub
 table.include.list=public\\.(orders|customers)
 snapshot.mode=initial
+snapshot.include.collection.list=public\\.orders
 tombstones.on.delete=false
 heartbeat.interval.ms=2500
 heartbeat.action.query=INSERT INTO public.rustium_heartbeat (id) VALUES (1)
@@ -1322,6 +1327,7 @@ max.batch.size=1000
         );
         assert!(source.read_only);
         assert_eq!(source.hstore_handling_mode, "map");
+        assert_eq!(config.snapshot.include_collections, [r"public\.orders"]);
         assert!(!config.format.tombstones_on_delete);
         assert!(
             config
@@ -1463,6 +1469,7 @@ database.ssl.cert=/etc/mysql/client.pem
 database.ssl.key=/etc/mysql/client-key.pem
 database.include.list=inventory
 table.include.list=inventory\.(orders|customers)
+snapshot.include.collection.list=inventory\\.orders
 topic.prefix=inventory
 connect.keep.alive=false
 connect.keep.alive.interval.ms=250
@@ -1520,6 +1527,7 @@ topic.heartbeat.name=shared-heartbeat
         );
         assert!(source.tables.includes("inventory", "orders"));
         assert!(!source.tables.includes("inventory", "products"));
+        assert_eq!(config.snapshot.include_collections, [r"inventory\.orders"]);
     }
 
     #[test]
@@ -1746,6 +1754,7 @@ database.password=secret
 database.names=inventory
 table.include.list=dbo\.orders
 topic.prefix=inventory
+snapshot.include.collection.list=inventory\\.dbo\\.orders
 snapshot.isolation.mode=snapshot
 streaming.fetch.size=2048
 heartbeat.interval.ms=1000
@@ -1792,6 +1801,10 @@ incremental.snapshot.watermarking.strategy=insert_insert
         assert_eq!(source.incremental_snapshot_chunk_size, 64);
         assert_eq!(source.signal_kafka_bootstrap_servers, ["kafka:9092"]);
         assert_eq!(source.signal_kafka_group_id, "sql-signals");
+        assert_eq!(
+            config.snapshot.include_collections,
+            [r"inventory\.dbo\.orders"]
+        );
         assert_eq!(
             source
                 .signal_kafka_consumer_properties

@@ -28,6 +28,8 @@ source:
 snapshot:
   mode: initial
   fetch_size: 1024
+  include_collections:
+    - public\.(orders|customers)
 
 format:
   type: debezium_json

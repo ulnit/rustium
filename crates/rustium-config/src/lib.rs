@@ -86,6 +86,7 @@ impl Config {
                 "snapshot.fetch_size must be greater than zero".into(),
             ));
         }
+        self.snapshot.validate()?;
         if self.runtime.channel_capacity == 0 {
             return Err(Error::Configuration(
                 "runtime.channel_capacity must be greater than zero".into(),
@@ -123,7 +124,7 @@ impl Config {
             "api_version": self.api_version,
             "name": self.metadata.name,
             "source": self.source.semantic_config(),
-            "snapshot": self.snapshot,
+            "snapshot": self.snapshot.semantic_config(),
             "format": self.format.semantic_config(),
             "sink": self.sink.semantic_config(),
         });
@@ -1114,6 +1115,8 @@ pub struct SnapshotConfig {
     pub mode: SnapshotMode,
     #[serde(default = "default_snapshot_fetch_size")]
     pub fetch_size: usize,
+    #[serde(default)]
+    pub include_collections: Vec<String>,
 }
 
 impl Default for SnapshotConfig {
@@ -1121,7 +1124,47 @@ impl Default for SnapshotConfig {
         Self {
             mode: SnapshotMode::Initial,
             fetch_size: default_snapshot_fetch_size(),
+            include_collections: Vec::new(),
         }
+    }
+}
+
+impl SnapshotConfig {
+    fn validate(&self) -> Result<()> {
+        for pattern in &self.include_collections {
+            if Regex::new(pattern).is_err() {
+                return Err(Error::Configuration(format!(
+                    "snapshot include selector {pattern:?} is not a valid regular expression"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn includes_collection(&self, collection: &str) -> bool {
+        self.include_collections.is_empty()
+            || self
+                .include_collections
+                .iter()
+                .any(|pattern| regex_matches(pattern, collection))
+    }
+
+    fn semantic_config(&self) -> serde_json::Value {
+        let mut semantic = serde_json::json!({
+            "mode": self.mode,
+            "fetch_size": self.fetch_size,
+        });
+        if !self.include_collections.is_empty() {
+            semantic
+                .as_object_mut()
+                .expect("snapshot semantic is an object")
+                .insert(
+                    "include_collections".into(),
+                    serde_json::json!(self.include_collections),
+                );
+        }
+        semantic
     }
 }
 
@@ -1910,6 +1953,45 @@ sink:
             Config::from_yaml(&CONFIG.replace("sink:\n", "snapshot:\n  fetch_size: 0\nsink:\n"))
                 .unwrap_err();
         assert!(error.to_string().contains("snapshot.fetch_size"));
+    }
+
+    #[test]
+    fn validates_anchored_snapshot_collection_filters() {
+        let config = Config::from_yaml(&CONFIG.replace(
+            "sink:\n",
+            "snapshot:\n  include_collections: [public\\.orders]\nsink:\n",
+        ))
+        .unwrap();
+        assert!(config.snapshot.includes_collection("public.orders"));
+        assert!(!config.snapshot.includes_collection("archive.public.orders"));
+        assert!(!config.snapshot.includes_collection("public.orders_history"));
+
+        let error = Config::from_yaml(&CONFIG.replace(
+            "sink:\n",
+            "snapshot:\n  include_collections: ['[invalid']\nsink:\n",
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("snapshot include selector"));
+    }
+
+    #[test]
+    fn preserves_snapshot_fingerprint_shape_without_a_filter() {
+        assert_eq!(
+            SnapshotConfig::default().semantic_config(),
+            serde_json::json!({
+                "mode": "initial",
+                "fetch_size": default_snapshot_fetch_size(),
+            })
+        );
+
+        let filtered = SnapshotConfig {
+            include_collections: vec![r"public\.orders".into()],
+            ..SnapshotConfig::default()
+        };
+        assert_eq!(
+            filtered.semantic_config()["include_collections"],
+            serde_json::json!([r"public\.orders"])
+        );
     }
 
     #[test]

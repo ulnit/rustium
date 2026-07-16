@@ -701,7 +701,15 @@ impl SqlServerSource {
         let mut ordinal = 0_u64;
         let mut captures = self.captures.clone();
         let signal_table = signal_table_key(&self.config);
-        captures.retain(|capture| signal_table.as_ref() != Some(&capture.key()));
+        captures.retain(|capture| {
+            signal_table.as_ref() != Some(&capture.key())
+                && snapshot_includes(
+                    &self.snapshot,
+                    self.database(),
+                    &capture.schema,
+                    &capture.table,
+                )
+        });
         captures.sort_by_key(CaptureTable::key);
         for capture in &captures {
             snapshot_table(
@@ -1399,6 +1407,10 @@ fn signal_table_key(config: &SqlServerSourceConfig) -> Option<(String, String)> 
         [schema, table] | [_, schema, table] => Some(((*schema).into(), (*table).into())),
         _ => None,
     }
+}
+
+fn snapshot_includes(snapshot: &SnapshotConfig, database: &str, schema: &str, table: &str) -> bool {
+    snapshot.includes_collection(&format!("{database}.{schema}.{table}"))
 }
 
 fn validate_signal_schema(capture: &CaptureTable) -> Result<()> {
@@ -2785,6 +2797,22 @@ const fn is_transient_sqlserver_code(code: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qualifies_sqlserver_snapshot_collection_filters() {
+        let snapshot = SnapshotConfig {
+            include_collections: vec![r"inventory\.dbo\.orders".into()],
+            ..SnapshotConfig::default()
+        };
+        assert!(snapshot_includes(&snapshot, "inventory", "dbo", "orders"));
+        assert!(!snapshot_includes(&snapshot, "archive", "dbo", "orders"));
+        assert!(!snapshot_includes(
+            &snapshot,
+            "inventory",
+            "dbo",
+            "orders_history"
+        ));
+    }
 
     #[test]
     fn round_trips_sqlserver_lsn() {

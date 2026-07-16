@@ -255,6 +255,9 @@ async fn snapshots_and_streams_cdc_changes() {
                  hierarchyid::Parse('/1/2/'), geometry::STGeomFromText('POINT (1 2)', 4326), \
                  geography::STGeomFromText('POINT (1 2)', 4326)); \
              EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'orders', @role_name=NULL, @supports_net_changes=0; \
+             CREATE TABLE dbo.audit (id bigint NOT NULL PRIMARY KEY, note nvarchar(100) NOT NULL); \
+             INSERT INTO dbo.audit VALUES (100, N'excluded from initial snapshot'); \
+             EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'audit', @role_name=NULL, @supports_net_changes=0; \
              CREATE TABLE dbo.cdc_probe (id int NOT NULL PRIMARY KEY); \
              EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'cdc_probe', @role_name=NULL, @supports_net_changes=0; \
              INSERT INTO dbo.cdc_probe VALUES (1); \
@@ -309,7 +312,7 @@ async fn snapshots_and_streams_cdc_changes() {
         password: CONNECTOR_PASSWORD.into(),
         databases: vec!["inventory".into()],
         tables: TableSelection {
-            include: vec![r"dbo\.orders".into()],
+            include: vec![r"dbo\.(orders|audit)".into()],
             exclude: Vec::new(),
         },
         connect_timeout: Duration::from_secs(15),
@@ -340,6 +343,7 @@ async fn snapshots_and_streams_cdc_changes() {
         SnapshotConfig {
             mode: SnapshotMode::Initial,
             fetch_size: 128,
+            include_collections: vec![r"inventory\.dbo\.orders".into()],
         },
     )
     .with_retry_policy(RetryPolicy {
@@ -414,6 +418,7 @@ async fn snapshots_and_streams_cdc_changes() {
             SnapshotConfig {
                 mode: SnapshotMode::WhenNeeded,
                 fetch_size: 128,
+                include_collections: vec![r"inventory\.dbo\.orders".into()],
             },
         )
         .with_retry_policy(RetryPolicy {
@@ -454,6 +459,42 @@ async fn snapshots_and_streams_cdc_changes() {
             }
         }
         assert_eq!(recovery_snapshot_rows, 2);
+
+        admin
+            .simple_query(
+                "INSERT INTO dbo.audit VALUES (101, N'streamed after snapshot');",
+            )
+            .await
+            .unwrap()
+            .into_results()
+            .await
+            .unwrap();
+        let mut streamed_audit = false;
+        loop {
+            let record = tokio::time::timeout(Duration::from_secs(60), output_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let Some(event) = record.event {
+                if event.source.table.as_deref() == Some("audit") {
+                    assert_eq!(event.operation, Operation::Create);
+                    assert!(!event.source.snapshot);
+                    assert_eq!(
+                        sqlserver_integer(event.after.as_ref().and_then(|row| row.get("id"))),
+                        Some(101)
+                    );
+                    streamed_audit = true;
+                }
+            }
+            if record.boundary == RecordBoundary::TransactionCommit {
+                break;
+            }
+        }
+        assert!(
+            streamed_audit,
+            "snapshot.include.collection.list narrowed SQL Server streaming"
+        );
 
         admin
             .simple_query(
