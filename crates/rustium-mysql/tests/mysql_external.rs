@@ -115,6 +115,178 @@ async fn runs_incremental_snapshot_from_mysql_signal_channel() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an external MySQL 8.0+ server with row binlog and GTID enabled"]
+async fn deduplicates_incremental_rows_changed_inside_the_binlog_window() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_window_{}", &suffix[..12]);
+    let connector_name = format!("mysql-window-{}", &suffix[..12]);
+    let signal_id = format!("mysql-window-signal-{}", &suffix[..12]);
+    let qualified_table = format!(
+        "{}.{}",
+        quote_identifier(&settings.database),
+        quote_identifier(&table_name)
+    );
+    let mut admin = connect_admin(&settings).await?;
+    let outcome: TestResult = async {
+        admin
+            .query_drop(format!(
+                "CREATE TABLE {qualified_table} (id BIGINT PRIMARY KEY, value VARCHAR(50) NOT NULL)"
+            ))
+            .await?;
+        admin
+            .query_drop(format!(
+                "INSERT INTO {qualified_table} VALUES (1,'before'),(2,'stable')"
+            ))
+            .await?;
+        let mut config = settings.source_config(&table_name);
+        config.signal_enabled_channels = vec!["in-process".into()];
+        config.incremental_snapshot_chunk_size = 2;
+        let (snapshot_position, schema_history) =
+            capture_snapshot(&connector_name, config.clone()).await?;
+        let checkpoint = Checkpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            connector_name: connector_name.clone(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: snapshot_position.clone(),
+            snapshot_completed: true,
+            config_fingerprint: "mysql-window-test".into(),
+            updated_at: SystemTime::now(),
+            connector_state: Some(schema_history),
+        };
+
+        admin.query_drop("START TRANSACTION").await?;
+        admin
+            .query_drop(format!(
+                "UPDATE {qualified_table} SET value = 'during-window' WHERE id = 1"
+            ))
+            .await?;
+
+        let mut source = MySqlSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, signal_sender, cancellation, source_task) =
+            start_source_with_signals(source, Some(checkpoint), Some(snapshot_position));
+        signal_sender
+            .send(SignalRecord::new(
+                &signal_id,
+                "execute-snapshot",
+                serde_json::json!({
+                    "type": "incremental",
+                    "data-collections": [format!("{}\\.{}", settings.database, table_name)],
+                    "additional-conditions": [{
+                        "data-collection": format!("{}\\.{}", settings.database, table_name),
+                        "filter": "SLEEP(0.25) = 0"
+                    }]
+                }),
+            ))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        admin.query_drop("COMMIT").await?;
+
+        let capture_result: TestResult<(usize, Vec<i128>)> = async {
+            let mut update_events = 0;
+            let mut snapshot_ids = Vec::new();
+            let mut last_position: Option<SourcePosition> = None;
+            loop {
+                let record = receive(&mut output).await?;
+                if let Some(previous) = &last_position {
+                    require(
+                        previous.is_at_or_before(&record.position),
+                        format!(
+                            "MySQL incremental window moved backwards from {previous:?} to {:?}",
+                            record.position
+                        ),
+                    )?;
+                }
+                last_position = Some(record.position.clone());
+                if let Some(event) = &record.event
+                    && event.source.table.as_deref() == Some(table_name.as_str())
+                {
+                    let id = event
+                        .after
+                        .as_ref()
+                        .or(event.before.as_ref())
+                        .and_then(|row| row.get("id"))
+                        .and_then(mysql_integer);
+                    if event
+                        .source
+                        .attributes
+                        .get("rustium.snapshot.kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("incremental")
+                    {
+                        if let Some(id) = id {
+                            snapshot_ids.push(id);
+                        }
+                    } else if event.operation == Operation::Update && id == Some(1) {
+                        require(
+                            event.after.as_ref().and_then(|row| row.get("value"))
+                                == Some(&DataValue::String("during-window".into())),
+                            "MySQL window update has the wrong after image",
+                        )?;
+                        update_events += 1;
+                    }
+                }
+                let completed = record
+                    .connector_state
+                    .as_ref()
+                    .and_then(|state| state.payload.get("completed_signal_ids"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&signal_id)));
+                if completed {
+                    break Ok((update_events, snapshot_ids));
+                }
+            }
+        }
+        .await;
+        let (update_events, snapshot_ids) =
+            finish_source(cancellation, source_task, capture_result).await?;
+        require(
+            update_events == 1,
+            format!("expected one MySQL CDC update, got {update_events}"),
+        )?;
+        require(
+            snapshot_ids == [2],
+            format!(
+                "MySQL incremental window emitted changed or missing rows; got {snapshot_ids:?}"
+            ),
+        )
+    }
+    .await;
+    let rollback_result = admin.query_drop("ROLLBACK").await.map_err(boxed_error);
+    let cleanup_result = admin
+        .query_drop(format!("DROP TABLE IF EXISTS {qualified_table}"))
+        .await
+        .map_err(boxed_error);
+    let close_result = admin.disconnect().await.map_err(boxed_error);
+    match (outcome, rollback_result, cleanup_result, close_result) {
+        (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), rollback, cleanup, close) => {
+            if let Err(rollback_error) = rollback {
+                eprintln!("MySQL window test rollback also failed: {rollback_error}");
+            }
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("MySQL window test cleanup also failed: {cleanup_error}");
+            }
+            if let Err(close_error) = close {
+                eprintln!("MySQL window test connection close also failed: {close_error}");
+            }
+            Err(error)
+        }
+        (Ok(()), Err(error), _, _)
+        | (Ok(()), Ok(()), Err(error), _)
+        | (Ok(()), Ok(()), Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external MySQL 8.0+ server with row binlog and GTID enabled"]
 async fn resumes_incremental_snapshot_with_persisted_keyset() -> TestResult {
     let settings = TestSettings::from_env()?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();

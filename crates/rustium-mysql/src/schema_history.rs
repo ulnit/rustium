@@ -38,7 +38,7 @@ struct MySqlSchemaHistoryState {
     completed_signal_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub(crate) enum MySqlKeyValue {
     Int(i64),

@@ -83,6 +83,7 @@ Requirements:
 - Rust `1.88.0` or newer
 - CMake, OpenSSL, libcurl, and Cyrus SASL development packages for the Kafka client build (`cmake`, `libssl-dev`, `libcurl4-openssl-dev`, and `libsasl2-dev` on Ubuntu)
 - Access to PostgreSQL 14+ with logical replication for the ignored PostgreSQL integration test
+- Access to MySQL 8.0+ with row binlog and GTID for the ignored MySQL external integration test
 - Access to SQL Server 2017+ with CDC and SQL Server Agent for the ignored SQL Server external integration test
 - Docker for the ignored MySQL and SQL Server container integration tests
 
@@ -113,7 +114,7 @@ export RUSTIUM_MYSQL_TEST_DATABASE=cdc_demo
 cargo test -p rustium-mysql --test mysql_external -- --ignored --nocapture
 ```
 
-The admin account only creates and removes uniquely named test tables. The CDC account verifies idle periodic heartbeats, `heartbeat.action.query`, snapshot/replication, GTID-filtered startup from the exact server UUID, checkpoint recovery, and destructive-DDL recovery. This gate has passed against MySQL 8.4 with row binlog and GTID enabled.
+The admin account only creates and removes uniquely named test tables. The CDC account verifies idle periodic heartbeats, `heartbeat.action.query`, snapshot/replication, GTID-filtered startup from the exact server UUID, checkpoint recovery, destructive-DDL recovery, typed keyset restart, durable completed signal IDs, and deduplication of an update committed while an incremental chunk window is open. This gate has passed against MySQL 8.4 with row binlog and GTID enabled.
 
 Run the external PostgreSQL 14+ integration test without storing credentials in the repository:
 
@@ -407,7 +408,8 @@ Implemented behavior:
 - FULL, MINIMAL, and NOBLOB row images with explicit unavailable values where MySQL omits data
 - PARTIAL_JSON update diffs reconstructed from a complete before image, with unavailable fallback when safe reconstruction is impossible
 - source-table, file, in-process, and Kafka signaling for incremental snapshot controls, with primary-key keyset progress and completed signal IDs persisted in connector state
-- Docker and external integration coverage against MySQL 8.4, including filtered GTID startup and restart across destructive DDL
+- low/high binlog-coordinate windows that remove incrementally read rows superseded by concurrent create, update, or delete events before the chunk commit
+- Docker and external integration coverage against MySQL 8.4, including filtered GTID startup, destructive-DDL restart, keyset restart, and concurrent-write deduplication
 
 Recommended MySQL permissions for the connector user:
 
@@ -429,7 +431,7 @@ DDL parsing failures stop the connector by default. Debezium-compatible `schema.
 
 Checkpoint v1 JSON remains readable, but a completed MySQL v1 checkpoint has no historical schema baseline and is rejected for resume. Reset that checkpoint and run a new initial snapshot once to establish checkpoint v2 schema history.
 
-MySQL supports source-table, file, bounded in-process, and Kafka signaling for Debezium-compatible `execute-snapshot`, `pause-snapshot`, `resume-snapshot`, and `stop-snapshot` controls. Incremental snapshots require a primary key, capture a fixed maximum key per collection, and advance with typed single-column or composite-key keyset queries instead of `LIMIT/OFFSET`. The current key, maximum key, collection, pause state, and a bounded history of completed signal IDs are persisted in connector state. Restart resumes after the last checkpointed key; a replayed completed execute signal is ignored, including the crash window between a connector checkpoint and Kafka offset commit. Only one chunk runs per event-loop turn, so binlog events and control signals are observed between chunks. Java-specific truststore/keystore conversion, wider DDL/type fixtures, and binlog-window deduplication under concurrent writes remain follow-up gates. When `binlog_row_value_options=PARTIAL_JSON` is enabled, a diff without a complete before image remains explicitly unavailable rather than being guessed.
+MySQL supports source-table, file, bounded in-process, and Kafka signaling for Debezium-compatible `execute-snapshot`, `pause-snapshot`, `resume-snapshot`, and `stop-snapshot` controls. Incremental snapshots require a primary key, capture a fixed maximum key per collection, and advance with typed single-column or composite-key keyset queries instead of `LIMIT/OFFSET`. For each chunk, Rustium captures low and high binlog coordinates around the query, buffers the read rows, emits ordinary CDC records while the stream catches up, and removes matching before/after primary keys changed inside `(low, high]`. The remaining rows are emitted with the chunk commit, which also persists the current key, maximum key, collection, pause state, and bounded completed-signal history. Restart resumes after the last checkpointed key; a replayed completed execute signal is ignored, including the crash window between a connector checkpoint and Kafka offset commit. An uncommitted in-memory window is discarded and reread after reconnect, and schema changes observed while a window is open stop the source before mismatched rows are emitted. Only one chunk runs per event-loop turn, so binlog events and control signals are observed between chunks. Java-specific truststore/keystore conversion and wider DDL/type fixtures remain follow-up gates. When `binlog_row_value_options=PARTIAL_JSON` is enabled, a diff without a complete before image remains explicitly unavailable rather than being guessed.
 
 For MySQL source-table signaling, set `signal.data.collection=database.signal_table` and include the signal table in the connector user's `SELECT` scope. The table must expose `id`, `type`, and `data` columns; the connector does not write to it. File signaling consumes one JSON envelope per line and clears the file only after reading it. In-process signaling uses the same `SignalSender` and HTTP management route as the other connectors. Kafka signaling uses the existing single-partition, checkpoint-coupled `rustium-signal-kafka` channel and the same Debezium topic/key contract.
 
@@ -628,6 +630,7 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 - Kafka 客户端构建所需的 CMake、OpenSSL、libcurl 和 Cyrus SASL 开发包（Ubuntu 上为 `cmake`、`libssl-dev`、`libcurl4-openssl-dev` 和 `libsasl2-dev`）
 - 运行被忽略的 PostgreSQL 集成测试时，需要可访问已启用逻辑复制的 PostgreSQL 14+
 - 运行被忽略的 SQL Server 外部集成测试时，需要可访问已启用 CDC 和 SQL Server Agent 的 SQL Server 2017+
+- 运行被忽略的 MySQL 外部集成测试时，需要可访问且启用行级 binlog 与 GTID 的 MySQL 8.0+
 - 运行被忽略的 MySQL 和 SQL Server 容器集成测试时需要 Docker
 
 ```bash
@@ -657,7 +660,7 @@ export RUSTIUM_MYSQL_TEST_DATABASE=cdc_demo
 cargo test -p rustium-mysql --test mysql_external -- --ignored --nocapture
 ```
 
-管理账号只负责创建和删除唯一命名的测试表；CDC 账号用于验证空闲周期 heartbeat、`heartbeat.action.query`，以及快照/复制、基于精确 server UUID 的 GTID 过滤启动、checkpoint 恢复和破坏性 DDL 恢复。该门槛已在启用行级 binlog 和 GTID 的 MySQL 8.4 上通过。
+管理账号只负责创建和删除唯一命名的测试表；CDC 账号用于验证空闲周期 heartbeat、`heartbeat.action.query`、快照/复制、基于精确 server UUID 的 GTID 过滤启动、checkpoint 恢复、破坏性 DDL 恢复、带类型 keyset 重启、已完成 signal ID 持久化，以及增量 chunk 窗口打开期间提交更新时的去重。该门槛已在启用行级 binlog 和 GTID 的 MySQL 8.4 上通过。
 
 运行外部 PostgreSQL 14+ 集成测试，凭据无需存入仓库：
 
@@ -943,7 +946,8 @@ MySQL 连接器通过原生复制协议读取行级二进制日志。
 - 支持 FULL、MINIMAL、NOBLOB row image；MySQL 未提供的值会明确标记为 unavailable
 - 根据完整 before image 重建 PARTIAL_JSON 更新 diff；无法安全重建时保守标记为 unavailable
 - 支持源表、文件、进程内和 Kafka 增量快照信号，并将主键 keyset 进度与已完成 signal ID 持久化到 connector state
-- MySQL 8.4 Docker 和外部集成测试，包括过滤后的 GTID 启动和跨破坏性 DDL 重启
+- 使用低/高 binlog 坐标窗口，在 chunk commit 前移除已被并发 create、update 或 delete 覆盖的增量 read 行
+- MySQL 8.4 Docker 和外部集成测试，包括过滤后的 GTID 启动、破坏性 DDL 重启、keyset 重启和并发写入去重
 
 建议给 MySQL 连接器用户授予：
 
@@ -965,7 +969,7 @@ DDL 默认解析失败即停止连接器。可使用 Debezium 兼容参数 `sche
 
 Checkpoint v1 JSON 仍可读取，但已完成的 MySQL v1 checkpoint 不含历史 schema 基线，因此会拒绝恢复。升级后需要重置该 checkpoint 并执行一次新的 initial snapshot，以建立 checkpoint v2 schema history。
 
-MySQL 已支持源表、文件、进程内和 Kafka signal，并兼容 Debezium 的 `execute-snapshot`、`pause-snapshot`、`resume-snapshot`、`stop-snapshot` 控制。增量快照要求目标表具有主键；每个集合会固定最大主键，并使用带类型的单列或复合主键 keyset 查询推进，不再使用 `LIMIT/OFFSET`。当前主键、最大主键、集合、暂停状态和有界的已完成 signal ID 历史都会持久化到 connector state。重启会从最后 checkpoint 的主键之后继续；已完成的 execute signal 重放会被忽略，包括 connector checkpoint 与 Kafka offset commit 之间的崩溃窗口。事件循环每轮最多执行一个 chunk，因此可以在 chunk 之间处理 binlog 和控制信号。Kafka 使用现有的单 partition、与 checkpoint 绑定的 `rustium-signal-kafka` channel 以及同一 Debezium topic/key 合约。Java 专用 truststore/keystore 转换、更广的 DDL/类型样例，以及并发写入下的 binlog window 去重仍是后续门槛。启用 `binlog_row_value_options=PARTIAL_JSON` 时，如果 diff 没有完整 before image，仍会明确标记为 unavailable，而不会猜测结果。
+MySQL 已支持源表、文件、进程内和 Kafka signal，并兼容 Debezium 的 `execute-snapshot`、`pause-snapshot`、`resume-snapshot`、`stop-snapshot` 控制。增量快照要求目标表具有主键；每个集合会固定最大主键，并使用带类型的单列或复合主键 keyset 查询推进，不再使用 `LIMIT/OFFSET`。每个 chunk 都会在查询前后捕获低/高 binlog 坐标，先缓存 read 行，在复制流追到高水位期间正常发出 CDC record，并移除 `(low, high]` 内发生变化的 before/after 主键。剩余行与 chunk commit 一起发出，同时持久化当前主键、最大主键、集合、暂停状态和有界的已完成 signal ID 历史。重启会从最后 checkpoint 的主键之后继续；已完成的 execute signal 重放会被忽略，包括 connector checkpoint 与 Kafka offset commit 之间的崩溃窗口。未提交的内存窗口在重连后会丢弃并重读；窗口打开期间观察到 schema change 时，Source 会在发出布局不匹配的行之前停止。事件循环每轮最多执行一个 chunk，因此可以在 chunk 之间处理 binlog 和控制信号。Kafka 使用现有的单 partition、与 checkpoint 绑定的 `rustium-signal-kafka` channel 以及同一 Debezium topic/key 合约。Java 专用 truststore/keystore 转换和更广的 DDL/类型样例仍是后续门槛。启用 `binlog_row_value_options=PARTIAL_JSON` 时，如果 diff 没有完整 before image，仍会明确标记为 unavailable，而不会猜测结果。
 
 MySQL 源表信号需要配置 `signal.data.collection=database.signal_table`，并让连接器用户对信号表具有 `SELECT` 权限；连接器不会向信号表写入数据。信号表必须提供 `id`、`type`、`data` 三列。文件信号每行一个 JSON envelope，读取后清空文件；进程内信号复用其他连接器的 `SignalSender` 和 HTTP 管理端点；Kafka signal 复用单 partition、与 checkpoint 绑定的 `rustium-signal-kafka` channel。
 

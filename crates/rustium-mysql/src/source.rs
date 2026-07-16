@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
 };
 
@@ -40,6 +40,21 @@ struct BinlogCoordinates {
     gtid_set: Option<String>,
     gtid_set_is_complete: bool,
     source_server_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BinlogCursor {
+    filename: String,
+    position: u64,
+}
+
+impl From<&BinlogCoordinates> for BinlogCursor {
+    fn from(coordinates: &BinlogCoordinates) -> Self {
+        Self {
+            filename: coordinates.filename.clone(),
+            position: coordinates.position,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -143,6 +158,7 @@ enum SnapshotSignal {
 
 struct MySqlIncrementalSnapshot {
     progress: Option<IncrementalSnapshotProgress>,
+    window: Option<MySqlIncrementalWindow>,
     event_serial: u64,
     completed_signal_ids: Vec<String>,
     state_dirty: bool,
@@ -155,6 +171,7 @@ impl MySqlIncrementalSnapshot {
     ) -> Self {
         Self {
             progress,
+            window: None,
             event_serial: 0,
             completed_signal_ids,
             state_dirty: false,
@@ -173,6 +190,27 @@ impl MySqlIncrementalSnapshot {
         self.progress
             .as_ref()
             .is_some_and(|progress| !progress.paused)
+            && self.window.is_none()
+    }
+
+    fn has_window(&self) -> bool {
+        self.window.is_some()
+    }
+
+    fn observes_collection(&self, collection: &(String, String)) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.collection == format!("{}.{}", collection.0, collection.1))
+    }
+
+    fn discard_window(&mut self) {
+        self.window = None;
+    }
+
+    fn window_reached(&self, cursor: &BinlogCursor) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| cursor >= &window.high)
     }
 
     fn state_dirty(&self) -> bool {
@@ -194,14 +232,6 @@ impl MySqlIncrementalSnapshot {
         self.completed_signal_ids.push(id);
         if self.completed_signal_ids.len() > MAX_COMPLETED_SIGNAL_IDS {
             self.completed_signal_ids.remove(0);
-        }
-    }
-
-    fn latest_position(&self, base: &SourcePosition) -> Result<Option<SourcePosition>> {
-        if self.event_serial == 0 {
-            Ok(None)
-        } else {
-            incremental_position(base, self.event_serial).map(Some)
         }
     }
 
@@ -267,6 +297,7 @@ impl MySqlIncrementalSnapshot {
                     return Ok(());
                 };
                 if data_collections.is_empty() {
+                    self.discard_window();
                     let signal_id = progress.signal_id;
                     info!(%id, "MySQL incremental snapshot stopped");
                     self.remember_completed(signal_id);
@@ -290,6 +321,7 @@ impl MySqlIncrementalSnapshot {
                     self.progress = Some(progress);
                     return Ok(());
                 }
+                self.discard_window();
                 let current_removed = current_collection
                     .as_ref()
                     .is_some_and(|collection| collection_matches_any(collection, &patterns));
@@ -335,12 +367,10 @@ impl MySqlIncrementalSnapshot {
         }
     }
 
-    async fn run_next_chunk(
-        &mut self,
-        source: &MySqlSource,
-        base_position: &SourcePosition,
-        output: &tokio::sync::mpsc::Sender<Result<SourceRecord>>,
-    ) -> Result<()> {
+    async fn start_next_chunk(&mut self, source: &MySqlSource) -> Result<()> {
+        if self.window.is_some() {
+            return Ok(());
+        }
         let Some(progress) = self.progress.clone() else {
             return Ok(());
         };
@@ -366,7 +396,70 @@ impl MySqlIncrementalSnapshot {
         let chunk = source.read_incremental_chunk(&schema, &progress).await?;
         let row_count = chunk.rows.len();
         let last_key = chunk.rows.last().map(|(_, key)| key.clone());
-        for (row, _) in chunk.rows {
+        let mut rows = Vec::with_capacity(row_count);
+        let mut remaining_keys = HashSet::with_capacity(row_count);
+        for (row, key) in chunk.rows {
+            remaining_keys.insert(key.clone());
+            rows.push((convert_snapshot_row(row, &schema.event_schema)?, key));
+        }
+        self.window = Some(MySqlIncrementalWindow {
+            collection,
+            schema,
+            low: chunk.low,
+            high: chunk.high,
+            rows,
+            remaining_keys,
+            maximum_key: chunk.maximum_key,
+            last_key,
+            row_count,
+        });
+        Ok(())
+    }
+
+    fn observe_rows(
+        &mut self,
+        collection: &(String, String),
+        cursor: &BinlogCursor,
+        rows: &RowsEventData<'_>,
+        table_map: &TableMapEvent<'_>,
+        schema: &TableSchema,
+    ) -> Result<()> {
+        let Some(window) = &mut self.window else {
+            return Ok(());
+        };
+        if window.collection != format!("{}.{}", collection.0, collection.1)
+            || cursor <= &window.low
+            || cursor > &window.high
+        {
+            return Ok(());
+        }
+        for pair in rows.rows(table_map) {
+            let (before, after) = pair.map_err(mysql_error)?;
+            for row in [before.as_ref(), after.as_ref()].into_iter().flatten() {
+                if let Some(key) = mysql_key_from_binlog_row(row, &schema.event_schema)? {
+                    window.remaining_keys.remove(&key);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish_window(
+        &mut self,
+        source: &MySqlSource,
+        base_position: &SourcePosition,
+        output: &tokio::sync::mpsc::Sender<Result<SourceRecord>>,
+    ) -> Result<SourcePosition> {
+        let window = self.window.take().ok_or_else(|| {
+            Error::State("MySQL incremental snapshot has no pending window".into())
+        })?;
+        let progress = self.progress.clone().ok_or_else(|| {
+            Error::State("MySQL incremental snapshot window has no progress".into())
+        })?;
+        for (row, key) in window.rows {
+            if !window.remaining_keys.contains(&key) {
+                continue;
+            }
             self.event_serial = self.event_serial.saturating_add(1);
             let position = incremental_position(base_position, self.event_serial)?;
             let mut attributes = BTreeMap::new();
@@ -374,17 +467,17 @@ impl MySqlIncrementalSnapshot {
             let event = ChangeEvent {
                 id: EventId::deterministic(
                     &source.connector_name,
-                    &schema.database,
+                    &window.schema.database,
                     &position,
-                    &collection,
+                    &window.collection,
                     self.event_serial,
                 ),
                 source: SourceMetadata {
                     connector: "mysql".into(),
                     connector_name: source.connector_name.clone(),
-                    database: schema.database.clone(),
+                    database: window.schema.database.clone(),
                     schema: None,
-                    table: Some(schema.table.clone()),
+                    table: Some(window.schema.table.clone()),
                     snapshot: true,
                     version: CONNECTOR_VERSION.into(),
                     attributes,
@@ -393,8 +486,8 @@ impl MySqlIncrementalSnapshot {
                 transaction: None,
                 operation: Operation::Read,
                 before: None,
-                after: Some(convert_snapshot_row(row, &schema.event_schema)?),
-                schema: schema.event_schema.clone(),
+                after: Some(row),
+                schema: window.schema.event_schema.clone(),
                 source_time: None,
                 observed_time: Utc::now(),
             };
@@ -407,12 +500,12 @@ impl MySqlIncrementalSnapshot {
         let mut next = progress;
         next.offset = 0;
         if next.maximum_key.is_none() {
-            next.maximum_key.clone_from(&chunk.maximum_key);
+            next.maximum_key.clone_from(&window.maximum_key);
         }
-        next.last_key = last_key;
+        next.last_key = window.last_key;
         let collection_complete = next.maximum_key.is_none()
             || next.last_key.as_ref() == next.maximum_key.as_ref()
-            || row_count < source.config.incremental_snapshot_chunk_size;
+            || window.row_count < source.config.incremental_snapshot_chunk_size;
         if collection_complete {
             next.current_collection = next.current_collection.saturating_add(1);
             next.last_key = None;
@@ -431,7 +524,7 @@ impl MySqlIncrementalSnapshot {
         output
             .send(Ok(SourceRecord {
                 event: None,
-                position,
+                position: position.clone(),
                 boundary: RecordBoundary::TransactionCommit,
                 connector_state: Some(encode_connector_state(
                     &source.schemas,
@@ -443,13 +536,27 @@ impl MySqlIncrementalSnapshot {
             .await
             .map_err(|_| Error::Cancelled)?;
         self.mark_checkpointed();
-        Ok(())
+        Ok(position)
     }
 }
 
 struct IncrementalChunk {
     rows: Vec<(MySqlRow, Vec<MySqlKeyValue>)>,
     maximum_key: Option<Vec<MySqlKeyValue>>,
+    low: BinlogCursor,
+    high: BinlogCursor,
+}
+
+struct MySqlIncrementalWindow {
+    collection: String,
+    schema: TableSchema,
+    low: BinlogCursor,
+    high: BinlogCursor,
+    rows: Vec<(Row, Vec<MySqlKeyValue>)>,
+    remaining_keys: HashSet<Vec<MySqlKeyValue>>,
+    maximum_key: Option<Vec<MySqlKeyValue>>,
+    last_key: Option<Vec<MySqlKeyValue>>,
+    row_count: usize,
 }
 
 pub struct MySqlSource {
@@ -785,6 +892,7 @@ impl MySqlSource {
                     .and_then(|pattern| pattern.is_match(&collection_name).then_some(filter))
             });
         let mut connection = connect(&self.config).await?;
+        let low = current_binlog_coordinates(&mut connection, self.source_server_id).await?;
         let maximum_key = match &progress.maximum_key {
             Some(maximum_key) => Some(maximum_key.clone()),
             None => {
@@ -808,48 +916,46 @@ impl MySqlSource {
                     .transpose()?
             }
         };
-        let Some(maximum_key) = maximum_key else {
-            connection.disconnect().await.map_err(mysql_error)?;
-            return Ok(IncrementalChunk {
-                rows: Vec::new(),
-                maximum_key: None,
-            });
+        let rows = if let Some(maximum_key) = &maximum_key {
+            let mut predicates = Vec::new();
+            let mut parameters = Vec::new();
+            if let Some(condition) = condition {
+                predicates.push(format!("({condition})"));
+            }
+            if let Some(last_key) = &progress.last_key {
+                validate_key_width(&key_columns, last_key, "last")?;
+                predicates.push(key_comparison(&key_columns, ">"));
+                parameters.extend(last_key.iter().map(mysql_key_to_value));
+            }
+            validate_key_width(&key_columns, maximum_key, "maximum")?;
+            predicates.push(key_comparison(&key_columns, "<="));
+            parameters.extend(maximum_key.iter().map(mysql_key_to_value));
+            let where_clause = format!(" WHERE {}", predicates.join(" AND "));
+            let query = format!(
+                "SELECT * FROM {qualified}{where_clause} ORDER BY {} LIMIT {}",
+                key_columns.join(", "),
+                self.config.incremental_snapshot_chunk_size
+            );
+            let rows: Vec<MySqlRow> = connection
+                .exec(query, Params::Positional(parameters))
+                .await
+                .map_err(mysql_error)?;
+            rows.into_iter()
+                .map(|row| {
+                    let key = mysql_key_from_row(&row, &key_indices)?;
+                    Ok((row, key))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
         };
-
-        let mut predicates = Vec::new();
-        let mut parameters = Vec::new();
-        if let Some(condition) = condition {
-            predicates.push(format!("({condition})"));
-        }
-        if let Some(last_key) = &progress.last_key {
-            validate_key_width(&key_columns, last_key, "last")?;
-            predicates.push(key_comparison(&key_columns, ">"));
-            parameters.extend(last_key.iter().map(mysql_key_to_value));
-        }
-        validate_key_width(&key_columns, &maximum_key, "maximum")?;
-        predicates.push(key_comparison(&key_columns, "<="));
-        parameters.extend(maximum_key.iter().map(mysql_key_to_value));
-        let where_clause = format!(" WHERE {}", predicates.join(" AND "));
-        let query = format!(
-            "SELECT * FROM {qualified}{where_clause} ORDER BY {} LIMIT {}",
-            key_columns.join(", "),
-            self.config.incremental_snapshot_chunk_size
-        );
-        let rows: Vec<MySqlRow> = connection
-            .exec(query, Params::Positional(parameters))
-            .await
-            .map_err(mysql_error)?;
-        let rows = rows
-            .into_iter()
-            .map(|row| {
-                let key = mysql_key_from_row(&row, &key_indices)?;
-                Ok((row, key))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let high = current_binlog_coordinates(&mut connection, self.source_server_id).await?;
         connection.disconnect().await.map_err(mysql_error)?;
         Ok(IncrementalChunk {
             rows,
-            maximum_key: Some(maximum_key),
+            maximum_key,
+            low: BinlogCursor::from(&low),
+            high: BinlogCursor::from(&high),
         })
     }
 
@@ -864,6 +970,10 @@ impl MySqlSource {
         let header = event.header();
         let event_start =
             u64::from(header.log_pos()).saturating_sub(u64::from(header.event_size()));
+        let event_cursor = BinlogCursor {
+            filename: state.current_filename.clone(),
+            position: u64::from(header.log_pos()),
+        };
         let source_time = mysql_source_time(header.timestamp());
         let Some(data) = event.read_data().map_err(mysql_error)? else {
             return Ok(None);
@@ -902,6 +1012,21 @@ impl MySqlSource {
                     table_map.database_name().into_owned(),
                     table_map.table_name().into_owned(),
                 );
+                if incremental.observes_collection(&table_name) {
+                    let schema = state.schemas.get(&table_name).cloned().ok_or_else(|| {
+                        Error::Source(format!(
+                            "received an event for unknown MySQL table {}.{}",
+                            table_name.0, table_name.1
+                        ))
+                    })?;
+                    incremental.observe_rows(
+                        &table_name,
+                        &event_cursor,
+                        &rows,
+                        table_map,
+                        &schema,
+                    )?;
+                }
                 if signal_channel_enabled(&self.config, "source")
                     && signal_table.as_ref() == Some(&table_name)
                 {
@@ -949,6 +1074,12 @@ impl MySqlSource {
                 let query_text = query.query().into_owned();
                 let current_database = query.schema().into_owned();
                 let schema_change = is_schema_change(&query_text);
+                if schema_change && incremental.has_window() {
+                    return Err(Error::Source(
+                        "MySQL schema change encountered while an incremental snapshot window was open; the uncommitted chunk must be retried"
+                            .into(),
+                    ));
+                }
                 let mut record =
                     state.handle_query(&query_text, event_start, header.server_id(), source_time);
                 if schema_change && let Some(record) = &mut record {
@@ -1014,6 +1145,7 @@ impl MySqlSource {
         last_safe_position: &mut Option<SourcePosition>,
         reconnect_attempts: &mut u32,
         heartbeat_connection: &mut Option<Conn>,
+        stream_cursor: &mut BinlogCursor,
     ) -> Result<Option<Error>> {
         let mut heartbeat = heartbeat_timer(self.config.heartbeat_interval);
         let mut file_signal_poll = file_signal_timer(&self.config);
@@ -1024,11 +1156,15 @@ impl MySqlSource {
                 _ = context.cancellation.cancelled() => return Ok(None),
                 _ = incremental_tick.tick(),
                     if incremental.is_active() && state.transaction.is_none() => {
-                    let base = last_safe_position.clone().unwrap_or_else(|| mysql_position(
-                        &state.current_filename, 4, None, self.source_server_id, 0, false,
-                    ));
-                    incremental.run_next_chunk(self, &base, &context.output).await?;
-                    if let Some(position) = incremental.latest_position(&base)? {
+                    incremental.start_next_chunk(self).await?;
+                    if incremental.window_reached(stream_cursor) {
+                        let base = last_safe_position.clone().unwrap_or_else(|| mysql_position(
+                            &state.current_filename, stream_cursor.position, None,
+                            self.source_server_id, 0, false,
+                        ));
+                        let position = incremental
+                            .finish_window(self, &base, &context.output)
+                            .await?;
                         *last_safe_position = Some(position);
                     }
                 }
@@ -1083,12 +1219,30 @@ impl MySqlSource {
                             )));
                         }
                     };
+                    let event_filename = state.current_filename.clone();
+                    let event_end = u64::from(event.header().log_pos());
                     if let Some(position) = self
                         .process_binlog_event(event, stream, state, incremental, context)
                         .await?
                     {
                         *last_safe_position = Some(position);
                         *reconnect_attempts = 0;
+                    }
+                    if state.current_filename != event_filename {
+                        stream_cursor.filename.clone_from(&state.current_filename);
+                        stream_cursor.position = 4;
+                    } else if event_end != 0 {
+                        stream_cursor.position = event_end;
+                    }
+                    if incremental.window_reached(stream_cursor) && state.transaction.is_none() {
+                        let base = last_safe_position.clone().unwrap_or_else(|| mysql_position(
+                            &stream_cursor.filename, stream_cursor.position, None,
+                            self.source_server_id, 0, false,
+                        ));
+                        let position = incremental
+                            .finish_window(self, &base, &context.output)
+                            .await?;
+                        *last_safe_position = Some(position);
                     }
                 }
                 () = next_heartbeat(&mut heartbeat) => {
@@ -1278,6 +1432,7 @@ impl SourceConnector for MySqlSource {
                 "MySQL streaming started"
             );
 
+            let mut stream_cursor = BinlogCursor::from(&stream_coordinates);
             let failure = self
                 .consume_binlog_stream(
                     &mut stream,
@@ -1287,6 +1442,7 @@ impl SourceConnector for MySqlSource {
                     &mut last_safe_position,
                     &mut reconnect_attempts,
                     &mut heartbeat_connection,
+                    &mut stream_cursor,
                 )
                 .await?;
 
@@ -1298,6 +1454,7 @@ impl SourceConnector for MySqlSource {
             if let Err(error) = close_result {
                 debug!(%error, "failed to close disconnected MySQL binlog stream");
             }
+            incremental.discard_window();
             if !wait_for_reconnect(&self.config, &mut context, &mut reconnect_attempts, failure)
                 .await?
             {
@@ -1401,6 +1558,46 @@ fn mysql_key_from_row(row: &MySqlRow, indices: &[usize]) -> Result<Vec<MySqlKeyV
                 .and_then(mysql_key_from_value)
         })
         .collect()
+}
+
+fn mysql_key_from_binlog_row(
+    row: &BinlogRow,
+    schema: &EventSchema,
+) -> Result<Option<Vec<MySqlKeyValue>>> {
+    let mut key = Vec::new();
+    for (field_index, field) in schema.fields.iter().enumerate() {
+        if !field.primary_key {
+            continue;
+        }
+        let value = row
+            .columns_ref()
+            .iter()
+            .enumerate()
+            .find_map(|(column_index, column)| {
+                let raw_name = column.name_str();
+                let matches = raw_name
+                    .strip_prefix('@')
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .map_or_else(|| raw_name == field.name, |index| index == field_index);
+                matches.then(|| row.as_ref(column_index)).flatten()
+            });
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let BinlogValue::Value(value) = value else {
+            return Err(Error::Source(format!(
+                "MySQL incremental snapshot primary-key column {:?} has an unsupported binlog value",
+                field.name
+            )));
+        };
+        key.push(mysql_key_from_value(value)?);
+    }
+    if key.is_empty() {
+        return Err(Error::Source(
+            "MySQL incremental snapshot table has no primary-key fields".into(),
+        ));
+    }
+    Ok(Some(key))
 }
 
 fn mysql_key_from_values(values: Vec<Value>) -> Result<Vec<MySqlKeyValue>> {
