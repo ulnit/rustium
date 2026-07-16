@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) const SQLSERVER_STATE_FORMAT: &str = "rustium.sqlserver.connector-state";
 const SQLSERVER_STATE_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub(crate) enum SqlServerKeyValue {
     Boolean(bool),

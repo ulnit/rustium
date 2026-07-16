@@ -642,7 +642,9 @@ async fn resumes_incremental_snapshot_with_persisted_keyset() -> TestResult {
     let settings = TestSettings::from_env()?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let table_name = format!("rustium_incremental_{}", &suffix[..12]);
+    let signal_table = format!("rustium_inc_signal_{}", &suffix[..12]);
     let capture_instance = format!("rustium_inc_cap_{}", &suffix[..12]);
+    let signal_capture = format!("rustium_inc_sig_cap_{}", &suffix[..12]);
     let connector_name = format!("sqlserver-incremental-{}", &suffix[..12]);
     let signal_id = format!("sqlserver-signal-{}", &suffix[..12]);
     let mut client = connect(&settings).await?;
@@ -652,19 +654,31 @@ async fn resumes_incremental_snapshot_with_persisted_keyset() -> TestResult {
             &mut client,
             &format!(
                 "CREATE TABLE dbo.{table_name} (id bigint NOT NULL PRIMARY KEY, value nvarchar(50) NOT NULL); \
+                 CREATE TABLE dbo.{signal_table} (id nvarchar(200) NOT NULL PRIMARY KEY, [type] nvarchar(64) NOT NULL, data nvarchar(max) NOT NULL); \
                  INSERT INTO dbo.{table_name} VALUES (1, N'one'), (2, N'two'), (3, N'three'); \
                  EXEC sys.sp_cdc_enable_table \
                     @source_schema=N'dbo', \
                     @source_name=N'{table_name}', \
                     @capture_instance=N'{capture_instance}', \
                     @role_name=NULL, \
+                    @supports_net_changes=0; \
+                 EXEC sys.sp_cdc_enable_table \
+                    @source_schema=N'dbo', \
+                    @source_name=N'{signal_table}', \
+                    @capture_instance=N'{signal_capture}', \
+                    @role_name=NULL, \
                     @supports_net_changes=0;"
             ),
         )
         .await?;
         wait_for_capture_instance(&mut client, &capture_instance).await?;
+        wait_for_capture_instance(&mut client, &signal_capture).await?;
 
         let mut config = settings.source_config(&table_name);
+        config.signal_data_collection = Some(format!(
+            "{}.dbo.{}",
+            settings.database, signal_table
+        ));
         config.signal_enabled_channels = vec!["in-process".into()];
         config.incremental_snapshot_chunk_size = 1;
         let mut source = SqlServerSource::new(
@@ -801,7 +815,11 @@ async fn resumes_incremental_snapshot_with_persisted_keyset() -> TestResult {
     }
     .await;
 
-    let cleanup_result = cleanup(&mut client, &table_name, &capture_instance).await;
+    let cleanup_result = async {
+        cleanup(&mut client, &signal_table, &signal_capture).await?;
+        cleanup(&mut client, &table_name, &capture_instance).await
+    }
+    .await;
     let close_result = client.close().await.map_err(boxed_error);
     match (outcome, cleanup_result, close_result) {
         (Ok(()), Ok(()), Ok(())) => Ok(()),
@@ -815,6 +833,191 @@ async fn resumes_incremental_snapshot_with_persisted_keyset() -> TestResult {
             Err(error)
         }
         (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external SQL Server 2017+ instance with CDC and SQL Server Agent enabled"]
+async fn deduplicates_incremental_rows_changed_inside_the_cdc_window() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_window_{}", &suffix[..12]);
+    let signal_table = format!("rustium_window_sig_{}", &suffix[..12]);
+    let capture_instance = format!("rustium_win_cap_{}", &suffix[..12]);
+    let signal_capture = format!("rustium_win_sig_cap_{}", &suffix[..12]);
+    let connector_name = format!("sqlserver-window-{}", &suffix[..12]);
+    let signal_id = format!("sqlserver-window-signal-{}", &suffix[..12]);
+    let mut client = connect(&settings).await?;
+    let mut observer = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        execute_batch(
+            &mut client,
+            &format!(
+                "CREATE TABLE dbo.{table_name} (id bigint NOT NULL PRIMARY KEY, value nvarchar(50) NOT NULL); \
+                 CREATE TABLE dbo.{signal_table} (id nvarchar(200) NOT NULL PRIMARY KEY, [type] nvarchar(64) NOT NULL, data nvarchar(max) NOT NULL); \
+                 INSERT INTO dbo.{table_name} VALUES (1, N'before'), (2, N'stable'); \
+                 EXEC sys.sp_cdc_enable_table \
+                    @source_schema=N'dbo', @source_name=N'{table_name}', \
+                    @capture_instance=N'{capture_instance}', @role_name=NULL, @supports_net_changes=0; \
+                 EXEC sys.sp_cdc_enable_table \
+                    @source_schema=N'dbo', @source_name=N'{signal_table}', \
+                    @capture_instance=N'{signal_capture}', @role_name=NULL, @supports_net_changes=0;"
+            ),
+        )
+        .await?;
+        wait_for_capture_instance(&mut client, &capture_instance).await?;
+        wait_for_capture_instance(&mut client, &signal_capture).await?;
+
+        let mut config = settings.source_config(&table_name);
+        config.signal_data_collection = Some(format!(
+            "{}.dbo.{}",
+            settings.database, signal_table
+        ));
+        config.signal_enabled_channels = vec!["in-process".into()];
+        config.incremental_snapshot_chunk_size = 2;
+        config.poll_interval = Duration::from_millis(50);
+        let mut source = SqlServerSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+
+        execute_batch(
+            &mut client,
+            &format!(
+                "BEGIN TRANSACTION; \
+                 UPDATE dbo.{table_name} SET value = N'during-window' WHERE id = 1;"
+            ),
+        )
+        .await?;
+        let (mut output, signal_sender, cancellation, source_task) =
+            start_source_with_signals(source, None);
+        signal_sender
+            .send(SignalRecord::new(
+                &signal_id,
+                "execute-snapshot",
+                serde_json::json!({
+                    "type": "incremental",
+                    "data-collections": [format!("dbo\\.{}", table_name)]
+                }),
+            ))
+            .await?;
+        wait_for_signal_type(&mut observer, &signal_table, "snapshot-window-open").await?;
+        execute_batch(&mut client, "COMMIT TRANSACTION").await?;
+
+        let capture_result: TestResult<(usize, Vec<i128>)> = async {
+            let mut update_events = 0;
+            let mut snapshot_ids = Vec::new();
+            let mut last_position: Option<SourcePosition> = None;
+            loop {
+                let record = receive(&mut output).await?;
+                if let Some(previous) = &last_position {
+                    require(
+                        previous.is_at_or_before(&record.position),
+                        &format!(
+                            "SQL Server incremental window moved backwards from {previous:?} to {:?}",
+                            record.position
+                        ),
+                    )?;
+                }
+                last_position = Some(record.position.clone());
+                if let Some(event) = &record.event
+                    && event.source.table.as_deref() == Some(table_name.as_str())
+                {
+                    let id = event
+                        .after
+                        .as_ref()
+                        .or(event.before.as_ref())
+                        .and_then(|row| row.get("id"))
+                        .and_then(sqlserver_integer);
+                    if event
+                        .source
+                        .attributes
+                        .get("rustium.snapshot.kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("incremental")
+                    {
+                        if let Some(id) = id {
+                            snapshot_ids.push(id);
+                        }
+                    } else if event.operation == Operation::Update && id == Some(1) {
+                        require(
+                            event.after.as_ref().and_then(|row| row.get("value"))
+                                == Some(&DataValue::String("during-window".into())),
+                            "SQL Server window update has the wrong after image",
+                        )?;
+                        update_events += 1;
+                    }
+                }
+                let completed = record
+                    .connector_state
+                    .as_ref()
+                    .and_then(|state| state.payload.get("completed_signal_ids"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&signal_id)));
+                if completed {
+                    break Ok((update_events, snapshot_ids));
+                }
+            }
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        let (update_events, snapshot_ids) =
+            combine_capture_and_stop(capture_result, stop_result)?;
+        require(
+            update_events == 1,
+            &format!("expected one SQL Server CDC update, got {update_events}"),
+        )?;
+        require(
+            snapshot_ids == [2],
+            &format!(
+                "SQL Server CDC window emitted changed or missing rows: {snapshot_ids:?}"
+            ),
+        )
+    }
+    .await;
+
+    let rollback_result =
+        execute_batch(&mut client, "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION").await;
+    let cleanup_result = async {
+        cleanup(&mut client, &signal_table, &signal_capture).await?;
+        cleanup(&mut client, &table_name, &capture_instance).await
+    }
+    .await;
+    let observer_close = observer.close().await.map_err(boxed_error);
+    let close_result = client.close().await.map_err(boxed_error);
+    match (
+        outcome,
+        rollback_result,
+        cleanup_result,
+        observer_close,
+        close_result,
+    ) {
+        (Ok(()), Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), rollback, cleanup, observer_close, close) => {
+            if let Err(rollback_error) = rollback {
+                eprintln!("SQL Server window rollback also failed: {rollback_error}");
+            }
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("SQL Server window cleanup also failed: {cleanup_error}");
+            }
+            if let Err(close_error) = observer_close {
+                eprintln!("SQL Server window observer close also failed: {close_error}");
+            }
+            if let Err(close_error) = close {
+                eprintln!("SQL Server window close also failed: {close_error}");
+            }
+            Err(error)
+        }
+        (Ok(()), Err(error), _, _, _)
+        | (Ok(()), Ok(()), Err(error), _, _)
+        | (Ok(()), Ok(()), Ok(()), Err(error), _)
+        | (Ok(()), Ok(()), Ok(()), Ok(()), Err(error)) => Err(error),
     }
 }
 
@@ -1268,6 +1471,38 @@ async fn wait_for_capture_instance(client: &mut SqlClient, capture_instance: &st
     Err(test_error(
         "SQL Server CDC capture instance did not finish initialization",
     ))
+}
+
+async fn wait_for_signal_type(
+    client: &mut SqlClient,
+    signal_table: &str,
+    signal_type: &str,
+) -> TestResult {
+    for _ in 0..300 {
+        let row = client
+            .query(
+                &format!(
+                    "SELECT CAST(COUNT(*) AS int) AS signal_count \
+                     FROM dbo.{signal_table} WHERE [type] = @P1"
+                ),
+                &[&signal_type],
+            )
+            .await?
+            .into_row()
+            .await?;
+        if row
+            .as_ref()
+            .and_then(|row| row.get::<i32, _>("signal_count"))
+            .unwrap_or_default()
+            > 0
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(test_error(&format!(
+        "SQL Server signal table did not receive {signal_type}"
+    )))
 }
 
 async fn cleanup(client: &mut SqlClient, table_name: &str, capture_instance: &str) -> TestResult {

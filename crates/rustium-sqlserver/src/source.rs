@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -28,6 +28,8 @@ const RAW_UPDATE_BEFORE: i32 = 3;
 const RAW_UPDATE_AFTER: i32 = 4;
 const COMMIT_SERIAL: u64 = 5;
 const MAX_COMPLETED_SIGNAL_IDS: usize = 1_024;
+const WINDOW_OPEN_SIGNAL: &str = "snapshot-window-open";
+const WINDOW_CLOSE_SIGNAL: &str = "snapshot-window-close";
 
 type SqlClient = Client<Compat<TcpStream>>;
 
@@ -128,6 +130,8 @@ enum SnapshotSignal {
 
 struct SqlServerIncrementalSnapshot {
     progress: Option<IncrementalSnapshotProgress>,
+    opening_window_id: Option<String>,
+    window: Option<SqlServerIncrementalWindow>,
     completed_signal_ids: Vec<String>,
     event_serial: u64,
     state_dirty: bool,
@@ -140,6 +144,8 @@ impl SqlServerIncrementalSnapshot {
     ) -> Self {
         Self {
             progress,
+            opening_window_id: None,
+            window: None,
             completed_signal_ids,
             event_serial: 0,
             state_dirty: false,
@@ -158,18 +164,17 @@ impl SqlServerIncrementalSnapshot {
         self.progress
             .as_ref()
             .is_some_and(|progress| !progress.paused)
+            && self.opening_window_id.is_none()
+            && self.window.is_none()
+    }
+
+    fn discard_window(&mut self) {
+        self.opening_window_id = None;
+        self.window = None;
     }
 
     fn state_dirty(&self) -> bool {
         self.state_dirty
-    }
-
-    fn latest_position(&self, base: &SourcePosition) -> Result<Option<SourcePosition>> {
-        if self.event_serial == 0 {
-            Ok(None)
-        } else {
-            sqlserver_incremental_position(base, self.event_serial).map(Some)
-        }
     }
 
     fn mark_checkpointed(&mut self) {
@@ -230,6 +235,12 @@ impl SqlServerIncrementalSnapshot {
                     tracing::warn!(%id, "SQL Server incremental snapshot is already active; execute signal ignored");
                     return Ok(());
                 }
+                source.signal_capture().ok_or_else(|| {
+                    Error::Configuration(
+                        "SQL Server incremental snapshots require a CDC-enabled signal.data.collection so Rustium can emit open/close watermarks"
+                            .into(),
+                    )
+                })?;
                 self.progress = Some(IncrementalSnapshotProgress {
                     signal_id: id,
                     data_collections: source.expand_data_collections(&data_collections)?,
@@ -251,6 +262,7 @@ impl SqlServerIncrementalSnapshot {
                     return Ok(());
                 };
                 if data_collections.is_empty() {
+                    self.discard_window();
                     self.remember_completed(progress.signal_id);
                     self.state_dirty = true;
                     info!(%id, "SQL Server incremental snapshot stopped");
@@ -271,6 +283,7 @@ impl SqlServerIncrementalSnapshot {
                     self.progress = Some(progress);
                     return Ok(());
                 }
+                self.discard_window();
                 if current
                     .as_ref()
                     .is_some_and(|collection| collection_matches_any(collection, &patterns))
@@ -315,18 +328,32 @@ impl SqlServerIncrementalSnapshot {
         }
     }
 
-    async fn run_next_chunk(
-        &mut self,
-        source: &SqlServerSource,
-        base_position: &SourcePosition,
-        output: &tokio::sync::mpsc::Sender<Result<SourceRecord>>,
-    ) -> Result<()> {
+    async fn start_next_chunk(&mut self, source: &SqlServerSource) -> Result<()> {
+        if self.opening_window_id.is_some() || self.window.is_some() {
+            return Ok(());
+        }
         let Some(progress) = self.progress.clone() else {
             return Ok(());
         };
         if progress.paused {
             return Ok(());
         }
+        let window_id = format!(
+            "rustium-window-{}-{}",
+            progress.chunk_sequence,
+            uuid::Uuid::new_v4().simple()
+        );
+        source
+            .emit_incremental_watermark(&format!("{window_id}-open"), WINDOW_OPEN_SIGNAL)
+            .await?;
+        self.opening_window_id = Some(window_id);
+        Ok(())
+    }
+
+    async fn open_window(&mut self, source: &SqlServerSource, window_id: String) -> Result<()> {
+        let Some(progress) = self.progress.clone() else {
+            return Ok(());
+        };
         let collection = progress
             .data_collections
             .get(progress.current_collection)
@@ -346,7 +373,129 @@ impl SqlServerIncrementalSnapshot {
         let chunk = source.read_incremental_chunk(&capture, &progress).await?;
         let row_count = chunk.rows.len();
         let last_key = chunk.rows.last().map(|(_, key)| key.clone());
-        for (row, _) in chunk.rows {
+        let remaining_keys = chunk
+            .rows
+            .iter()
+            .map(|(_, key)| key.clone())
+            .collect::<HashSet<_>>();
+        self.window = Some(SqlServerIncrementalWindow {
+            id: window_id.clone(),
+            collection,
+            capture,
+            rows: chunk.rows,
+            remaining_keys,
+            maximum_key: chunk.maximum_key,
+            last_key,
+            row_count,
+            close_commit_lsn: None,
+        });
+        source
+            .emit_incremental_watermark(&format!("{window_id}-close"), WINDOW_CLOSE_SIGNAL)
+            .await?;
+        Ok(())
+    }
+
+    async fn handle_internal_signal(
+        &mut self,
+        record: &SourceRecord,
+        row: &Row,
+        source: &SqlServerSource,
+    ) -> Result<bool> {
+        let signal_type = signal_text(row, "type")?;
+        if !matches!(
+            signal_type.as_str(),
+            WINDOW_OPEN_SIGNAL | WINDOW_CLOSE_SIGNAL
+        ) {
+            return Ok(false);
+        }
+        let id = signal_text(row, "id")?;
+        let opening_matches = self
+            .opening_window_id
+            .as_ref()
+            .is_some_and(|window_id| id == format!("{window_id}-open"));
+        let closing_matches = self
+            .window
+            .as_ref()
+            .is_some_and(|window| id == format!("{}-close", window.id));
+        if signal_type == WINDOW_OPEN_SIGNAL && opening_matches {
+            let window_id = self.opening_window_id.take().ok_or_else(|| {
+                Error::State("SQL Server incremental opening window disappeared".into())
+            })?;
+            self.open_window(source, window_id).await?;
+        } else if signal_type == WINDOW_CLOSE_SIGNAL && closing_matches {
+            let SourcePosition::SqlServer(position) = &record.position else {
+                return Err(Error::State(
+                    "SQL Server watermark record has a non-SQL Server position".into(),
+                ));
+            };
+            let capture = self
+                .window
+                .as_ref()
+                .map(|window| window.capture.clone())
+                .ok_or_else(|| Error::State("SQL Server incremental window disappeared".into()))?;
+            source.validate_incremental_schema(&capture).await?;
+            if let Some(window) = &mut self.window {
+                window.close_commit_lsn = Some(position.commit_lsn.clone());
+            }
+        }
+        Ok(true)
+    }
+
+    fn observe_record(&mut self, record: &SourceRecord) -> Result<()> {
+        let Some(window) = &mut self.window else {
+            return Ok(());
+        };
+        if window.close_commit_lsn.is_some() {
+            return Ok(());
+        }
+        let Some(event) = &record.event else {
+            return Ok(());
+        };
+        let collection = event
+            .source
+            .schema
+            .as_deref()
+            .zip(event.source.table.as_deref())
+            .map(|(schema, table)| format!("{schema}.{table}"));
+        if collection.as_deref() != Some(window.collection.as_str()) {
+            return Ok(());
+        }
+        for row in [event.before.as_ref(), event.after.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let key = sqlserver_key_from_row(row, &window.capture.event_schema)?;
+            window.remaining_keys.remove(&key);
+        }
+        Ok(())
+    }
+
+    fn closes_at(&self, record: &SourceRecord) -> bool {
+        let SourcePosition::SqlServer(position) = &record.position else {
+            return false;
+        };
+        record.boundary == RecordBoundary::TransactionCommit
+            && self.window.as_ref().is_some_and(|window| {
+                window.close_commit_lsn.as_deref() == Some(position.commit_lsn.as_str())
+            })
+    }
+
+    async fn finish_window(
+        &mut self,
+        source: &SqlServerSource,
+        base_position: &SourcePosition,
+        output: &tokio::sync::mpsc::Sender<Result<SourceRecord>>,
+    ) -> Result<SourcePosition> {
+        let window = self.window.take().ok_or_else(|| {
+            Error::State("SQL Server incremental snapshot has no pending window".into())
+        })?;
+        let progress = self.progress.clone().ok_or_else(|| {
+            Error::State("SQL Server incremental snapshot window has no progress".into())
+        })?;
+        for (row, key) in window.rows {
+            if !window.remaining_keys.contains(&key) {
+                continue;
+            }
             self.event_serial = self.event_serial.saturating_add(1);
             let position = sqlserver_incremental_position(base_position, self.event_serial)?;
             let mut attributes = BTreeMap::new();
@@ -356,15 +505,15 @@ impl SqlServerIncrementalSnapshot {
                     &source.connector_name,
                     source.database(),
                     &position,
-                    &collection,
+                    &window.collection,
                     self.event_serial,
                 ),
                 source: SourceMetadata {
                     connector: "sqlserver".into(),
                     connector_name: source.connector_name.clone(),
                     database: source.database().into(),
-                    schema: Some(capture.schema.clone()),
-                    table: Some(capture.table.clone()),
+                    schema: Some(window.capture.schema.clone()),
+                    table: Some(window.capture.table.clone()),
                     snapshot: true,
                     version: CONNECTOR_VERSION.into(),
                     attributes,
@@ -374,7 +523,7 @@ impl SqlServerIncrementalSnapshot {
                 operation: Operation::Read,
                 before: None,
                 after: Some(row),
-                schema: capture.event_schema.clone(),
+                schema: window.capture.event_schema.clone(),
                 source_time: None,
                 observed_time: Utc::now(),
             };
@@ -386,12 +535,12 @@ impl SqlServerIncrementalSnapshot {
 
         let mut next = progress;
         if next.maximum_key.is_none() {
-            next.maximum_key.clone_from(&chunk.maximum_key);
+            next.maximum_key.clone_from(&window.maximum_key);
         }
-        next.last_key = last_key;
+        next.last_key = window.last_key;
         let collection_complete = next.maximum_key.is_none()
             || next.last_key.as_ref() == next.maximum_key.as_ref()
-            || row_count < source.config.incremental_snapshot_chunk_size;
+            || window.row_count < source.config.incremental_snapshot_chunk_size;
         if collection_complete {
             next.current_collection = next.current_collection.saturating_add(1);
             next.last_key = None;
@@ -410,7 +559,7 @@ impl SqlServerIncrementalSnapshot {
         output
             .send(Ok(SourceRecord {
                 event: None,
-                position,
+                position: position.clone(),
                 boundary: RecordBoundary::TransactionCommit,
                 connector_state: Some(encode_connector_state(
                     self.progress.as_ref(),
@@ -421,13 +570,25 @@ impl SqlServerIncrementalSnapshot {
             .await
             .map_err(|_| Error::Cancelled)?;
         self.mark_checkpointed();
-        Ok(())
+        Ok(position)
     }
 }
 
 struct IncrementalChunk {
     rows: Vec<(Row, Vec<SqlServerKeyValue>)>,
     maximum_key: Option<Vec<SqlServerKeyValue>>,
+}
+
+struct SqlServerIncrementalWindow {
+    id: String,
+    collection: String,
+    capture: CaptureTable,
+    rows: Vec<(Row, Vec<SqlServerKeyValue>)>,
+    remaining_keys: HashSet<Vec<SqlServerKeyValue>>,
+    maximum_key: Option<Vec<SqlServerKeyValue>>,
+    last_key: Option<Vec<SqlServerKeyValue>>,
+    row_count: usize,
+    close_commit_lsn: Option<String>,
 }
 
 pub struct SqlServerSource {
@@ -584,6 +745,55 @@ impl SqlServerSource {
         Ok(anchor)
     }
 
+    fn signal_capture(&self) -> Option<CaptureTable> {
+        let signal = signal_table_key(&self.config)?;
+        self.captures
+            .iter()
+            .find(|capture| capture.key() == signal)
+            .cloned()
+    }
+
+    async fn emit_incremental_watermark(&self, id: &str, signal_type: &str) -> Result<()> {
+        let capture = self.signal_capture().ok_or_else(|| {
+            Error::Configuration(
+                "SQL Server incremental snapshots require a CDC-enabled signal.data.collection"
+                    .into(),
+            )
+        })?;
+        let table = format!(
+            "{}.{}",
+            quote_identifier(&capture.schema),
+            quote_identifier(&capture.table)
+        );
+        let data = serde_json::json!({
+            "connector": self.connector_name,
+            "watermark": signal_type,
+        })
+        .to_string();
+        let mut client = connect(&self.config, self.database()).await?;
+        client
+            .execute(
+                format!("INSERT INTO {table} ([id], [type], [data]) VALUES (@P1, @P2, @P3)"),
+                &[&id, &signal_type, &data],
+            )
+            .await
+            .map_err(sqlserver_error)?;
+        client.close().await.map_err(sqlserver_error)
+    }
+
+    async fn validate_incremental_schema(&self, capture: &CaptureTable) -> Result<()> {
+        let mut client = connect(&self.config, self.database()).await?;
+        let fields = discover_fields(&mut client, capture.source_object_id).await?;
+        client.close().await.map_err(sqlserver_error)?;
+        if fields != capture.event_schema.fields {
+            return Err(Error::Source(format!(
+                "SQL Server schema changed while incremental snapshot window for {}.{} was open",
+                capture.schema, capture.table
+            )));
+        }
+        Ok(())
+    }
+
     fn capture_for_collection(&self, collection: &str) -> Option<CaptureTable> {
         self.captures
             .iter()
@@ -662,6 +872,13 @@ impl SqlServerSource {
             quote_identifier(&capture.table)
         );
         let mut client = connect(&self.config, self.database()).await?;
+        let current_fields = discover_fields(&mut client, capture.source_object_id).await?;
+        if current_fields != capture.event_schema.fields {
+            return Err(Error::Source(format!(
+                "SQL Server schema changed before incremental snapshot query for {}.{}",
+                capture.schema, capture.table
+            )));
+        }
         let maximum_key = match &progress.maximum_key {
             Some(key) => Some(key.clone()),
             None => {
@@ -877,11 +1094,7 @@ impl SourceConnector for SqlServerSource {
                     if incremental.is_active()
                         && state.transaction.is_none()
                         && state.cursor.commit_complete() => {
-                    let base = last_safe_position.clone();
-                    incremental.run_next_chunk(self, &base, &context.output).await?;
-                    if let Some(position) = incremental.latest_position(&base)? {
-                        last_safe_position = position;
-                    }
+                    incremental.start_next_chunk(self).await?;
                 }
                 () = next_file_signal_poll(&mut file_signal_poll),
                     if signal_channel_enabled(&self.config, "file")
@@ -960,12 +1173,27 @@ impl SourceConnector for SqlServerSource {
                     ).await?;
                     for mut record in records {
                         if let Some(signal_row) = source_signal_row(&record, &self.config) {
-                            if signal_channel_enabled(&self.config, "source")
-                                && let Some(signal_row) = signal_row
-                            {
-                                let signal = SqlServerIncrementalSnapshot::parse_row(signal_row)?;
-                                incremental.handle_signal(signal, self)?;
+                            if let Some(signal_row) = signal_row {
+                                if incremental
+                                    .handle_internal_signal(&record, signal_row, self)
+                                    .await?
+                                {
+                                    continue;
+                                }
+                                if signal_channel_enabled(&self.config, "source") {
+                                    let signal =
+                                        SqlServerIncrementalSnapshot::parse_row(signal_row)?;
+                                    incremental.handle_signal(signal, self)?;
+                                }
                             }
+                            continue;
+                        }
+                        incremental.observe_record(&record)?;
+                        if incremental.closes_at(&record) {
+                            let base = record.position.clone();
+                            last_safe_position = incremental
+                                .finish_window(self, &base, &context.output)
+                                .await?;
                             continue;
                         }
                         if record.boundary == RecordBoundary::TransactionCommit
@@ -1244,6 +1472,30 @@ fn sqlserver_key_from_projection(
                 .and_then(|value| sqlserver_key_from_data_value(&value))
         })
         .collect()
+}
+
+fn sqlserver_key_from_row(row: &Row, schema: &EventSchema) -> Result<Vec<SqlServerKeyValue>> {
+    let key = schema
+        .fields
+        .iter()
+        .filter(|field| field.primary_key)
+        .map(|field| {
+            row.get(&field.name)
+                .ok_or_else(|| {
+                    Error::Source(format!(
+                        "SQL Server CDC row is missing primary-key column {:?}",
+                        field.name
+                    ))
+                })
+                .and_then(sqlserver_key_from_data_value)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if key.is_empty() {
+        return Err(Error::Source(
+            "SQL Server incremental snapshot table has no primary-key fields".into(),
+        ));
+    }
+    Ok(key)
 }
 
 fn sqlserver_key_from_data_value(value: &DataValue) -> Result<SqlServerKeyValue> {
