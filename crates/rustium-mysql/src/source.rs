@@ -701,7 +701,7 @@ impl MySqlSource {
                     .await?;
             let mut ordered = schemas
                 .values()
-                .filter(|schema| self.config.tables.includes(&schema.database, &schema.table))
+                .filter(|schema| is_business_table(&self.config, &schema.database, &schema.table))
                 .cloned()
                 .collect::<Vec<_>>();
             ordered.sort_by_key(TableSchema::key);
@@ -1552,6 +1552,14 @@ fn signal_table_key(config: &MySqlSourceConfig) -> Option<(String, String)> {
     Some((database.to_owned(), table.to_owned()))
 }
 
+fn is_business_table(config: &MySqlSourceConfig, database: &str, table: &str) -> bool {
+    config.tables.includes(database, table)
+        && (config.databases.is_empty() || config.databases.iter().any(|name| name == database))
+        && signal_table_key(config).is_none_or(|(signal_database, signal_table)| {
+            signal_database != database || signal_table != table
+        })
+}
+
 fn validate_signal_schema(schema: &TableSchema) -> Result<()> {
     let expected = ["id", "type", "data"];
     if schema.event_schema.fields.len() != expected.len()
@@ -2051,9 +2059,8 @@ impl StreamingState {
     ) -> Result<Vec<SourceRecord>> {
         let database = table_map.database_name().into_owned();
         let table = table_map.table_name().into_owned();
-        if !config.tables.includes(&database, &table)
-            || (!config.databases.is_empty() && !config.databases.contains(&database))
-        {
+        let key = (database.clone(), table.clone());
+        if !is_business_table(config, &database, &table) {
             return Ok(Vec::new());
         }
         if self
@@ -2063,8 +2070,6 @@ impl StreamingState {
         {
             return Ok(Vec::new());
         }
-
-        let key = (database.clone(), table.clone());
         let schema = self.schemas.get(&key).cloned().ok_or_else(|| {
             Error::Source(format!(
                 "received an event for unknown MySQL table {database}.{table}"
@@ -3369,6 +3374,14 @@ mod tests {
             ])),
             Err(Error::Configuration(message)) if message.contains("exactly text-compatible")
         ));
+    }
+
+    #[test]
+    fn excludes_mysql_signal_table_from_business_selection() {
+        let mut config = test_mysql_config();
+        config.signal_data_collection = Some("inventory.rustium_signal".into());
+        assert!(!is_business_table(&config, "inventory", "rustium_signal"));
+        assert!(is_business_table(&config, "inventory", "orders"));
     }
 
     #[test]
