@@ -912,7 +912,9 @@ mod tests {
                 id,
                 destination: "orders".into(),
                 key: Some(Bytes::from_static(b"1")),
+                key_schema: None,
                 payload,
+                payload_schema: None,
                 headers: BTreeMap::new(),
             };
             Ok(vec![
@@ -1130,7 +1132,9 @@ mod tests {
                 id: event.id.clone(),
                 destination: "orders".into(),
                 key: Some(Bytes::from_static(b"1")),
+                key_schema: None,
                 payload: Some(Bytes::from_static(b"value")),
+                payload_schema: None,
                 headers: BTreeMap::new(),
             })
         }

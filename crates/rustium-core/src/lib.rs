@@ -11,6 +11,7 @@ pub use event::{
     ChangeEvent, ConnectorIdentity, ConnectorStateEnvelope, DataValue, DeliveryBatch, EncodedEvent,
     EventId, EventSchema, FieldSchema, MySqlPosition, Operation, PostgresPosition, RecordBoundary,
     Row, SourceMetadata, SourcePosition, SourceRecord, SqlServerPosition, TransactionMetadata,
+    WireSchema, WireSchemaType,
 };
 pub use runtime::{
     ConnectorRuntime, ConnectorState, RetryPolicy, RuntimeConfig, RuntimeStatus, StatusSnapshot,

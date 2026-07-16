@@ -145,5 +145,5 @@ jobs:
             libsasl2-dev \
             libssl-dev \
             pkg-config
-      - name: Test Kafka Sink against a real broker
+      - name: Test Kafka Sink and Schema Registry
         run: bash scripts/test-kafka-sink.sh

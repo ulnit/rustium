@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use rustium_core::{
-    ChangeEvent, EncodedEvent, Error, EventEncoder, Operation, Result, Row, SourcePosition,
+    ChangeEvent, EncodedEvent, Error, EventEncoder, FieldSchema, Operation, Result, Row,
+    SourcePosition, WireSchema, WireSchemaType,
 };
 
 #[derive(Debug, Clone)]
@@ -61,6 +62,62 @@ impl DebeziumJsonEncoder {
     }
 }
 
+pub struct DebeziumJsonSchemaEncoder {
+    inner: DebeziumJsonEncoder,
+}
+
+impl DebeziumJsonSchemaEncoder {
+    #[must_use]
+    pub fn new(config: JsonEncoderConfig) -> Self {
+        Self {
+            inner: DebeziumJsonEncoder::new(config),
+        }
+    }
+
+    fn attach_schemas(&self, event: &ChangeEvent, records: &mut [EncodedEvent]) -> Result<()> {
+        let Some(first) = records.first() else {
+            return Ok(());
+        };
+        let key_schema = first
+            .key
+            .is_some()
+            .then(|| json_key_schema(event, &first.destination, &self.inner.config))
+            .transpose()?;
+        let payload_schema = json_payload_schema(event, &first.destination, &self.inner.config)?;
+        for record in records {
+            if record.key.is_some() {
+                record.key_schema.clone_from(&key_schema);
+            }
+            if record.payload.is_some() {
+                record.payload_schema = Some(payload_schema.clone());
+            }
+            record.headers.insert(
+                "rustium.content.type".into(),
+                "application/json; framing=confluent-schema-registry".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl EventEncoder for DebeziumJsonSchemaEncoder {
+    fn content_type(&self) -> &'static str {
+        "application/json; framing=confluent-schema-registry"
+    }
+
+    fn encode(&self, event: &ChangeEvent) -> Result<EncodedEvent> {
+        let mut records = vec![self.inner.encode(event)?];
+        self.attach_schemas(event, &mut records)?;
+        Ok(records.remove(0))
+    }
+
+    fn encode_batch(&self, event: &ChangeEvent) -> Result<Vec<EncodedEvent>> {
+        let mut records = self.inner.encode_batch(event)?;
+        self.attach_schemas(event, &mut records)?;
+        Ok(records)
+    }
+}
+
 impl EventEncoder for DebeziumJsonEncoder {
     fn content_type(&self) -> &'static str {
         "application/json"
@@ -102,7 +159,9 @@ impl EventEncoder for DebeziumJsonEncoder {
             id: tombstone_id.clone(),
             destination: encoded.destination.clone(),
             key: encoded.key.clone(),
+            key_schema: encoded.key_schema.clone(),
             payload: None,
+            payload_schema: None,
             headers: encoded.headers.clone(),
         };
         tombstone
@@ -170,7 +229,9 @@ fn build_encoded(
         id: event.id.clone(),
         destination,
         key,
+        key_schema: None,
         payload: Some(Bytes::from(serde_json::to_vec(&payload)?)),
+        payload_schema: None,
         headers,
     })
 }
@@ -263,6 +324,224 @@ fn row_to_json(row: &Row, unavailable_value: &str) -> serde_json::Value {
         .into()
 }
 
+fn json_key_schema(
+    event: &ChangeEvent,
+    destination: &str,
+    config: &JsonEncoderConfig,
+) -> Result<WireSchema> {
+    let definition = if is_heartbeat(event) {
+        serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "title": format!("{}.HeartbeatKey", event.source.connector_name),
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"serverName": {"type": "string"}},
+            "required": ["serverName"],
+        })
+    } else {
+        let key_fields = event
+            .schema
+            .fields
+            .iter()
+            .filter(|field| field.primary_key)
+            .collect::<Vec<_>>();
+        let properties = key_fields
+            .iter()
+            .map(|field| {
+                (
+                    field.name.clone(),
+                    json_field_schema(field, &config.unavailable_value, true),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let required = key_fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "title": schema_title(event, "Key"),
+            "type": "object",
+            "additionalProperties": false,
+            "properties": properties,
+            "required": required,
+        })
+    };
+    wire_schema(format!("{destination}-key"), definition)
+}
+
+fn json_payload_schema(
+    event: &ChangeEvent,
+    destination: &str,
+    config: &JsonEncoderConfig,
+) -> Result<WireSchema> {
+    let definition = if is_heartbeat(event) {
+        serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "title": format!("{}.Heartbeat", event.source.connector_name),
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"ts_ms": {"type": "integer"}},
+            "required": ["ts_ms"],
+        })
+    } else {
+        let row_schema = json_row_schema(event, config);
+        serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "title": schema_title(event, "Envelope"),
+            "$comment": format!("Rustium EventSchema version {}", event.schema.version),
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "before": {"anyOf": [{"type": "null"}, row_schema.clone()]},
+                "after": {"anyOf": [{"type": "null"}, row_schema]},
+                "source": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "version": {"type": "string"},
+                        "connector": {"type": "string"},
+                        "name": {"type": "string"},
+                        "ts_ms": {"type": ["integer", "null"]},
+                        "snapshot": {"type": "string"},
+                        "db": {"type": "string"},
+                        "schema": {"type": ["string", "null"]},
+                        "table": {"type": ["string", "null"]}
+                    },
+                    "required": ["version", "connector", "name", "ts_ms", "snapshot", "db", "schema", "table"]
+                },
+                "op": {"type": "string", "enum": ["r", "c", "u", "d", "t", "m"]},
+                "ts_ms": {"type": "integer"},
+                "transaction": {
+                    "anyOf": [
+                        {"type": "null"},
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "id": {"type": "string"},
+                                "total_order": {"type": ["integer", "null"]},
+                                "data_collection_order": {"type": ["integer", "null"]}
+                            },
+                            "required": ["id", "total_order", "data_collection_order"]
+                        }
+                    ]
+                }
+            },
+            "required": ["before", "after", "source", "op", "ts_ms", "transaction"]
+        })
+    };
+    wire_schema(format!("{destination}-value"), definition)
+}
+
+fn json_row_schema(event: &ChangeEvent, config: &JsonEncoderConfig) -> serde_json::Value {
+    let properties = event
+        .schema
+        .fields
+        .iter()
+        .map(|field| {
+            (
+                field.name.clone(),
+                json_field_schema(field, &config.unavailable_value, false),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::json!({
+        "title": schema_title(event, "Value"),
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties
+    })
+}
+
+fn json_field_schema(field: &FieldSchema, unavailable_value: &str, key: bool) -> serde_json::Value {
+    let mut variants = vec![json_base_type(&field.type_name)];
+    if !key {
+        variants.push(serde_json::json!({
+            "type": "string",
+            "const": unavailable_value
+        }));
+    }
+    if field.optional {
+        variants.push(serde_json::json!({"type": "null"}));
+    }
+    if variants.len() == 1 {
+        variants.remove(0)
+    } else {
+        serde_json::json!({"anyOf": variants})
+    }
+}
+
+fn json_base_type(type_name: &str) -> serde_json::Value {
+    let normalized = type_name.trim().to_ascii_lowercase();
+    if let Some(element) = normalized.strip_suffix("[]") {
+        return serde_json::json!({
+            "type": "array",
+            "items": json_base_type(element)
+        });
+    }
+    if normalized == "hstore" || normalized.starts_with("map") {
+        return serde_json::json!({
+            "type": "object",
+            "additionalProperties": {"type": ["string", "null"]}
+        });
+    }
+    if normalized == "json" || normalized == "jsonb" {
+        return serde_json::json!({});
+    }
+    if normalized == "bool" || normalized == "boolean" || normalized == "bit" {
+        return serde_json::json!({"type": "boolean"});
+    }
+    if normalized.contains("decimal")
+        || normalized.contains("numeric")
+        || normalized.contains("money")
+    {
+        return serde_json::json!({"type": "string"});
+    }
+    if [
+        "tinyint",
+        "smallint",
+        "mediumint",
+        "integer",
+        "bigint",
+        "serial",
+        "year",
+        "int2",
+        "int4",
+        "int8",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
+        || normalized == "int"
+    {
+        return serde_json::json!({"type": "integer"});
+    }
+    if ["real", "float", "double"]
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+    {
+        return serde_json::json!({"type": ["number", "null"]});
+    }
+    serde_json::json!({"type": "string"})
+}
+
+fn schema_title(event: &ChangeEvent, suffix: &str) -> String {
+    let base = event
+        .schema
+        .name
+        .strip_suffix(".Envelope")
+        .unwrap_or(&event.schema.name);
+    format!("{base}.{suffix}")
+}
+
+fn wire_schema(subject: String, definition: serde_json::Value) -> Result<WireSchema> {
+    Ok(WireSchema {
+        subject,
+        schema_type: WireSchemaType::Json,
+        definition: serde_json::to_string(&definition)?,
+    })
+}
+
 const fn operation_code(operation: Operation) -> &'static str {
     match operation {
         Operation::Read => "r",
@@ -334,12 +613,26 @@ mod tests {
             schema: EventSchema {
                 name: "orders.app.public.customers.Envelope".into(),
                 version: 1,
-                fields: vec![FieldSchema {
-                    name: "id".into(),
-                    type_name: "int8".into(),
-                    optional: false,
-                    primary_key: true,
-                }],
+                fields: vec![
+                    FieldSchema {
+                        name: "id".into(),
+                        type_name: "int8".into(),
+                        optional: false,
+                        primary_key: true,
+                    },
+                    FieldSchema {
+                        name: "name".into(),
+                        type_name: "text".into(),
+                        optional: false,
+                        primary_key: false,
+                    },
+                    FieldSchema {
+                        name: "attributes".into(),
+                        type_name: "hstore".into(),
+                        optional: true,
+                        primary_key: false,
+                    },
+                ],
             },
             source_time: Some(Utc::now()),
             observed_time: Utc::now(),
@@ -486,5 +779,47 @@ mod tests {
         .encode(&event)
         .unwrap();
         assert_eq!(overridden.destination, "shared-heartbeat");
+    }
+
+    #[test]
+    fn emits_json_schema_registry_descriptors_and_tombstones() {
+        let encoder = DebeziumJsonSchemaEncoder::new(JsonEncoderConfig {
+            topic_prefix: "app".into(),
+            unavailable_value: "__unavailable".into(),
+            tombstones_on_delete: true,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
+        });
+        let encoded = encoder.encode(&event()).unwrap();
+        let key_schema = encoded.key_schema.as_ref().unwrap();
+        let payload_schema = encoded.payload_schema.as_ref().unwrap();
+        assert_eq!(key_schema.subject, "app.app.public.customers-key");
+        assert_eq!(payload_schema.subject, "app.app.public.customers-value");
+        assert_eq!(key_schema.schema_type, WireSchemaType::Json);
+        let key: serde_json::Value = serde_json::from_str(&key_schema.definition).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload_schema.definition).unwrap();
+        assert_eq!(key["required"], serde_json::json!(["id"]));
+        assert_eq!(key["properties"]["id"]["type"], "integer");
+        assert_eq!(
+            payload["properties"]["after"]["anyOf"][1]["properties"]["attributes"]["anyOf"][0]["type"],
+            "object"
+        );
+
+        let mut changed = event();
+        changed.schema.version = 2;
+        let changed = encoder.encode(&changed).unwrap();
+        assert_ne!(
+            payload_schema.definition,
+            changed.payload_schema.unwrap().definition
+        );
+
+        let mut deleted = event();
+        deleted.operation = Operation::Delete;
+        deleted.before = deleted.after.take();
+        let deleted = encoder.encode_batch(&deleted).unwrap();
+        assert_eq!(deleted.len(), 2);
+        assert_eq!(deleted[0].key_schema, deleted[1].key_schema);
+        assert!(deleted[0].payload_schema.is_some());
+        assert!(deleted[1].payload_schema.is_none());
     }
 }

@@ -6,11 +6,13 @@ use rustium_core::{
     CheckpointStore, ConnectorIdentity, ConnectorRuntime, EventEncoder, Result, RuntimeConfig,
     RuntimeStatus, Sink, SourceConnector,
 };
-use rustium_format_json::{DebeziumJsonEncoder, JsonEncoderConfig, RustiumJsonEncoder};
+use rustium_format_json::{
+    DebeziumJsonEncoder, DebeziumJsonSchemaEncoder, JsonEncoderConfig, RustiumJsonEncoder,
+};
 use rustium_mysql::MySqlSource;
 use rustium_postgresql::PostgresSource;
 use rustium_signal_kafka::KafkaSignalChannel;
-use rustium_sink_kafka::KafkaSink;
+use rustium_sink_kafka::{KafkaSink, SchemaRegistrySettings};
 use rustium_sink_stdout::StdoutSink;
 use rustium_sqlserver::SqlServerSource;
 use rustium_state::SqliteCheckpointStore;
@@ -315,6 +317,7 @@ fn build_encoder(config: &Config) -> Arc<dyn EventEncoder> {
     match config.format.kind {
         FormatType::RustiumJson => Arc::new(RustiumJsonEncoder::new(encoder_config)),
         FormatType::DebeziumJson => Arc::new(DebeziumJsonEncoder::new(encoder_config)),
+        FormatType::DebeziumJsonSchema => Arc::new(DebeziumJsonSchemaEncoder::new(encoder_config)),
     }
 }
 
@@ -328,13 +331,25 @@ fn build_sink(config: &Config) -> Result<Box<dyn Sink>> {
             delivery_timeout,
             properties,
             ..
-        } => Ok(Box::new(KafkaSink::new(
-            bootstrap_servers,
-            acks,
-            compression,
-            *delivery_timeout,
-            properties,
-        )?)),
+        } => {
+            let mut sink = KafkaSink::new(
+                bootstrap_servers,
+                acks,
+                compression,
+                *delivery_timeout,
+                properties,
+            )?;
+            if let Some(registry) = &config.format.schema_registry {
+                sink = sink.with_schema_registry(SchemaRegistrySettings {
+                    urls: registry.urls.clone(),
+                    username: registry.username.clone(),
+                    password: registry.password.clone(),
+                    request_timeout: registry.request_timeout,
+                    cache_capacity: registry.cache_capacity,
+                })?;
+            }
+            Ok(Box::new(sink))
+        }
     }
 }
 

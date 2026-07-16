@@ -329,8 +329,24 @@ pub struct EncodedEvent {
     pub id: EventId,
     pub destination: String,
     pub key: Option<Bytes>,
+    pub key_schema: Option<WireSchema>,
     pub payload: Option<Bytes>,
+    pub payload_schema: Option<WireSchema>,
     pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WireSchemaType {
+    Avro,
+    Json,
+    Protobuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WireSchema {
+    pub subject: String,
+    pub schema_type: WireSchemaType,
+    pub definition: String,
 }
 
 #[derive(Debug, Clone)]

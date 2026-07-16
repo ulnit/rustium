@@ -636,14 +636,7 @@ fn assemble_config(
         },
         source,
         snapshot,
-        format: FormatConfig {
-            kind: FormatType::DebeziumJson,
-            unavailable_value: properties
-                .get("unavailable.value.placeholder")
-                .cloned()
-                .unwrap_or_else(default_unavailable_value),
-            tombstones_on_delete: bool_value(properties, "tombstones.on.delete", true)?,
-        },
+        format: format_config(properties)?,
         sink,
         state: StateConfig {
             kind: StateType::Sqlite,
@@ -697,6 +690,122 @@ fn assemble_config(
     };
     config.validate()?;
     Ok(config)
+}
+
+fn format_config(properties: &BTreeMap<String, String>) -> Result<FormatConfig> {
+    const JSON_CONVERTER: &str = "org.apache.kafka.connect.json.JsonConverter";
+    const JSON_SCHEMA_CONVERTER: &str = "io.confluent.connect.json.JsonSchemaConverter";
+
+    let key_converter = properties
+        .get("key.converter")
+        .map_or(JSON_CONVERTER, String::as_str);
+    let value_converter = properties
+        .get("value.converter")
+        .map_or(JSON_CONVERTER, String::as_str);
+    let unavailable_value = properties
+        .get("unavailable.value.placeholder")
+        .cloned()
+        .unwrap_or_else(default_unavailable_value);
+    let tombstones_on_delete = bool_value(properties, "tombstones.on.delete", true)?;
+
+    if key_converter == JSON_CONVERTER && value_converter == JSON_CONVERTER {
+        return Ok(FormatConfig {
+            kind: FormatType::DebeziumJson,
+            unavailable_value,
+            tombstones_on_delete,
+            schema_registry: None,
+        });
+    }
+    if key_converter != JSON_SCHEMA_CONVERTER || value_converter != JSON_SCHEMA_CONVERTER {
+        return Err(Error::Configuration(format!(
+            "Rustium requires matching key.converter and value.converter values; supported pairs are {JSON_CONVERTER:?} and {JSON_SCHEMA_CONVERTER:?}, got {key_converter:?} and {value_converter:?}"
+        )));
+    }
+
+    let key_urls = required(properties, "key.converter.schema.registry.url")?;
+    let value_urls = required(properties, "value.converter.schema.registry.url")?;
+    if split_csv(key_urls) != split_csv(value_urls) {
+        return Err(Error::Configuration(
+            "Rustium currently requires key and value converters to use the same schema.registry.url list"
+                .into(),
+        ));
+    }
+    for prefix in ["key.converter", "value.converter"] {
+        if !bool_value(properties, &format!("{prefix}.auto.register.schemas"), true)? {
+            return Err(Error::Configuration(format!(
+                "{prefix}.auto.register.schemas=false is not implemented"
+            )));
+        }
+        if bool_value(properties, &format!("{prefix}.use.latest.version"), false)? {
+            return Err(Error::Configuration(format!(
+                "{prefix}.use.latest.version=true is not implemented"
+            )));
+        }
+        if let Some(strategy) = properties.get(&format!("{prefix}.subject.name.strategy"))
+            && !strategy.ends_with("TopicNameStrategy")
+        {
+            return Err(Error::Configuration(format!(
+                "{prefix}.subject.name.strategy={strategy:?} is not implemented; Rustium currently uses TopicNameStrategy"
+            )));
+        }
+        if let Some(source) = properties.get(&format!("{prefix}.basic.auth.credentials.source"))
+            && source != "USER_INFO"
+        {
+            return Err(Error::Configuration(format!(
+                "{prefix}.basic.auth.credentials.source={source:?} is not implemented; use USER_INFO"
+            )));
+        }
+    }
+
+    let key_auth = properties
+        .get("key.converter.basic.auth.user.info")
+        .map(String::as_str);
+    let value_auth = properties
+        .get("value.converter.basic.auth.user.info")
+        .map(String::as_str);
+    if key_auth != value_auth {
+        return Err(Error::Configuration(
+            "Rustium currently requires matching key and value schema registry basic.auth.user.info values"
+                .into(),
+        ));
+    }
+    let (username, password) = match key_auth {
+        Some(value) => {
+            let (username, password) = value.split_once(':').ok_or_else(|| {
+                Error::Configuration(
+                    "schema registry basic.auth.user.info must use username:password".into(),
+                )
+            })?;
+            if username.is_empty() {
+                return Err(Error::Configuration(
+                    "schema registry basic.auth.user.info username must not be empty".into(),
+                ));
+            }
+            (Some(username.to_string()), Some(password.to_string()))
+        }
+        None => (None, None),
+    };
+
+    Ok(FormatConfig {
+        kind: FormatType::DebeziumJsonSchema,
+        unavailable_value,
+        tombstones_on_delete,
+        schema_registry: Some(SchemaRegistryConfig {
+            urls: split_csv(key_urls),
+            username,
+            password,
+            request_timeout: duration_ms(
+                properties,
+                "rustium.schema.registry.request.timeout.ms",
+                default_schema_registry_timeout(),
+            )?,
+            cache_capacity: usize_value(
+                properties,
+                "rustium.schema.registry.cache.capacity",
+                default_schema_registry_cache_capacity(),
+            )?,
+        }),
+    })
 }
 
 fn sink_config(properties: &BTreeMap<String, String>, topic_prefix: &str) -> Result<SinkConfig> {
@@ -978,6 +1087,22 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "connection.validation.timeout.ms",
         "unavailable.value.placeholder",
         "tombstones.on.delete",
+        "key.converter",
+        "value.converter",
+        "key.converter.schemas.enable",
+        "value.converter.schemas.enable",
+        "key.converter.schema.registry.url",
+        "value.converter.schema.registry.url",
+        "key.converter.auto.register.schemas",
+        "value.converter.auto.register.schemas",
+        "key.converter.use.latest.version",
+        "value.converter.use.latest.version",
+        "key.converter.subject.name.strategy",
+        "value.converter.subject.name.strategy",
+        "key.converter.basic.auth.credentials.source",
+        "value.converter.basic.auth.credentials.source",
+        "key.converter.basic.auth.user.info",
+        "value.converter.basic.auth.user.info",
         "heartbeat.interval.ms",
         "heartbeat.action.query",
         "heartbeat.topics.prefix",
@@ -1005,6 +1130,8 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "rustium.kafka.acks",
         "rustium.kafka.compression.type",
         "rustium.kafka.delivery.timeout.ms",
+        "rustium.schema.registry.request.timeout.ms",
+        "rustium.schema.registry.cache.capacity",
         "rustium.state.path",
         "rustium.server.bind",
         "rustium.server.enable.mutations",
@@ -1601,5 +1728,97 @@ incremental.snapshot.watermarking.strategy=insert_insert
                 .any(|warning| warning.contains("signal.enabled.channels=jmx"))
         );
         assert!(config.format.tombstones_on_delete);
+    }
+
+    #[test]
+    fn maps_confluent_json_schema_converters() {
+        let config = parse(
+            r#"
+name=inventory
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+rustium.sink.type=kafka
+rustium.kafka.bootstrap.servers=kafka:9092
+key.converter=io.confluent.connect.json.JsonSchemaConverter
+key.converter.schema.registry.url=https://registry-1:8081,https://registry-2:8081
+key.converter.basic.auth.credentials.source=USER_INFO
+key.converter.basic.auth.user.info=registry-user:registry-secret
+key.converter.auto.register.schemas=true
+value.converter=io.confluent.connect.json.JsonSchemaConverter
+value.converter.schema.registry.url=https://registry-1:8081,https://registry-2:8081
+value.converter.basic.auth.credentials.source=USER_INFO
+value.converter.basic.auth.user.info=registry-user:registry-secret
+value.converter.auto.register.schemas=true
+rustium.schema.registry.request.timeout.ms=2500
+rustium.schema.registry.cache.capacity=64
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.format.kind, FormatType::DebeziumJsonSchema);
+        let registry = config.format.schema_registry.as_ref().unwrap();
+        assert_eq!(
+            registry.urls,
+            ["https://registry-1:8081", "https://registry-2:8081"]
+        );
+        assert_eq!(registry.username.as_deref(), Some("registry-user"));
+        assert_eq!(registry.password.as_deref(), Some("registry-secret"));
+        assert_eq!(registry.request_timeout, Duration::from_millis(2500));
+        assert_eq!(registry.cache_capacity, 64);
+        let mut changed_secret = config.clone();
+        changed_secret
+            .format
+            .schema_registry
+            .as_mut()
+            .unwrap()
+            .password = Some("different-secret".into());
+        assert_eq!(config.fingerprint(), changed_secret.fingerprint());
+        assert!(!config.compatibility_warnings.iter().any(|warning| {
+            warning.contains("converter") || warning.contains("schema.registry")
+        }));
+    }
+
+    #[test]
+    fn rejects_unsafe_json_schema_converter_variants() {
+        let mismatched = parse(
+            r#"
+name=inventory
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+key.converter=org.apache.kafka.connect.json.JsonConverter
+value.converter=io.confluent.connect.json.JsonSchemaConverter
+value.converter.schema.registry.url=http://registry:8081
+"#,
+        )
+        .unwrap_err();
+        assert!(mismatched.to_string().contains("matching key.converter"));
+
+        let no_registration = parse(
+            r#"
+name=inventory
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+key.converter=io.confluent.connect.json.JsonSchemaConverter
+key.converter.schema.registry.url=http://registry:8081
+key.converter.auto.register.schemas=false
+value.converter=io.confluent.connect.json.JsonSchemaConverter
+value.converter.schema.registry.url=http://registry:8081
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            no_registration
+                .to_string()
+                .contains("auto.register.schemas=false")
+        );
     }
 }

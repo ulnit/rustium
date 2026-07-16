@@ -146,7 +146,9 @@ impl EventEncoder for SoakEncoder {
             id: event.id.clone(),
             destination: "runtime-soak".into(),
             key: Some(Bytes::from(serial.to_string())),
+            key_schema: None,
             payload: Some(Bytes::from(format!(r#"{{"serial":{serial}}}"#))),
+            payload_schema: None,
             headers: BTreeMap::from([("runtime-soak".into(), serial.to_string())]),
         })
     }

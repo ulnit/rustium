@@ -4,6 +4,7 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 image=${RUSTIUM_KAFKA_TEST_IMAGE:-docker.redpanda.com/redpandadata/redpanda:v25.1.9}
 port=${RUSTIUM_KAFKA_TEST_PORT:-19092}
+registry_port=${RUSTIUM_SCHEMA_REGISTRY_TEST_PORT:-18081}
 container="rustium-kafka-sink-$$"
 
 cleanup() {
@@ -21,6 +22,7 @@ docker pull "$image"
 docker run --detach \
     --name "$container" \
     --publish "127.0.0.1:${port}:${port}" \
+    --publish "127.0.0.1:${registry_port}:${registry_port}" \
     "$image" \
     redpanda start \
         --mode dev-container \
@@ -31,6 +33,7 @@ docker run --detach \
         --check=false \
         --kafka-addr "PLAINTEXT://0.0.0.0:${port}" \
         --advertise-kafka-addr "PLAINTEXT://127.0.0.1:${port}" \
+        --schema-registry-addr "0.0.0.0:${registry_port}" \
     >/dev/null
 
 ready=false
@@ -47,8 +50,21 @@ if [[ $ready != true ]]; then
     exit 1
 fi
 
+registry_ready=false
+for _ in $(seq 1 60); do
+    if curl --fail --silent "http://127.0.0.1:${registry_port}/subjects" >/dev/null; then
+        registry_ready=true
+        break
+    fi
+    sleep 1
+done
+if [[ $registry_ready != true ]]; then
+    echo "Schema Registry did not become ready" >&2
+    exit 1
+fi
+
 cd "$root"
 RUSTIUM_KAFKA_TEST_BOOTSTRAP_SERVERS="127.0.0.1:${port}" \
+RUSTIUM_SCHEMA_REGISTRY_TEST_URL="http://127.0.0.1:${registry_port}" \
 cargo test -p rustium-sink-kafka --test kafka_external --locked -- \
-    delivers_records_tombstones_and_broker_failures \
-    --ignored --exact --nocapture
+    --ignored --nocapture --test-threads=1

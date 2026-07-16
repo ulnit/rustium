@@ -10,11 +10,18 @@ authors.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bytes.workspace = true
 rdkafka.workspace = true
 rustium-core = { path = "../rustium-core" }
+schema_registry_converter.workspace = true
 tokio.workspace = true
+url.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
+mockito.workspace = true
+rustium-format-json = { path = "../rustium-format-json" }
+serde_json.workspace = true
 uuid.workspace = true
 
 [lints]

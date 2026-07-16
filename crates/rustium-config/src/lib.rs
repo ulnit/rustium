@@ -80,6 +80,7 @@ impl Config {
         validate_name(&self.metadata.name, "metadata.name")?;
         self.source.validate()?;
         self.sink.validate()?;
+        self.format.validate(&self.sink)?;
         if self.snapshot.fetch_size == 0 {
             return Err(Error::Configuration(
                 "snapshot.fetch_size must be greater than zero".into(),
@@ -123,7 +124,7 @@ impl Config {
             "name": self.metadata.name,
             "source": self.source.semantic_config(),
             "snapshot": self.snapshot,
-            "format": self.format,
+            "format": self.format.semantic_config(),
             "sink": self.sink.semantic_config(),
         });
         let bytes = serde_json::to_vec(&semantic).expect("configuration serialization cannot fail");
@@ -1142,6 +1143,8 @@ pub struct FormatConfig {
     pub unavailable_value: String,
     #[serde(default = "default_true")]
     pub tombstones_on_delete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_registry: Option<SchemaRegistryConfig>,
 }
 
 impl Default for FormatConfig {
@@ -1150,7 +1153,39 @@ impl Default for FormatConfig {
             kind: FormatType::DebeziumJson,
             unavailable_value: default_unavailable_value(),
             tombstones_on_delete: true,
+            schema_registry: None,
         }
+    }
+}
+
+impl FormatConfig {
+    fn validate(&self, sink: &SinkConfig) -> Result<()> {
+        match (self.kind, &self.schema_registry) {
+            (FormatType::DebeziumJsonSchema, Some(registry)) => {
+                if !matches!(sink, SinkConfig::Kafka { .. }) {
+                    return Err(Error::Configuration(
+                        "format.type=debezium_json_schema requires sink.type=kafka".into(),
+                    ));
+                }
+                registry.validate()
+            }
+            (FormatType::DebeziumJsonSchema, None) => Err(Error::Configuration(
+                "format.type=debezium_json_schema requires format.schema_registry".into(),
+            )),
+            (_, Some(_)) => Err(Error::Configuration(
+                "format.schema_registry is only valid with format.type=debezium_json_schema".into(),
+            )),
+            (_, None) => Ok(()),
+        }
+    }
+
+    fn semantic_config(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": self.kind,
+            "unavailable_value": self.unavailable_value,
+            "tombstones_on_delete": self.tombstones_on_delete,
+            "schema_registry": self.schema_registry.as_ref().map(SchemaRegistryConfig::semantic_config),
+        })
     }
 }
 
@@ -1160,6 +1195,69 @@ pub enum FormatType {
     RustiumJson,
     #[default]
     DebeziumJson,
+    DebeziumJsonSchema,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchemaRegistryConfig {
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default = "default_schema_registry_timeout")]
+    #[serde(with = "humantime_serde")]
+    pub request_timeout: Duration,
+    #[serde(default = "default_schema_registry_cache_capacity")]
+    pub cache_capacity: usize,
+}
+
+impl SchemaRegistryConfig {
+    fn validate(&self) -> Result<()> {
+        if self.urls.is_empty() {
+            return Err(Error::Configuration(
+                "format.schema_registry.urls must contain at least one URL".into(),
+            ));
+        }
+        for raw in &self.urls {
+            let url = Url::parse(raw).map_err(|error| {
+                Error::Configuration(format!(
+                    "format.schema_registry URL {raw:?} is invalid: {error}"
+                ))
+            })?;
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                return Err(Error::Configuration(format!(
+                    "format.schema_registry URL {raw:?} must be an absolute HTTP(S) URL"
+                )));
+            }
+        }
+        if self.password.is_some() && self.username.is_none() {
+            return Err(Error::Configuration(
+                "format.schema_registry.password requires username".into(),
+            ));
+        }
+        if self.request_timeout.is_zero() {
+            return Err(Error::Configuration(
+                "format.schema_registry.request_timeout must be greater than zero".into(),
+            ));
+        }
+        if self.cache_capacity == 0 {
+            return Err(Error::Configuration(
+                "format.schema_registry.cache_capacity must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn semantic_config(&self) -> serde_json::Value {
+        serde_json::json!({
+            "urls": self.urls,
+            "username": self.username,
+            "request_timeout_ms": self.request_timeout.as_millis(),
+            "cache_capacity": self.cache_capacity,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1575,6 +1673,14 @@ fn default_kafka_compression() -> String {
 const fn default_delivery_timeout() -> Duration {
     Duration::from_secs(30)
 }
+
+const fn default_schema_registry_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
+const fn default_schema_registry_cache_capacity() -> usize {
+    1_000
+}
 fn default_state_path() -> String {
     "rustium.db".into()
 }
@@ -1661,6 +1767,56 @@ sink:
             config.source.as_postgresql().unwrap().hstore_handling_mode,
             "json"
         );
+    }
+
+    #[test]
+    fn validates_native_json_schema_registry_format() {
+        let config = Config::from_yaml(
+            r#"
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: orders-cdc
+source:
+  type: postgresql
+  database: app
+  username: rustium
+  password: secret
+  publication: rustium_pub
+  slot_name: rustium_orders
+format:
+  type: debezium_json_schema
+  schema_registry:
+    urls: [https://registry-1:8081, https://registry-2:8081]
+    username: registry-user
+    password: registry-secret
+    request_timeout: 5s
+sink:
+  type: kafka
+  bootstrap_servers: [kafka:9092]
+  topic_prefix: app
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.format.kind, FormatType::DebeziumJsonSchema);
+        assert_eq!(
+            config
+                .format
+                .schema_registry
+                .as_ref()
+                .unwrap()
+                .request_timeout,
+            Duration::from_secs(5)
+        );
+
+        let error = Config::from_yaml(
+            &CONFIG.replace(
+                "sink:\n",
+                "format:\n  type: debezium_json_schema\n  schema_registry:\n    urls: [http://registry:8081]\nsink:\n",
+            ),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires sink.type=kafka"));
     }
 
     #[test]
