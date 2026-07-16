@@ -600,8 +600,11 @@ async fn snapshots_and_streams_cdc_changes() {
     if let Err(panic) = capture_result {
         std::panic::resume_unwind(panic);
     }
-    source_result
+    let source_result = source_result
         .expect("SQL Server source stopped after cancellation")
-        .expect("SQL Server source task joined")
-        .expect("SQL Server source completed without error");
+        .expect("SQL Server source task joined");
+    match source_result {
+        Ok(()) | Err(rustium_core::Error::Cancelled) => {}
+        Err(error) => panic!("SQL Server source completed with an unexpected error: {error}"),
+    }
 }
