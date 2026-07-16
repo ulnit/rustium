@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use chrono::{DateTime, Utc};
 use prometheus::{Encoder, Gauge, IntGauge, Registry, TextEncoder};
 use rustium_core::{ConnectorState, Error, Result, RuntimeStatus, SignalRecord, SignalSender};
 use serde_json::json;
@@ -33,6 +34,9 @@ struct Metrics {
     queue_depth: IntGauge,
     connector_state: IntGauge,
     source_lag_seconds: Gauge,
+    checkpoint_age_seconds: Gauge,
+    last_event_age_seconds: Gauge,
+    state_age_seconds: Gauge,
 }
 
 impl Metrics {
@@ -68,6 +72,21 @@ impl Metrics {
             "Current wall-clock lag from the last durably acknowledged source timestamp, or NaN when unavailable",
         )
         .map_err(metrics_error)?;
+        let checkpoint_age_seconds = Gauge::new(
+            "rustium_checkpoint_age_seconds",
+            "Seconds since the last durably persisted checkpoint, or NaN when unavailable",
+        )
+        .map_err(metrics_error)?;
+        let last_event_age_seconds = Gauge::new(
+            "rustium_last_event_age_seconds",
+            "Seconds since the last observed source event, or NaN when unavailable",
+        )
+        .map_err(metrics_error)?;
+        let state_age_seconds = Gauge::new(
+            "rustium_connector_state_age_seconds",
+            "Seconds since the connector entered its current lifecycle state",
+        )
+        .map_err(metrics_error)?;
         for collector in [
             Box::new(delivered_events.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(failed_events.clone()),
@@ -75,6 +94,9 @@ impl Metrics {
             Box::new(queue_depth.clone()),
             Box::new(connector_state.clone()),
             Box::new(source_lag_seconds.clone()),
+            Box::new(checkpoint_age_seconds.clone()),
+            Box::new(last_event_age_seconds.clone()),
+            Box::new(state_age_seconds.clone()),
         ] {
             registry.register(collector).map_err(metrics_error)?;
         }
@@ -86,6 +108,9 @@ impl Metrics {
             queue_depth,
             connector_state,
             source_lag_seconds,
+            checkpoint_age_seconds,
+            last_event_age_seconds,
+            state_age_seconds,
         })
     }
 }
@@ -214,6 +239,19 @@ async fn metrics(State(state): State<AppState>) -> Response {
             .source_lag_millis
             .map_or(f64::NAN, |lag| lag as f64 / 1_000.0),
     );
+    let now = Utc::now();
+    state
+        .metrics
+        .checkpoint_age_seconds
+        .set(age_seconds(status.last_checkpoint_at, now));
+    state
+        .metrics
+        .last_event_age_seconds
+        .set(age_seconds(status.last_event_observed_at, now));
+    state
+        .metrics
+        .state_age_seconds
+        .set(age_seconds(Some(status.state_since), now));
 
     let encoder = TextEncoder::new();
     let mut body = Vec::new();
@@ -247,6 +285,15 @@ const fn state_number(state: ConnectorState) -> i64 {
 
 fn metrics_error(error: prometheus::Error) -> Error {
     Error::Source(format!("metrics initialization failed: {error}"))
+}
+
+fn age_seconds(timestamp: Option<DateTime<Utc>>, now: DateTime<Utc>) -> f64 {
+    timestamp.map_or(f64::NAN, |timestamp| {
+        now.signed_duration_since(timestamp)
+            .num_milliseconds()
+            .max(0) as f64
+            / 1_000.0
+    })
 }
 
 #[cfg(test)]
@@ -293,6 +340,8 @@ mod tests {
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("rustium_source_lag_seconds NaN"));
+        assert!(body.contains("rustium_checkpoint_age_seconds NaN"));
+        assert!(body.contains("rustium_last_event_age_seconds NaN"));
         assert!(body.contains("rustium_sink_retry_attempts 0"));
     }
 }

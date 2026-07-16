@@ -3093,6 +3093,7 @@ name = "rustium-server"
 version = "0.1.0-alpha.1"
 dependencies = [
  "axum",
+ "chrono",
  "prometheus",
  "rustium-core",
  "serde_json",

@@ -28,6 +28,8 @@ jobs:
             pkg-config
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Check workflow YAML
+        run: ruby -e 'require "yaml"; %w[ci release].each { |name| YAML.parse_file(".github/workflows/#{name}.yml") }'
       - name: Check workspace
         run: cargo check --workspace --all-targets --locked
       - name: Clippy

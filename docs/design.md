@@ -67,7 +67,8 @@ The workspace contains a runnable alpha service.
 | SQL Server source | Implemented; required Docker CI and external SQL Server 2022 recovery/soak gates pass |
 | CLI and HTTP management | Implemented |
 | Reproducible non-root container image and Helm chart source | Implemented; packaging gate enforced by CI |
-| Published image/package/Helm chart | Not published until a tagged release |
+| Tagged-release image, Helm OCI chart, and GitHub Release automation | Implemented; runs only for matching protected `v*` tags |
+| Published crates | Not published; requires reviewed leaf-to-CLI crates.io publication |
 
 Alpha means the source and delivery contracts are functional, but configuration and persisted state are not stable yet.
 
@@ -411,7 +412,7 @@ Lifecycle states are created, starting, snapshotting, streaming, paused, failed,
 | `POST /v1/connector/signals` | bounded in-process signal submission when mutations and the channel are enabled |
 | `GET /metrics` | Prometheus metrics |
 
-Metrics expose connector state, delivered events, failed events, pipeline queue depth, `rustium_sink_retry_attempts`, and `rustium_source_lag_seconds`. Lag is recomputed from wall-clock time and the last durably checkpointed source timestamp; it is `NaN` when a source timestamp is unavailable. Encoding failures count one source event, while an exhausted or non-retryable Sink write counts every encoded event in that batch. Retained-log metrics remain release work.
+Metrics expose connector state, delivered events, failed events, pipeline queue depth, `rustium_sink_retry_attempts`, `rustium_source_lag_seconds`, `rustium_checkpoint_age_seconds`, `rustium_last_event_age_seconds`, and `rustium_connector_state_age_seconds`. Lag is recomputed from wall-clock time and the last durably checkpointed source timestamp; age metrics are `NaN` when their timestamp is unavailable. Encoding failures count one source event, while an exhausted or non-retryable Sink write counts every encoded event in that batch. All currently defined metrics are low-cardinality and suitable for Prometheus scraping.
 
 ### 14. Error, Security, and Resource Policy
 
@@ -429,7 +430,7 @@ The security response and deployment baseline are normative in [SECURITY.md](../
 
 #### 14.1 Container and Kubernetes Packaging
 
-The repository ships a multi-stage `Dockerfile` and `deploy/helm/rustium` chart. The runtime image contains the Rustium binary and only the native Kafka/TLS libraries required at runtime, runs as UID/GID `65532`, uses `/var/lib/rustium` as its writable state directory, and exposes management port `8080`. The chart deliberately enforces one replica and `Recreate` because SQLite checkpoint ownership and source ordering are single-owner contracts. Its default pod uses a retained `ReadWriteOnce` PVC, a read-only root filesystem, dropped Linux capabilities, disabled ServiceAccount token mounting, and live/ready probes. Configuration is mounted from a Secret; production installations should use an externally managed Secret and interpolate database, Kafka, and Registry credentials through environment variables. `scripts/test-packaging.sh` builds the image, executes `rustium --version`, checks OCI/non-root metadata, lints and renders the chart, verifies persistence/probe/security invariants, and rejects multiple replicas. Published OCI artifacts remain a tagged-release operation and are not claimed by the source tree.
+The repository ships a multi-stage `Dockerfile` and `deploy/helm/rustium` chart. The runtime image contains the Rustium binary and only the native Kafka/TLS libraries required at runtime, runs as UID/GID `65532`, uses `/var/lib/rustium` as its writable state directory, and exposes management port `8080`. The chart deliberately enforces one replica and `Recreate` because SQLite checkpoint ownership and source ordering are single-owner contracts. Its default pod uses a retained `ReadWriteOnce` PVC, a read-only root filesystem, dropped Linux capabilities, disabled ServiceAccount token mounting, and live/ready probes. Configuration is mounted from a Secret; production installations should use an externally managed Secret and interpolate database, Kafka, and Registry credentials through environment variables. `scripts/test-packaging.sh` builds the image, executes `rustium --version`, checks OCI/non-root metadata, lints and renders the chart, verifies persistence/probe/security invariants, and rejects multiple replicas. Matching protected `v*` tags run `.github/workflows/release.yml`, which publishes signed multi-architecture GHCR images with SBOM/provenance, a Helm OCI artifact, and a GitHub Release with checksums. Crates.io publication remains reviewed and ordered from leaf crates to the CLI.
 
 ### 15. Testing and Release Gates
 
@@ -533,7 +534,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. Roadmap
 
-1. Add a security policy, operational runbooks, and stable upgrade migrations before `1.0`; reproducible container and Helm packaging is implemented, while publication remains a tagged-release operation.
+1. Freeze the public configuration, event, and persisted-state compatibility contracts after the remaining release gates pass; tagged image/Helm/GitHub Release automation is implemented, while crates.io publication remains a reviewed ordered operation.
 2. Freeze the public configuration, event, and persisted-state compatibility contracts after the remaining release gates pass.
 3. Consider additional databases only after the current three connectors and shared runtime pass the full `1.0` gates.
 
@@ -594,7 +595,8 @@ Workspace 已包含可运行的 alpha 服务。
 | SQL Server Source | 已实现；必选 Docker CI 和外部 SQL Server 2022 恢复/soak 门槛通过 |
 | CLI 和 HTTP 管理 | 已实现 |
 | 可复现的非 root 容器镜像与 Helm Chart 源码 | 已实现；CI 强制运行 packaging gate |
-| 已发布镜像/包/Helm Chart | tagged release 前不发布 |
+| Tagged release 镜像、Helm OCI Chart 和 GitHub Release 自动化 | 已实现；仅由匹配的受保护 `v*` tag 触发 |
+| 已发布 crates | 尚未发布；需要审查后按叶子 crate 到 CLI 的顺序发布 |
 
 Alpha 表示源端和投递契约可以运行，但配置和持久化状态尚未稳定。
 
@@ -938,7 +940,7 @@ stdout 是 best-effort，仅用于开发，并将 tombstone 输出为一行 `nul
 | `POST /v1/connector/signals` | 启用变更端点和 channel 时有界提交 in-process 信号 |
 | `GET /metrics` | Prometheus 指标 |
 
-当前指标包括连接器状态、已投递事件、失败事件、流水线队列深度、`rustium_sink_retry_attempts` 和 `rustium_source_lag_seconds`。lag 根据当前时间与最后一个已持久 checkpoint 的源时间戳动态计算；源时间戳不可用时为 `NaN`。编码失败计一个源事件，重试耗尽或不可重试的 Sink 写入失败则统计该批次全部已编码事件。日志保留指标仍属于发布工作。
+当前指标包括连接器状态、已投递事件、失败事件、流水线队列深度、`rustium_sink_retry_attempts`、`rustium_source_lag_seconds`、`rustium_checkpoint_age_seconds`、`rustium_last_event_age_seconds` 和 `rustium_connector_state_age_seconds`。Lag 根据当前时间与最后一个已持久 checkpoint 的源时间戳动态计算；没有对应时间戳时 age 指标为 `NaN`。所有当前指标都是低基数，适合 Prometheus 抓取。编码失败计一个源事件，重试耗尽或不可重试的 Sink 写入失败则统计该批次全部已编码事件。
 
 ### 14. 错误、安全与资源策略
 
@@ -956,7 +958,7 @@ stdout 是 best-effort，仅用于开发，并将 tombstone 输出为一行 `nul
 
 #### 14.1 容器与 Kubernetes 打包
 
-仓库提供多阶段 `Dockerfile` 和 `deploy/helm/rustium` Chart。运行时镜像只包含 Rustium 二进制及 Kafka/TLS client 所需的原生运行库，以 UID/GID `65532` 运行，将 `/var/lib/rustium` 作为可写状态目录，并暴露 `8080` 管理端口。由于 SQLite checkpoint 所有权与源顺序都是单所有者契约，Chart 强制单副本和 `Recreate`。默认 Pod 使用保留的 `ReadWriteOnce` PVC、只读根文件系统、删除全部 Linux capabilities、关闭 ServiceAccount token 挂载，以及 live/ready probe。配置从 Secret 挂载；生产部署应使用外部管理的 Secret，并通过环境变量插入数据库、Kafka 和 Registry 凭据。`scripts/test-packaging.sh` 会构建镜像、执行 `rustium --version`、检查 OCI/非 root 元数据、lint/render Chart、验证持久化/probe/安全不变量，并拒绝多副本。OCI artifact 发布仍属于 tagged release 操作，源码仓库不会提前宣称已发布。
+仓库提供多阶段 `Dockerfile` 和 `deploy/helm/rustium` Chart。运行时镜像只包含 Rustium 二进制及 Kafka/TLS client 所需的原生运行库，以 UID/GID `65532` 运行，将 `/var/lib/rustium` 作为可写状态目录，并暴露 `8080` 管理端口。由于 SQLite checkpoint 所有权与源顺序都是单所有者契约，Chart 强制单副本和 `Recreate`。默认 Pod 使用保留的 `ReadWriteOnce` PVC、只读根文件系统、删除全部 Linux capabilities、关闭 ServiceAccount token 挂载，以及 live/ready probe。配置从 Secret 挂载；生产部署应使用外部管理的 Secret，并通过环境变量插入数据库、Kafka 和 Registry 凭据。`scripts/test-packaging.sh` 会构建镜像、执行 `rustium --version`、检查 OCI/非 root 元数据、lint/render Chart、验证持久化/probe/安全不变量，并拒绝多副本。匹配的受保护 `v*` tag 会运行 `.github/workflows/release.yml`，发布带签名、SBOM/provenance 的多架构 GHCR 镜像、Helm OCI artifact 和带 checksum 的 GitHub Release。crates.io 仍需审查后按叶子 crate 到 CLI 的顺序发布。
 
 ### 15. 测试与发布门槛
 
@@ -1060,6 +1062,6 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. 路线图
 
-1. 在 `1.0` 前补安全策略、运维手册和稳定升级迁移；可复现容器与 Helm 打包已实现，发布仍由 tagged release 完成。
+1. 剩余重点是冻结公共配置、事件和持久化状态兼容契约；tagged image/Helm/GitHub Release 自动化已实现，crates.io 仍需审查后有序发布。
 2. 剩余发布门槛通过后，冻结公共配置、事件和持久化状态兼容契约。
 3. 只有当当前三个连接器和共享运行时通过完整 `1.0` 门槛后，才考虑更多数据库。

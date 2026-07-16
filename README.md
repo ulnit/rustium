@@ -627,7 +627,7 @@ The server binds to `127.0.0.1:8080` by default.
 | `POST /v1/connector/signals` | Submit a Debezium-compatible in-process signal when mutations and the channel are enabled |
 | `GET /metrics` | Prometheus exposition |
 
-Status and metrics advance only after the sink write and checkpoint succeed. `rustium_source_lag_seconds` is the current wall-clock distance from the last durably acknowledged source timestamp and is `NaN` when the connector or database cannot provide one; `rustium_sink_retry_attempts` counts scheduled Sink retries across validation, delivery, and flush. Encoding and exhausted or non-retryable sink-delivery failures increment `failed_events`, transition the connector to `FAILED`, cancel the Source, and still run Sink shutdown; a Source that ignores cancellation is aborted after `runtime.shutdown_timeout`.
+Status and metrics advance only after the sink write and checkpoint succeed. `rustium_source_lag_seconds` is the current wall-clock distance from the last durably acknowledged source timestamp and is `NaN` when unavailable; `rustium_checkpoint_age_seconds`, `rustium_last_event_age_seconds`, and `rustium_connector_state_age_seconds` expose low-cardinality operational ages for alerting. `rustium_sink_retry_attempts` counts scheduled Sink retries across validation, delivery, and flush. Encoding and exhausted or non-retryable sink-delivery failures increment `failed_events`, transition the connector to `FAILED`, cancel the Source, and still run Sink shutdown; a Source that ignores cancellation is aborted after `runtime.shutdown_timeout`.
 
 ### Container and Kubernetes Deployment
 
@@ -644,6 +644,8 @@ helm upgrade --install rustium deploy/helm/rustium \
 ```
 
 The mounted configuration should use `server.bind: 0.0.0.0:8080` and `state.path: /var/lib/rustium/rustium.db`. Interpolate database, Kafka, and Schema Registry credentials from Kubernetes Secret environment variables; do not commit them in values files. See [deploy/helm/rustium/README.md](deploy/helm/rustium/README.md) for the complete English-first bilingual deployment contract.
+
+Tagged releases run [.github/workflows/release.yml](.github/workflows/release.yml). The workflow checks that the tag, Cargo workspace, and Chart versions match, repeats the locked Rust gates, publishes signed multi-architecture (`linux/amd64` and `linux/arm64`) images to GHCR with SBOM/provenance, pushes the Helm chart as an OCI artifact, and creates a GitHub Release with image-digest and SHA-256 checksum files. Crates.io publication remains a separate, reviewed, ordered operation because internal crates must be published from leaves to the CLI.
 
 ### Documentation and Contribution Policy
 
@@ -1265,7 +1267,7 @@ Server 默认绑定 `127.0.0.1:8080`。
 | `POST /v1/connector/signals` | 启用变更端点和 channel 时提交 Debezium 兼容 in-process 信号 |
 | `GET /metrics` | Prometheus 指标 |
 
-状态和指标只有在 Sink 写入及 checkpoint 成功后才会推进。`rustium_source_lag_seconds` 表示当前时间与最后一个已持久确认源时间戳之间的距离；连接器或数据库无法提供源时间戳时为 `NaN`。`rustium_sink_retry_attempts` 统计 Sink 校验、投递和 flush 阶段已调度的重试。编码失败、重试耗尽或不可重试的 Sink 投递失败会增加 `failed_events`、把连接器转为 `FAILED`、取消 Source，并仍然执行 Sink shutdown；若 Source 忽略取消，则会在 `runtime.shutdown_timeout` 后被 abort。
+状态和指标只有在 Sink 写入及 checkpoint 成功后才会推进。`rustium_source_lag_seconds` 表示当前时间与最后一个已持久确认源时间戳之间的距离；不可用时为 `NaN`。`rustium_checkpoint_age_seconds`、`rustium_last_event_age_seconds` 和 `rustium_connector_state_age_seconds` 提供低基数运维 age 指标，适合告警。`rustium_sink_retry_attempts` 统计 Sink 校验、投递和 flush 阶段已调度的重试。编码失败、重试耗尽或不可重试的 Sink 投递失败会增加 `failed_events`、把连接器转为 `FAILED`、取消 Source，并仍然执行 Sink shutdown；若 Source 忽略取消，则会在 `runtime.shutdown_timeout` 后被 abort。
 
 ### 容器与 Kubernetes 部署
 
@@ -1282,6 +1284,8 @@ helm upgrade --install rustium deploy/helm/rustium \
 ```
 
 挂载配置应使用 `server.bind: 0.0.0.0:8080` 和 `state.path: /var/lib/rustium/rustium.db`。数据库、Kafka 和 Schema Registry 凭据应通过 Kubernetes Secret 环境变量插入，不要提交到 values 文件。完整英中部署契约见 [deploy/helm/rustium/README.md](deploy/helm/rustium/README.md)。
+
+Tagged release 会运行 [.github/workflows/release.yml](.github/workflows/release.yml)。Workflow 会检查 tag、Cargo workspace 和 Chart 版本一致，重复 locked Rust 门禁，向 GHCR 发布带签名、SBOM/provenance 的多架构（`linux/amd64`、`linux/arm64`）镜像，以 OCI artifact 推送 Helm Chart，并创建带 image digest 与 SHA-256 checksum 文件的 GitHub Release。crates.io 发布仍是单独的人工审查、有序操作，因为内部 crate 必须从叶子 crate 逐步发布到 CLI。
 
 ### 文档与贡献策略
 

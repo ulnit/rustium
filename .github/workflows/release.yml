@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: clippy,rustfmt
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.18.6
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            libcurl4-openssl-dev \
+            libsasl2-dev \
+            libssl-dev \
+            pkg-config
+      - name: Check release versions
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(awk -F' = ' '/^version = / { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
+          chart_version="$(awk '/^version:/ { print $2; exit }' deploy/helm/rustium/Chart.yaml)"
+          test "$version" = "$cargo_version"
+          test "$version" = "$chart_version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Package manifest smoke test
+        run: cargo package -p rustium --locked --allow-dirty --list >/dev/null
+      - name: Lint Helm chart
+        run: helm lint --strict deploy/helm/rustium
+
+  image:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=v${{ needs.verify.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.verify.outputs.version }}
+            type=raw,value=latest,enable=${{ !contains(needs.verify.outputs.version, '-') }}
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.verify.outputs.version }}
+            REVISION=${{ github.sha }}
+            CREATED=${{ github.event.head_commit.timestamp }}
+          provenance: mode=max
+          sbom: true
+      - uses: sigstore/cosign-installer@v3.8.1
+      - name: Sign image digest
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+  chart:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.18.6
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Package and publish Helm chart
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          helm package deploy/helm/rustium \
+            --version "$VERSION" \
+            --app-version "$VERSION" \
+            --destination dist
+          helm push "dist/rustium-${VERSION}.tgz" \
+            oci://ghcr.io/${{ github.repository_owner }}/charts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustium-helm-chart
+          path: dist/rustium-*.tgz
+          if-no-files-found: error
+
+  github-release:
+    needs: [verify, image, chart]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustium-helm-chart
+          path: dist
+      - name: Create checksums and GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf 'ghcr.io/${{ github.repository }}@%s\n' "$IMAGE_DIGEST" > dist/rustium-image-digest.txt
+          (cd dist && sha256sum * > SHA256SUMS)
+          gh release create "v${VERSION}" dist/* \
+            --verify-tag \
+            --title "Rustium ${VERSION}" \
+            --generate-notes

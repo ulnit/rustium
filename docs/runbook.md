@@ -33,7 +33,7 @@ Alert on:
 - a growing `rustium_sink_retry_attempts` rate or repeated Registry/Kafka errors;
 - checkpoint age that exceeds the source retention safety margin.
 
-`rustium_source_lag_seconds` is `NaN` when no source timestamp exists. Interpret it together with status position and checkpoint time. Metrics and status update after Sink acknowledgement and checkpoint persistence, so a stalled metric is a reason to inspect the Sink and state store, not to reset state.
+`rustium_source_lag_seconds` is `NaN` when no source timestamp exists. `rustium_checkpoint_age_seconds`, `rustium_last_event_age_seconds`, and `rustium_connector_state_age_seconds` provide direct alerting signals for checkpoint freshness, source observation, and lifecycle transitions. Interpret them together with status position and checkpoint time. Metrics and status update after Sink acknowledgement and checkpoint persistence, so a stalled metric is a reason to inspect the Sink and state store, not to reset state.
 
 ### 4. State backup and restore
 
@@ -107,7 +107,7 @@ Before changing state, collect the sanitized status JSON, metrics, image digest,
 - `rustium_sink_retry_attempts` 增长或 Registry/Kafka 错误重复出现；
 - checkpoint age 超过 Source retention 安全余量。
 
-没有源时间戳时 `rustium_source_lag_seconds` 为 `NaN`，应结合 status 位点和 checkpoint 时间判断。指标和 status 只有 Sink 确认及 checkpoint 持久化后才推进；指标停滞应先检查 Sink 和 state store，不要直接 reset。
+没有源时间戳时 `rustium_source_lag_seconds` 为 `NaN`；`rustium_checkpoint_age_seconds`、`rustium_last_event_age_seconds` 和 `rustium_connector_state_age_seconds` 分别提供 checkpoint 新鲜度、源事件观察和生命周期状态的直接告警信号，应结合 status 位点和 checkpoint 时间判断。指标和 status 只有 Sink 确认及 checkpoint 持久化后才推进；指标停滞应先检查 Sink 和 state store，不要直接 reset。
 
 ### 4. 状态备份与恢复
 
