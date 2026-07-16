@@ -1,14 +1,11 @@
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    path::PathBuf,
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use futures::StreamExt;
 use mysql_async::{
-    BinlogStream, BinlogStreamRequest, ClientIdentity, Conn, Opts, OptsBuilder, Params,
-    Row as MySqlRow, Sid, SslOpts, Value,
+    BinlogStream, BinlogStreamRequest, Conn, Opts, OptsBuilder, Params, Row as MySqlRow, Sid,
+    Value,
     binlog::{
         events::{Event as BinlogEvent, EventData, RowsEventData, TableMapEvent},
         row::BinlogRow,
@@ -2242,7 +2239,7 @@ async fn connect(config: &MySqlSourceConfig) -> Result<Conn> {
         "preferred" => {
             let tls = builder
                 .clone()
-                .ssl_opts(Some(mysql_tls_options(config, true, true)));
+                .ssl_opts(Some(crate::tls::ssl_options(config, true, true)?));
             match connect_with_options(config, tls).await {
                 Ok(connection) => return Ok(connection),
                 Err(error) => {
@@ -2251,9 +2248,9 @@ async fn connect(config: &MySqlSourceConfig) -> Result<Conn> {
                 }
             }
         }
-        "required" => builder.ssl_opts(Some(mysql_tls_options(config, true, true))),
-        "verify_ca" => builder.ssl_opts(Some(mysql_tls_options(config, true, false))),
-        "verify_identity" => builder.ssl_opts(Some(mysql_tls_options(config, false, false))),
+        "required" => builder.ssl_opts(Some(crate::tls::ssl_options(config, true, true)?)),
+        "verify_ca" => builder.ssl_opts(Some(crate::tls::ssl_options(config, true, false)?)),
+        "verify_identity" => builder.ssl_opts(Some(crate::tls::ssl_options(config, false, false)?)),
         mode => {
             return Err(Error::Configuration(format!(
                 "unsupported MySQL database.ssl.mode {mode:?}"
@@ -2261,26 +2258,6 @@ async fn connect(config: &MySqlSourceConfig) -> Result<Conn> {
         }
     };
     connect_with_options(config, builder).await
-}
-
-fn mysql_tls_options(
-    config: &MySqlSourceConfig,
-    skip_domain_validation: bool,
-    accept_invalid_certs: bool,
-) -> SslOpts {
-    let mut options = SslOpts::default();
-    if let Some(ca) = &config.ssl_ca {
-        options = options.with_root_certs(vec![PathBuf::from(ca).into()]);
-    }
-    if let (Some(cert), Some(key)) = (&config.ssl_cert, &config.ssl_key) {
-        options = options.with_client_identity(Some(ClientIdentity::new(
-            PathBuf::from(cert).into(),
-            PathBuf::from(key).into(),
-        )));
-    }
-    options
-        .with_danger_skip_domain_validation(skip_domain_validation)
-        .with_danger_accept_invalid_certs(accept_invalid_certs)
 }
 
 async fn open_heartbeat_connection(config: &MySqlSourceConfig) -> Result<Option<Conn>> {
@@ -3114,6 +3091,10 @@ mod tests {
             ssl_ca: None,
             ssl_cert: None,
             ssl_key: None,
+            ssl_keystore: None,
+            ssl_keystore_password: None,
+            ssl_truststore: None,
+            ssl_truststore_password: None,
             connect_timeout: std::time::Duration::from_secs(1),
             connect_keep_alive: true,
             connect_keep_alive_interval: std::time::Duration::from_secs(1),

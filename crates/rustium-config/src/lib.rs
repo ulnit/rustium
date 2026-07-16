@@ -243,6 +243,18 @@ impl SourceConfig {
                     "gtid_source_excludes": config.gtid_source_excludes,
                     "gtid_source_filter_dml_events": config.gtid_source_filter_dml_events,
                 });
+                if config.ssl_keystore.is_some() || config.ssl_truststore.is_some() {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "java_ssl_stores".into(),
+                            serde_json::json!({
+                                "keystore": config.ssl_keystore,
+                                "truststore": config.ssl_truststore,
+                            }),
+                        );
+                }
                 add_heartbeat_semantics(
                     &mut semantic,
                     config.heartbeat_interval,
@@ -547,6 +559,14 @@ pub struct MySqlSourceConfig {
     pub ssl_cert: Option<String>,
     #[serde(default)]
     pub ssl_key: Option<String>,
+    #[serde(default)]
+    pub ssl_keystore: Option<String>,
+    #[serde(default)]
+    pub ssl_keystore_password: Option<String>,
+    #[serde(default)]
+    pub ssl_truststore: Option<String>,
+    #[serde(default)]
+    pub ssl_truststore_password: Option<String>,
     #[serde(default = "default_connect_timeout")]
     #[serde(with = "humantime_serde")]
     pub connect_timeout: Duration,
@@ -730,11 +750,35 @@ impl MySqlSourceConfig {
                 "source.ssl_cert and source.ssl_key must be configured together".into(),
             ));
         }
+        if self.ssl_keystore.is_some() && (self.ssl_cert.is_some() || self.ssl_key.is_some()) {
+            return Err(Error::Configuration(
+                "source.ssl_keystore cannot be combined with source.ssl_cert/source.ssl_key".into(),
+            ));
+        }
+        if self.ssl_truststore.is_some() && self.ssl_ca.is_some() {
+            return Err(Error::Configuration(
+                "source.ssl_truststore cannot be combined with source.ssl_ca".into(),
+            ));
+        }
+        if self.ssl_keystore.is_none() && self.ssl_keystore_password.is_some() {
+            return Err(Error::Configuration(
+                "source.ssl_keystore_password requires source.ssl_keystore".into(),
+            ));
+        }
+        if self.ssl_truststore.is_none() && self.ssl_truststore_password.is_some() {
+            return Err(Error::Configuration(
+                "source.ssl_truststore_password requires source.ssl_truststore".into(),
+            ));
+        }
         if self.ssl_mode == "disabled"
-            && (self.ssl_ca.is_some() || self.ssl_cert.is_some() || self.ssl_key.is_some())
+            && (self.ssl_ca.is_some()
+                || self.ssl_cert.is_some()
+                || self.ssl_key.is_some()
+                || self.ssl_keystore.is_some()
+                || self.ssl_truststore.is_some())
         {
             return Err(Error::Configuration(
-                "source.ssl_ca/ssl_cert/ssl_key require an enabled MySQL TLS mode".into(),
+                "source.ssl_ca/ssl_cert/ssl_key/ssl_keystore/ssl_truststore require an enabled MySQL TLS mode".into(),
             ));
         }
         if self
@@ -1592,6 +1636,50 @@ sink:
         let implicit_utc =
             Config::from_yaml(&raw.replace("  connection_time_zone: Etc/UTC\n", "")).unwrap();
         assert_eq!(config.fingerprint(), implicit_utc.fingerprint());
+    }
+
+    #[test]
+    fn parses_native_mysql_java_tls_stores_without_fingerprinting_passwords() {
+        let raw = r#"
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: inventory-mysql
+source:
+  type: mysql
+  username: rustium
+  password: secret
+  databases: [inventory]
+  ssl_mode: verify_identity
+  ssl_keystore: /run/secrets/client.p12
+  ssl_keystore_password: client-secret
+  ssl_truststore: /run/secrets/trust.jks
+  ssl_truststore_password: trust-secret
+sink:
+  type: stdout
+  topic_prefix: inventory
+"#;
+        let config = Config::from_yaml(raw).unwrap();
+        let source = config.source.as_mysql().unwrap();
+        assert_eq!(
+            source.ssl_keystore.as_deref(),
+            Some("/run/secrets/client.p12")
+        );
+        assert_eq!(
+            source.ssl_truststore.as_deref(),
+            Some("/run/secrets/trust.jks")
+        );
+
+        let rotated = Config::from_yaml(
+            &raw.replace("client-secret", "rotated-client")
+                .replace("trust-secret", "rotated-trust"),
+        )
+        .unwrap();
+        assert_eq!(config.fingerprint(), rotated.fingerprint());
+
+        let different_store =
+            Config::from_yaml(&raw.replace("client.p12", "replacement.p12")).unwrap();
+        assert_ne!(config.fingerprint(), different_store.fingerprint());
     }
 
     #[test]

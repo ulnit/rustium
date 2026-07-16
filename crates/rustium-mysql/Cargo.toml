@@ -10,10 +10,13 @@ authors.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
 chrono.workspace = true
 futures.workspace = true
 indexmap.workspace = true
+jks.workspace = true
 mysql_async.workspace = true
+p12-keystore.workspace = true
 regex.workspace = true
 rustium-config = { path = "../rustium-config" }
 rustium-core = { path = "../rustium-core" }

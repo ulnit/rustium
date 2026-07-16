@@ -302,6 +302,10 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
             ssl_ca: properties.get("database.ssl.ca").cloned(),
             ssl_cert: properties.get("database.ssl.cert").cloned(),
             ssl_key: properties.get("database.ssl.key").cloned(),
+            ssl_keystore: properties.get("database.ssl.keystore").cloned(),
+            ssl_keystore_password: properties.get("database.ssl.keystore.password").cloned(),
+            ssl_truststore: properties.get("database.ssl.truststore").cloned(),
+            ssl_truststore_password: properties.get("database.ssl.truststore.password").cloned(),
             connect_timeout: duration_ms(
                 properties,
                 "connect.timeout.ms",
@@ -886,6 +890,10 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "database.ssl.ca",
         "database.ssl.cert",
         "database.ssl.key",
+        "database.ssl.keystore",
+        "database.ssl.keystore.password",
+        "database.ssl.truststore",
+        "database.ssl.truststore.password",
         "database.include.list",
         "database.exclude.list",
         "gtid.source.includes",
@@ -1337,6 +1345,89 @@ database.ssl.ca=/etc/mysql/ca.pem
             config
                 .to_string()
                 .contains("require an enabled MySQL TLS mode")
+        );
+    }
+
+    #[test]
+    fn maps_mysql_java_tls_stores() {
+        let config = parse(
+            r#"
+name=mysql
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+database.ssl.mode=verify_identity
+database.ssl.keystore=/run/secrets/client.p12
+database.ssl.keystore.password=client-secret
+database.ssl.truststore=/run/secrets/trust.jks
+database.ssl.truststore.password=trust-secret
+"#,
+        )
+        .unwrap();
+        let source = config.source.as_mysql().unwrap();
+        assert_eq!(
+            source.ssl_keystore.as_deref(),
+            Some("/run/secrets/client.p12")
+        );
+        assert_eq!(
+            source.ssl_keystore_password.as_deref(),
+            Some("client-secret")
+        );
+        assert_eq!(
+            source.ssl_truststore.as_deref(),
+            Some("/run/secrets/trust.jks")
+        );
+        assert_eq!(
+            source.ssl_truststore_password.as_deref(),
+            Some("trust-secret")
+        );
+        assert!(!config.compatibility_warnings.iter().any(|warning| {
+            warning.contains("database.ssl.keystore") || warning.contains("database.ssl.truststore")
+        }));
+    }
+
+    #[test]
+    fn rejects_conflicting_mysql_tls_store_material() {
+        let conflicting_identity = parse(
+            r#"
+name=mysql
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+database.ssl.mode=required
+database.ssl.cert=/etc/mysql/client.pem
+database.ssl.key=/etc/mysql/client-key.pem
+database.ssl.keystore=/etc/mysql/client.p12
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            conflicting_identity
+                .to_string()
+                .contains("ssl_keystore cannot be combined")
+        );
+
+        let orphan_password = parse(
+            r#"
+name=mysql
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+database.ssl.mode=required
+database.ssl.truststore.password=trust-secret
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            orphan_password
+                .to_string()
+                .contains("ssl_truststore_password requires")
         );
     }
 
