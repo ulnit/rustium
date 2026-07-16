@@ -649,6 +649,8 @@ Tagged releases run [.github/workflows/release.yml](.github/workflows/release.ym
 
 Crates.io publication is available only through the manual [.github/workflows/publish-crates.yml](.github/workflows/publish-crates.yml) workflow. It requires typing `publish` at dispatch time and configuring the rotated `CARGO_REGISTRY_TOKEN` repository Secret; it verifies the full workspace and publishes core, foundation, connector, and CLI crates in dependency order. The workflow is never triggered by a push or tag.
 
+Every publishable workspace crate carries a concise English-first bilingual README in its package, and the packaging, release, and publication gates verify that the README is included in the Cargo tarball.
+
 ### Documentation and Contribution Policy
 
 - User-facing documentation is complete English first, followed by complete Simplified Chinese.
@@ -1290,6 +1292,8 @@ helm upgrade --install rustium deploy/helm/rustium \
 Tagged release 会运行 [.github/workflows/release.yml](.github/workflows/release.yml)。Workflow 会检查 tag、Cargo workspace 和 Chart 版本一致，重复 locked Rust 门禁，向 GHCR 发布带签名、SBOM/provenance 的多架构（`linux/amd64`、`linux/arm64`）镜像，以 OCI artifact 推送 Helm Chart，并创建带 image digest 与 SHA-256 checksum 文件的 GitHub Release。crates.io 发布仍是单独的人工审查、有序操作，因为内部 crate 必须从叶子 crate 逐步发布到 CLI。
 
 crates.io 发布只能通过手动 [.github/workflows/publish-crates.yml](.github/workflows/publish-crates.yml) workflow 执行。触发时必须输入 `publish`，并配置已轮换的 `CARGO_REGISTRY_TOKEN` repository Secret；workflow 会先验证完整 workspace，再按 core、foundation、connector、CLI 依赖顺序发布。普通 push 或 tag 不会触发该 workflow。
+
+每个可发布 workspace crate 都包含简洁的英中双语 README，packaging、release 和 publication 门禁会验证 README 确实包含在 Cargo tarball 中。
 
 ### 文档与贡献策略
 

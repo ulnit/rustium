@@ -18,9 +18,26 @@ trap cleanup EXIT
 command -v docker >/dev/null
 command -v helm >/dev/null
 
-# Validate the package manifest and included files without claiming unpublished
-# internal crates already exist on crates.io.
-cargo package -p rustium --locked --allow-dirty --list >/dev/null
+# Validate every package manifest and included README without claiming
+# unpublished internal crates already exist on crates.io.
+for package in \
+  rustium \
+  rustium-config \
+  rustium-core \
+  rustium-format-avro \
+  rustium-format-json \
+  rustium-format-protobuf \
+  rustium-mysql \
+  rustium-postgresql \
+  rustium-server \
+  rustium-signal-kafka \
+  rustium-sink-kafka \
+  rustium-sink-stdout \
+  rustium-sqlserver \
+  rustium-state; do
+  package_files="$(cargo package -p "$package" --locked --allow-dirty --list)"
+  grep -Fxq "README.md" <<<"$package_files"
+done
 
 docker build \
   --pull \
