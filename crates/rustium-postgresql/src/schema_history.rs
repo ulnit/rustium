@@ -5,7 +5,7 @@ use rustium_core::{ConnectorStateEnvelope, Error, EventSchema, FieldSchema, Resu
 use serde::{Deserialize, Serialize};
 
 pub(crate) const POSTGRES_SCHEMA_HISTORY_FORMAT: &str = "rustium.postgresql.schema-history";
-const POSTGRES_SCHEMA_HISTORY_VERSION: u32 = 4;
+const POSTGRES_SCHEMA_HISTORY_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PostgresColumnType {
@@ -48,6 +48,7 @@ pub(crate) struct IncrementalSnapshotProgress {
 pub(crate) struct PostgresConnectorState {
     pub(crate) schemas: HashMap<(String, String), TableSchema>,
     pub(crate) incremental_snapshot: Option<IncrementalSnapshotProgress>,
+    pub(crate) completed_signal_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,23 +56,27 @@ struct PostgresSchemaHistoryState {
     tables: Vec<TableSchema>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     incremental_snapshot: Option<IncrementalSnapshotProgress>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    completed_signal_ids: Vec<String>,
 }
 
 pub(crate) fn encode_schema_history(
     schemas: &HashMap<(String, String), TableSchema>,
 ) -> Result<ConnectorStateEnvelope> {
-    encode_connector_state(schemas, None)
+    encode_connector_state(schemas, None, &[])
 }
 
 pub(crate) fn encode_connector_state(
     schemas: &HashMap<(String, String), TableSchema>,
     incremental_snapshot: Option<&IncrementalSnapshotProgress>,
+    completed_signal_ids: &[String],
 ) -> Result<ConnectorStateEnvelope> {
     let mut tables = schemas.values().cloned().collect::<Vec<_>>();
     tables.sort_by_key(TableSchema::key);
     let payload = serde_json::to_value(PostgresSchemaHistoryState {
         tables,
         incremental_snapshot: incremental_snapshot.cloned(),
+        completed_signal_ids: completed_signal_ids.to_vec(),
     })?;
     Ok(ConnectorStateEnvelope::new(
         POSTGRES_SCHEMA_HISTORY_FORMAT,
@@ -116,6 +121,7 @@ pub(crate) fn decode_connector_state(
     Ok(PostgresConnectorState {
         schemas,
         incremental_snapshot: state.incremental_snapshot,
+        completed_signal_ids: state.completed_signal_ids,
     })
 }
 
@@ -237,7 +243,7 @@ mod tests {
         let envelope = encode_schema_history(&schemas).unwrap();
 
         assert_eq!(envelope.format, POSTGRES_SCHEMA_HISTORY_FORMAT);
-        assert_eq!(envelope.version, 4);
+        assert_eq!(envelope.version, 5);
         assert!(envelope.payload.get("incremental_snapshot").is_none());
         assert_eq!(decode_schema_history(&envelope).unwrap(), schemas);
     }
@@ -255,10 +261,11 @@ mod tests {
         let decoded = decode_connector_state(&envelope).unwrap();
         assert_eq!(decoded.schemas, schemas);
         assert_eq!(decoded.incremental_snapshot, None);
+        assert!(decoded.completed_signal_ids.is_empty());
     }
 
     #[test]
-    fn round_trips_version_four_incremental_snapshot_progress() {
+    fn round_trips_version_five_incremental_snapshot_progress() {
         let table = baseline();
         let schemas = HashMap::from([(table.key(), table)]);
         let progress = IncrementalSnapshotProgress {
@@ -276,12 +283,14 @@ mod tests {
             paused: true,
         };
 
-        let envelope = encode_connector_state(&schemas, Some(&progress)).unwrap();
+        let envelope =
+            encode_connector_state(&schemas, Some(&progress), &["snapshot-0".into()]).unwrap();
         let decoded = decode_connector_state(&envelope).unwrap();
 
-        assert_eq!(envelope.version, 4);
+        assert_eq!(envelope.version, 5);
         assert_eq!(decoded.schemas, schemas);
         assert_eq!(decoded.incremental_snapshot, Some(progress));
+        assert_eq!(decoded.completed_signal_ids, ["snapshot-0"]);
     }
 
     #[test]

@@ -20,6 +20,7 @@ const PAUSE_SNAPSHOT: &str = "pause-snapshot";
 const RESUME_SNAPSHOT: &str = "resume-snapshot";
 const WINDOW_OPEN: &str = "snapshot-window-open";
 const WINDOW_CLOSE: &str = "snapshot-window-close";
+const MAX_COMPLETED_SIGNAL_IDS: usize = 1_024;
 
 #[derive(Debug)]
 pub(crate) enum Signal {
@@ -72,6 +73,7 @@ struct ReadOnlyWatermarks {
 
 pub(crate) struct IncrementalSnapshotController {
     progress: Option<IncrementalSnapshotProgress>,
+    completed_signal_ids: Vec<String>,
     connection: Option<PgReplicationConnection>,
     window: IndexMap<String, Row>,
     current_schema: Option<TableSchema>,
@@ -85,9 +87,13 @@ pub(crate) struct IncrementalSnapshotController {
 }
 
 impl IncrementalSnapshotController {
-    pub(crate) fn new(progress: Option<IncrementalSnapshotProgress>) -> Self {
+    pub(crate) fn new(
+        progress: Option<IncrementalSnapshotProgress>,
+        completed_signal_ids: Vec<String>,
+    ) -> Self {
         Self {
             progress,
+            completed_signal_ids,
             connection: None,
             window: IndexMap::new(),
             current_schema: None,
@@ -103,6 +109,24 @@ impl IncrementalSnapshotController {
 
     pub(crate) fn progress(&self) -> Option<&IncrementalSnapshotProgress> {
         self.progress.as_ref()
+    }
+
+    pub(crate) fn completed_signal_ids(&self) -> &[String] {
+        &self.completed_signal_ids
+    }
+
+    fn remember_completed(&mut self, id: String) {
+        if let Some(index) = self
+            .completed_signal_ids
+            .iter()
+            .position(|candidate| candidate == &id)
+        {
+            self.completed_signal_ids.remove(index);
+        }
+        self.completed_signal_ids.push(id);
+        if self.completed_signal_ids.len() > MAX_COMPLETED_SIGNAL_IDS {
+            self.completed_signal_ids.remove(0);
+        }
     }
 
     pub(crate) fn take_state_dirty(&mut self) -> bool {
@@ -300,9 +324,13 @@ impl IncrementalSnapshotController {
     }
 
     fn is_duplicate_execute_signal(&self, id: &str) -> bool {
-        self.progress
-            .as_ref()
-            .is_some_and(|progress| progress.signal_id == id)
+        self.completed_signal_ids
+            .iter()
+            .any(|candidate| candidate == id)
+            || self
+                .progress
+                .as_ref()
+                .is_some_and(|progress| progress.signal_id == id)
     }
 
     pub(crate) fn deduplicate(&mut self, event: &ChangeEvent) {
@@ -495,19 +523,24 @@ impl IncrementalSnapshotController {
     }
 
     fn advance_progress(&mut self) {
-        let Some(progress) = self.progress.as_mut() else {
-            return;
+        let completed_signal_id = {
+            let Some(progress) = self.progress.as_mut() else {
+                return;
+            };
+            if self.current_chunk_complete {
+                progress.current_collection += 1;
+                progress.last_key = None;
+                progress.maximum_key = None;
+            } else {
+                progress.last_key = self.current_chunk_end.take();
+            }
+            progress.chunk_sequence += 1;
+            (progress.current_collection >= progress.data_collections.len())
+                .then(|| progress.signal_id.clone())
         };
-        if self.current_chunk_complete {
-            progress.current_collection += 1;
-            progress.last_key = None;
-            progress.maximum_key = None;
-        } else {
-            progress.last_key = self.current_chunk_end.take();
-        }
-        progress.chunk_sequence += 1;
-        if progress.current_collection >= progress.data_collections.len() {
+        if let Some(signal_id) = completed_signal_id {
             self.progress = None;
+            self.remember_completed(signal_id);
         }
     }
 
@@ -529,7 +562,7 @@ impl IncrementalSnapshotController {
     }
 
     fn stop_snapshot(&mut self, signal_id: &str, patterns: &[String]) -> Result<()> {
-        let Some(progress) = self.progress.as_mut() else {
+        let Some(mut progress) = self.progress.take() else {
             return Ok(());
         };
         let patterns = compile_patterns(patterns, "stop-snapshot data-collections")?;
@@ -554,6 +587,7 @@ impl IncrementalSnapshotController {
             }
         }
         if !removed {
+            self.progress = Some(progress);
             return Ok(());
         }
 
@@ -562,8 +596,9 @@ impl IncrementalSnapshotController {
             .retain(|collection, _| retained.contains(collection));
         progress.data_collections = retained;
         if progress.data_collections.is_empty() {
-            self.progress = None;
+            let completed_signal_id = progress.signal_id;
             self.clear_current_chunk();
+            self.remember_completed(completed_signal_id);
         } else {
             progress.current_collection =
                 retained_before_current.min(progress.data_collections.len() - 1);
@@ -575,6 +610,7 @@ impl IncrementalSnapshotController {
                 self.clear_current_chunk();
                 self.prepare_after_commit = !paused;
             }
+            self.progress = Some(progress);
         }
         self.state_dirty = true;
         tracing::info!(%signal_id, "PostgreSQL incremental snapshot collections stopped");
@@ -1237,17 +1273,21 @@ mod tests {
 
     #[test]
     fn recognizes_replayed_execute_signal_ids() {
-        let controller = IncrementalSnapshotController::new(Some(IncrementalSnapshotProgress {
-            signal_id: "snapshot-1".into(),
-            data_collections: vec!["public.orders".into()],
-            additional_conditions: BTreeMap::new(),
-            surrogate_key: None,
-            current_collection: 0,
-            last_key: None,
-            maximum_key: None,
-            chunk_sequence: 1,
-            paused: false,
-        }));
+        let controller = IncrementalSnapshotController::new(
+            Some(IncrementalSnapshotProgress {
+                signal_id: "snapshot-1".into(),
+                data_collections: vec!["public.orders".into()],
+                additional_conditions: BTreeMap::new(),
+                surrogate_key: None,
+                current_collection: 0,
+                last_key: None,
+                maximum_key: None,
+                chunk_sequence: 1,
+                paused: false,
+            }),
+            vec!["snapshot-0".into()],
+        );
+        assert!(controller.is_duplicate_execute_signal("snapshot-0"));
         assert!(controller.is_duplicate_execute_signal("snapshot-1"));
         assert!(!controller.is_duplicate_execute_signal("snapshot-2"));
     }
@@ -1268,7 +1308,7 @@ mod tests {
             chunk_sequence: 3,
             paused: false,
         };
-        let mut controller = IncrementalSnapshotController::new(Some(progress));
+        let mut controller = IncrementalSnapshotController::new(Some(progress), Vec::new());
 
         controller
             .stop_snapshot("stop-1", &[r"public\.orders".into()])
@@ -1286,6 +1326,61 @@ mod tests {
         );
         assert!(controller.prepare_after_commit);
         assert!(controller.take_state_dirty());
+    }
+
+    #[test]
+    fn remembers_completed_and_stopped_signal_ids_with_a_fixed_bound() {
+        let progress = IncrementalSnapshotProgress {
+            signal_id: "completed-snapshot".into(),
+            data_collections: vec!["public.orders".into()],
+            additional_conditions: BTreeMap::new(),
+            surrogate_key: None,
+            current_collection: 0,
+            last_key: None,
+            maximum_key: Some(vec!["1".into()]),
+            chunk_sequence: 1,
+            paused: false,
+        };
+        let mut controller = IncrementalSnapshotController::new(Some(progress), Vec::new());
+        controller.current_chunk_complete = true;
+        controller.advance_progress();
+        assert!(controller.progress().is_none());
+        assert_eq!(controller.completed_signal_ids(), ["completed-snapshot"]);
+
+        let progress = IncrementalSnapshotProgress {
+            signal_id: "stopped-snapshot".into(),
+            data_collections: vec!["public.orders".into()],
+            additional_conditions: BTreeMap::new(),
+            surrogate_key: None,
+            current_collection: 0,
+            last_key: None,
+            maximum_key: None,
+            chunk_sequence: 1,
+            paused: false,
+        };
+        let mut controller = IncrementalSnapshotController::new(
+            Some(progress),
+            controller.completed_signal_ids().to_vec(),
+        );
+        controller.stop_snapshot("stop-1", &[]).unwrap();
+        assert!(controller.progress().is_none());
+        assert_eq!(
+            controller.completed_signal_ids(),
+            ["completed-snapshot", "stopped-snapshot"]
+        );
+
+        for index in 0..=MAX_COMPLETED_SIGNAL_IDS {
+            controller.remember_completed(format!("bounded-{index}"));
+        }
+        assert_eq!(
+            controller.completed_signal_ids().len(),
+            MAX_COMPLETED_SIGNAL_IDS
+        );
+        assert_eq!(controller.completed_signal_ids()[0], "bounded-1");
+        assert_eq!(
+            controller.completed_signal_ids().last().map(String::as_str),
+            Some("bounded-1024")
+        );
     }
 
     #[test]

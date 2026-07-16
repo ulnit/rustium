@@ -5,14 +5,25 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use rdkafka::{
+    ClientConfig,
+    admin::{AdminClient, AdminOptions, NewTopic, TopicReplication},
+    client::DefaultClientContext,
+    consumer::{Consumer, StreamConsumer},
+    producer::{FutureProducer, FutureRecord},
+    topic_partition_list::{Offset, TopicPartitionList},
+    util::Timeout,
+};
 use rustium_config::{
     PostgresSourceConfig, SlotOwnership, SnapshotConfig, SnapshotMode, TableSelection,
 };
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
-    RecordBoundary, Row, SourceConnector, SourceContext, SourcePosition, SourceRecord,
+    RecordBoundary, Row, SignalRecord, SourceConnector, SourceContext, SourcePosition,
+    SourceRecord,
 };
 use rustium_postgresql::PostgresSource;
+use rustium_signal_kafka::KafkaSignalChannel;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -82,6 +93,320 @@ impl TestSettings {
             read_only: false,
             hstore_handling_mode: "json".into(),
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires external PostgreSQL logical replication and a Kafka-compatible broker"]
+async fn recovers_completed_snapshot_before_kafka_signal_offset_commit() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let bootstrap_servers = required_env("RUSTIUM_KAFKA_TEST_BOOTSTRAP_SERVERS")?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_kafka_{}", &suffix[..12]);
+    let signal_table = format!("rustium_pg_kafka_signal_{}", &suffix[..12]);
+    let publication = format!("rustium_pg_kafka_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_pg_kafka_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-kafka-{}", &suffix[..12]);
+    let signal_id = format!("postgresql-kafka-signal-{}", &suffix[..12]);
+    let topic = format!("rustium-postgresql-signal-{}", &suffix[..12]);
+    let group_id = format!("rustium-postgresql-signal-group-{}", &suffix[..12]);
+    let kafka_admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap_servers)
+        .create()?;
+    let topic_spec = NewTopic::new(&topic, 1, TopicReplication::Fixed(1));
+    let created = kafka_admin
+        .create_topics(
+            [&topic_spec],
+            &AdminOptions::new().operation_timeout(Some(Duration::from_secs(10))),
+        )
+        .await?;
+    require(
+        matches!(created.as_slice(), [Ok(created)] if created == &topic),
+        "PostgreSQL Kafka signal topic was not created",
+    )?;
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (id BIGINT PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT INTO public.{table_name} VALUES (1, 'one'), (2, 'two'); \
+                 CREATE TABLE public.{signal_table} (\
+                    id VARCHAR(64), type VARCHAR(32), data VARCHAR(2048)\
+                 ); \
+                 CREATE PUBLICATION {publication} FOR TABLE \
+                    public.{table_name}, public.{signal_table};"
+            ))
+            .await?;
+
+        let base_config = settings.source_config(&publication, &slot_name, &table_name);
+        let mut snapshot_source = PostgresSource::new(
+            &connector_name,
+            base_config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+            },
+        );
+        snapshot_source.validate().await?;
+        let (mut snapshot_output, cancellation, source_task) = start_source(snapshot_source, None);
+        let snapshot_capture: TestResult<(SourcePosition, ConnectorStateEnvelope)> = async {
+            let mut snapshot_rows = 0;
+            loop {
+                let record = receive_with_context(
+                    &mut snapshot_output,
+                    "waiting for the PostgreSQL Kafka fixture initial snapshot",
+                )
+                .await?;
+                if record.boundary == RecordBoundary::SnapshotComplete {
+                    require(
+                        snapshot_rows == 2,
+                        "PostgreSQL Kafka recovery fixture snapshot did not emit two rows",
+                    )?;
+                    let state = record.connector_state.ok_or_else(|| {
+                        test_error("PostgreSQL Kafka snapshot completion has no connector state")
+                    })?;
+                    break Ok((record.position, state));
+                }
+                require(
+                    record.event.as_ref().is_some_and(|event| {
+                        event.operation == Operation::Read && event.source.snapshot
+                    }),
+                    "PostgreSQL Kafka recovery fixture emitted a non-snapshot record",
+                )?;
+                snapshot_rows += 1;
+            }
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        let (snapshot_position, schema_history) =
+            combine_capture_and_stop(snapshot_capture, stop_result)?;
+        let initial_checkpoint = Checkpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            connector_name: connector_name.clone(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: snapshot_position.clone(),
+            snapshot_completed: true,
+            config_fingerprint: "postgresql-kafka-recovery-test".into(),
+            updated_at: SystemTime::now(),
+            connector_state: Some(schema_history),
+        };
+
+        let mut config = base_config;
+        config.signal_enabled_channels = vec!["kafka".into()];
+        config.signal_kafka_topic = Some(topic.clone());
+        config.signal_kafka_bootstrap_servers = vec![bootstrap_servers.clone()];
+        config.signal_kafka_group_id = group_id.clone();
+        config.signal_kafka_poll_timeout = Duration::from_millis(50);
+        config.signal_data_collection = Some(format!("public.{signal_table}"));
+        config.incremental_snapshot_chunk_size = 1;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &bootstrap_servers)
+            .create()?;
+        let offset_observer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &bootstrap_servers)
+            .set("group.id", &group_id)
+            .create()?;
+        let payload = serde_json::to_string(&SignalRecord::new(
+            &signal_id,
+            "execute-snapshot",
+            serde_json::json!({
+                "type": "incremental",
+                "data-collections": [format!("public.{}", table_name)],
+            }),
+        ))?;
+
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, source_cancellation, source_task, signal_sender) =
+            start_source_with_signals(source, Some(initial_checkpoint));
+        wait_for_active_slot(&client, &slot_name).await?;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            signal_sender.send_and_wait(SignalRecord::new(
+                format!("postgresql-kafka-ready-{suffix}"),
+                "pause-snapshot",
+                serde_json::json!({"type": "incremental"}),
+            )),
+        )
+        .await??;
+        let kafka_cancellation = CancellationToken::new();
+        let channel = KafkaSignalChannel::new(
+            std::slice::from_ref(&bootstrap_servers),
+            &connector_name,
+            &topic,
+            &group_id,
+            Duration::from_millis(50),
+            &BTreeMap::new(),
+        )?;
+        let (kafka_sender, mut kafka_receiver) = rustium_core::signal_channel(1);
+        let kafka_task = tokio::spawn(channel.run(kafka_sender, kafka_cancellation.clone()));
+        producer
+            .send(
+                FutureRecord::to(&topic)
+                    .key(&connector_name)
+                    .payload(&payload),
+                Timeout::After(Duration::from_secs(10)),
+            )
+            .await
+            .map_err(|(error, _)| error)?;
+
+        let kafka_delivery = tokio::time::timeout(Duration::from_secs(10), kafka_receiver.recv())
+            .await?
+            .ok_or_else(|| test_error("PostgreSQL Kafka signal channel closed before delivery"))?;
+        require(
+            kafka_delivery.record().id == signal_id,
+            "PostgreSQL Kafka channel delivered the wrong signal",
+        )?;
+        signal_sender.send(kafka_delivery.record().clone()).await?;
+
+        let mut incremental_rows = 0;
+        let completed_checkpoint = loop {
+            let record = receive_with_context(
+                &mut output,
+                "waiting for the PostgreSQL Kafka incremental snapshot checkpoint",
+            )
+            .await?;
+            if record.event.as_ref().is_some_and(|event| {
+                event
+                    .source
+                    .attributes
+                    .get("rustium.snapshot.kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("incremental")
+            }) {
+                incremental_rows += 1;
+            }
+            let Some(state) = record.connector_state.clone() else {
+                continue;
+            };
+            let completed = state
+                .payload
+                .get("completed_signal_ids")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&signal_id)));
+            if completed && record.boundary == RecordBoundary::TransactionCommit {
+                break Checkpoint {
+                    schema_version: CHECKPOINT_SCHEMA_VERSION,
+                    connector_name: connector_name.clone(),
+                    generation: uuid::Uuid::new_v4(),
+                    source_position: record.position,
+                    snapshot_completed: true,
+                    config_fingerprint: "postgresql-kafka-recovery-test".into(),
+                    updated_at: SystemTime::now(),
+                    connector_state: Some(state),
+                };
+            }
+        };
+        require(
+            incremental_rows == 2,
+            "Kafka signal did not snapshot both PostgreSQL rows",
+        )?;
+        require(
+            committed_kafka_offset(&offset_observer, &topic)? != Offset::Offset(1),
+            "PostgreSQL Kafka signal offset advanced before checkpoint acknowledgement",
+        )?;
+
+        stop_source(source_cancellation, source_task).await?;
+        kafka_cancellation.cancel();
+        kafka_task.await??;
+        drop(kafka_delivery);
+        tokio::time::sleep(Duration::from_secs(12)).await;
+
+        let (probe_sender, mut probe_receiver) = rustium_core::signal_channel(1);
+        let probe_cancellation = CancellationToken::new();
+        let probe_channel = KafkaSignalChannel::new(
+            std::slice::from_ref(&bootstrap_servers),
+            &connector_name,
+            &topic,
+            &group_id,
+            Duration::from_millis(50),
+            &BTreeMap::new(),
+        )?;
+        let probe_task = tokio::spawn(probe_channel.run(probe_sender, probe_cancellation.clone()));
+        let probe_delivery = tokio::time::timeout(Duration::from_secs(10), probe_receiver.recv())
+            .await?
+            .ok_or_else(|| test_error("PostgreSQL Kafka replay probe channel closed"))?;
+        require(
+            probe_delivery.record().id == signal_id,
+            "Kafka did not replay the completed PostgreSQL signal",
+        )?;
+
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+            },
+        );
+        source.validate().await?;
+        let (mut output, source_cancellation, source_task, signal_sender) =
+            start_source_with_signals(source, Some(completed_checkpoint));
+        signal_sender
+            .send_and_wait(probe_delivery.record().clone())
+            .await?;
+        let duplicate = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let record = receive_with_context(
+                    &mut output,
+                    "checking for duplicate PostgreSQL Kafka incremental rows",
+                )
+                .await?;
+                if record.event.as_ref().is_some_and(|event| {
+                    event
+                        .source
+                        .attributes
+                        .get("rustium.snapshot.kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("incremental")
+                }) {
+                    return TestResult::Ok(true);
+                }
+            }
+        })
+        .await;
+        require(
+            !matches!(duplicate, Ok(Ok(true))),
+            "replayed completed Kafka signal emitted duplicate PostgreSQL incremental rows",
+        )?;
+        probe_delivery.acknowledge();
+        wait_for_kafka_offset(&offset_observer, &topic, Offset::Offset(1)).await?;
+        stop_source(source_cancellation, source_task).await?;
+        probe_cancellation.cancel();
+        probe_task.await??;
+        Ok(())
+    }
+    .await;
+
+    let postgres_cleanup = cleanup(
+        &client,
+        &publication,
+        &slot_name,
+        &[&table_name, &signal_table],
+    )
+    .await;
+    connection_task.abort();
+    let kafka_cleanup = kafka_admin
+        .delete_topics(
+            &[&topic],
+            &AdminOptions::new().operation_timeout(Some(Duration::from_secs(10))),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| -> Box<dyn StdError + Send + Sync> { Box::new(error) });
+    match (outcome, postgres_cleanup, kafka_cleanup) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), _, _) => Err(error),
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
     }
 }
 
@@ -1555,8 +1880,8 @@ async fn resumes_signal_incremental_snapshot_from_chunk_checkpoint() -> TestResu
                         test_error("completed incremental snapshot has no connector state")
                     })?;
                     require(
-                        state.version == 4,
-                        "PostgreSQL connector state did not upgrade to version 4",
+                        state.version == 5,
+                        "PostgreSQL connector state did not upgrade to version 5",
                     )?;
                     require(
                         state.payload.get("incremental_snapshot").is_none(),
@@ -1746,7 +2071,7 @@ async fn controls_and_deduplicates_filtered_incremental_snapshot() -> TestResult
                 }
                 if record.boundary == RecordBoundary::TransactionCommit
                     && record.connector_state.as_ref().is_some_and(|state| {
-                        state.version == 4
+                        state.version == 5
                             && state.payload.get("incremental_snapshot").is_none()
                     })
                 {
@@ -1900,7 +2225,7 @@ async fn runs_incremental_snapshot_with_read_only_table_permissions() -> TestRes
                 }
                 if record.boundary == RecordBoundary::TransactionCommit
                     && record.connector_state.as_ref().is_some_and(|state| {
-                        state.version == 4 && state.payload.get("incremental_snapshot").is_none()
+                        state.version == 5 && state.payload.get("incremental_snapshot").is_none()
                     })
                 {
                     break;
@@ -2044,7 +2369,7 @@ async fn orders_incremental_chunks_by_unique_surrogate_key() -> TestResult {
                 }
                 if record.boundary == RecordBoundary::TransactionCommit
                     && record.connector_state.as_ref().is_some_and(|state| {
-                        state.version == 4 && state.payload.get("incremental_snapshot").is_none()
+                        state.version == 5 && state.payload.get("incremental_snapshot").is_none()
                     })
                 {
                     break;
@@ -2729,6 +3054,15 @@ async fn receive(
     Ok(record)
 }
 
+async fn receive_with_context(
+    output: &mut mpsc::Receiver<rustium_core::Result<SourceRecord>>,
+    context: &str,
+) -> TestResult<SourceRecord> {
+    receive(output)
+        .await
+        .map_err(|error| test_error(&format!("{context}: {error}")))
+}
+
 async fn wait_for_active_slot(client: &Client, slot_name: &str) -> TestResult {
     for _ in 0..100 {
         let active = client
@@ -2929,6 +3263,32 @@ async fn cleanup(
         Some(error) => Err(error.into()),
         None => Ok(()),
     }
+}
+
+async fn wait_for_kafka_offset(
+    consumer: &StreamConsumer,
+    topic: &str,
+    expected: Offset,
+) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if committed_kafka_offset(consumer, topic)? == expected {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await?
+}
+
+fn committed_kafka_offset(consumer: &StreamConsumer, topic: &str) -> TestResult<Offset> {
+    let mut partitions = TopicPartitionList::new();
+    partitions.add_partition(topic, 0);
+    Ok(consumer
+        .committed_offsets(partitions, Timeout::After(Duration::from_secs(2)))?
+        .find_partition(topic, 0)
+        .ok_or_else(|| test_error("Kafka committed offset has no PostgreSQL signal partition"))?
+        .offset())
 }
 
 fn required_env(name: &str) -> TestResult<String> {

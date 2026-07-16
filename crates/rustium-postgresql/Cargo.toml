@@ -24,6 +24,8 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+rdkafka.workspace = true
+rustium-signal-kafka = { path = "../rustium-signal-kafka" }
 tempfile.workspace = true
 tokio-postgres.workspace = true
 

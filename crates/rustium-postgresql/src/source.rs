@@ -347,6 +347,7 @@ impl SourceConnector for PostgresSource {
         };
 
         let mut incremental_progress = None;
+        let mut completed_signal_ids = Vec::new();
         if !snapshot_needed {
             if let Some(connector_state) = checkpoint
                 .as_ref()
@@ -355,6 +356,7 @@ impl SourceConnector for PostgresSource {
                 let state = decode_connector_state(connector_state)?;
                 self.schemas = state.schemas;
                 incremental_progress = state.incremental_snapshot;
+                completed_signal_ids = state.completed_signal_ids;
             } else if checkpoint.is_some() {
                 return Err(Error::State(
                     "PostgreSQL checkpoint predates persistent schema history and cannot safely replay relation changes; reset the checkpoint and run a new initial snapshot"
@@ -450,7 +452,8 @@ impl SourceConnector for PostgresSource {
         let mut heartbeat = heartbeat_timer(self.config.heartbeat_interval);
         let mut file_signal_poll = file_signal_timer(&self.config);
         let mut heartbeat_connection = open_heartbeat_connection(&self.config).await?;
-        let mut incremental = IncrementalSnapshotController::new(incremental_progress);
+        let mut incremental =
+            IncrementalSnapshotController::new(incremental_progress, completed_signal_ids);
         incremental.resume(&self.config, &state.schemas).await?;
         info!(
             connector = %self.connector_name,
@@ -716,6 +719,7 @@ impl SourceConnector for PostgresSource {
                             record.connector_state = Some(encode_connector_state(
                                 &state.schemas,
                                 incremental.progress(),
+                                incremental.completed_signal_ids(),
                             )?);
                             state.schema_dirty = false;
                         }
@@ -775,6 +779,7 @@ async fn checkpoint_external_signal_state(
             connector_state: Some(encode_connector_state(
                 &state.schemas,
                 incremental.progress(),
+                incremental.completed_signal_ids(),
             )?),
             signal_acknowledgements: acknowledgement.into_iter().collect(),
         }))
