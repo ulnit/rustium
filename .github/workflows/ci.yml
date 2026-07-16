@@ -35,7 +35,7 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --locked
 
-  postgresql-extensions:
+  postgresql-cdc:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -53,7 +53,7 @@ jobs:
             libsasl2-dev \
             libssl-dev \
             pkg-config
-      - name: Test PostgreSQL extension types
+      - name: Test PostgreSQL CDC recovery and extension types
         run: bash scripts/test-postgresql-extensions.sh
 
   sqlserver-cdc:

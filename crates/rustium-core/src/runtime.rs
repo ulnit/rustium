@@ -29,6 +29,34 @@ pub struct RuntimeConfig {
     pub config_fingerprint: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    pub max_retries: i32,
+    pub initial_delay: Duration,
+    pub max_delay: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 10,
+            initial_delay: Duration::from_millis(300),
+            max_delay: Duration::from_secs(10),
+        }
+    }
+}
+
+impl RuntimeConfig {
+    #[must_use]
+    pub const fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy {
+            max_retries: self.errors_max_retries,
+            initial_delay: self.errors_retry_delay_initial,
+            max_delay: self.errors_retry_delay_max,
+        }
+    }
+}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {

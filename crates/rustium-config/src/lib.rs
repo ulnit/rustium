@@ -5,7 +5,7 @@ mod debezium;
 use std::{collections::BTreeMap, env, fs, path::Path, time::Duration};
 
 use regex::Regex;
-use rustium_core::{Error, Result};
+use rustium_core::{Error, Result, RetryPolicy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -411,6 +411,11 @@ impl PostgresSourceConfig {
         }
         validate_name(&self.slot_name, "source.slot_name")?;
         validate_name(&self.publication, "source.publication")?;
+        if self.connect_timeout.is_zero() {
+            return Err(Error::Configuration(
+                "source.connect_timeout must be greater than zero".into(),
+            ));
+        }
         for pattern in self.tables.include.iter().chain(self.tables.exclude.iter()) {
             if Regex::new(pattern).is_err() {
                 return Err(Error::Configuration(format!(
@@ -1323,6 +1328,17 @@ impl Default for RuntimeSettings {
     }
 }
 
+impl RuntimeSettings {
+    #[must_use]
+    pub const fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy {
+            max_retries: self.errors_max_retries,
+            initial_delay: self.errors_retry_delay_initial,
+            max_delay: self.errors_retry_delay_max,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -1630,6 +1646,7 @@ sink:
             config.runtime.errors_retry_delay_max,
             Duration::from_secs(10)
         );
+        assert_eq!(config.runtime.retry_policy(), RetryPolicy::default());
         assert!(config.format.tombstones_on_delete);
         assert!(
             config
@@ -1661,7 +1678,17 @@ sink:
     }
 
     #[test]
-    fn validates_native_sink_retry_settings() {
+    fn rejects_zero_postgresql_connect_timeout() {
+        let error = Config::from_yaml(&CONFIG.replace(
+            "  database: app\n",
+            "  database: app\n  connect_timeout: 0s\n",
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("source.connect_timeout"));
+    }
+
+    #[test]
+    fn validates_native_retry_settings() {
         let configured = Config::from_yaml(&format!(
             "{CONFIG}\nruntime:\n  errors_max_retries: -1\n  errors_retry_delay_initial: 25ms\n  errors_retry_delay_max: 1s\n"
         ))
@@ -1670,6 +1697,14 @@ sink:
         assert_eq!(
             configured.runtime.errors_retry_delay_initial,
             Duration::from_millis(25)
+        );
+        assert_eq!(
+            configured.runtime.retry_policy(),
+            RetryPolicy {
+                max_retries: -1,
+                initial_delay: Duration::from_millis(25),
+                max_delay: Duration::from_secs(1),
+            }
         );
 
         for (settings, expected) in [

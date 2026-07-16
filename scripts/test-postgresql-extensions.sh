@@ -61,3 +61,12 @@ RUSTIUM_POSTGRES_REQUIRE_EXTENSION_TYPES=true \
 cargo test -p rustium-postgresql --test postgresql_external --locked -- \
     keeps_installed_extension_types_identical_across_snapshot_and_wal \
     --ignored --exact --nocapture
+
+RUSTIUM_POSTGRES_TEST_HOST=127.0.0.1 \
+RUSTIUM_POSTGRES_TEST_PORT="$port" \
+RUSTIUM_POSTGRES_TEST_USER=postgres \
+RUSTIUM_POSTGRES_TEST_PASSWORD="$password" \
+RUSTIUM_POSTGRES_TEST_DATABASE="$database" \
+cargo test -p rustium-postgresql --test postgresql_external --locked -- \
+    reconnects_after_replication_backend_termination \
+    --ignored --exact --nocapture

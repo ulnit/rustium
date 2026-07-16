@@ -263,11 +263,14 @@ async fn build_runtime(config: &Config, status: RuntimeStatus) -> Result<Connect
 
 fn build_source(config: &Config) -> Result<Box<dyn SourceConnector>> {
     match &config.source {
-        SourceConfig::Postgresql(source) => Ok(Box::new(PostgresSource::new(
-            &config.metadata.name,
-            source.as_ref().clone(),
-            config.snapshot.clone(),
-        ))),
+        SourceConfig::Postgresql(source) => Ok(Box::new(
+            PostgresSource::new(
+                &config.metadata.name,
+                source.as_ref().clone(),
+                config.snapshot.clone(),
+            )
+            .with_retry_policy(config.runtime.retry_policy()),
+        )),
         SourceConfig::Mysql(source) => Ok(Box::new(MySqlSource::new(
             &config.metadata.name,
             source.clone(),

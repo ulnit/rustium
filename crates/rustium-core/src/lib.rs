@@ -12,7 +12,9 @@ pub use event::{
     EventId, EventSchema, FieldSchema, MySqlPosition, Operation, PostgresPosition, RecordBoundary,
     Row, SourceMetadata, SourcePosition, SourceRecord, SqlServerPosition, TransactionMetadata,
 };
-pub use runtime::{ConnectorRuntime, ConnectorState, RuntimeConfig, RuntimeStatus, StatusSnapshot};
+pub use runtime::{
+    ConnectorRuntime, ConnectorState, RetryPolicy, RuntimeConfig, RuntimeStatus, StatusSnapshot,
+};
 pub use signal::{
     SignalAcknowledgement, SignalDelivery, SignalRecord, SignalSender, signal_channel,
 };

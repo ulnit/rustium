@@ -20,11 +20,14 @@ async fn main() -> Result<()> {
     let heartbeat_topics_prefix = source_config.heartbeat_topics_prefix.clone();
     let heartbeat_topic_name = source_config.heartbeat_topic_name.clone();
 
-    let source = Box::new(PostgresSource::new(
-        &config.metadata.name,
-        source_config,
-        config.snapshot.clone(),
-    ));
+    let source = Box::new(
+        PostgresSource::new(
+            &config.metadata.name,
+            source_config,
+            config.snapshot.clone(),
+        )
+        .with_retry_policy(config.runtime.retry_policy()),
+    );
     let encoder: Arc<dyn EventEncoder> = Arc::new(DebeziumJsonEncoder::new(JsonEncoderConfig {
         topic_prefix: config.sink.topic_prefix().into(),
         unavailable_value: config.format.unavailable_value.clone(),

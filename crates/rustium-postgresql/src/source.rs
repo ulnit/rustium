@@ -15,8 +15,8 @@ use pg_walstream::{
 use rustium_config::{PostgresSourceConfig, SlotOwnership, SnapshotConfig, SnapshotMode};
 use rustium_core::{
     ChangeEvent, DataValue, Error, EventId, EventSchema, FieldSchema, Operation, PostgresPosition,
-    RecordBoundary, Result, Row, SignalAcknowledgement, SourceConnector, SourceContext,
-    SourceMetadata, SourcePosition, SourceRecord, TransactionMetadata,
+    RecordBoundary, Result, RetryPolicy, Row, SignalAcknowledgement, SourceConnector,
+    SourceContext, SourceMetadata, SourcePosition, SourceRecord, TransactionMetadata,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -51,6 +51,7 @@ pub struct PostgresSource {
     config: PostgresSourceConfig,
     snapshot: SnapshotConfig,
     schemas: HashMap<(String, String), TableSchema>,
+    retry_policy: RetryPolicy,
 }
 
 impl PostgresSource {
@@ -65,7 +66,14 @@ impl PostgresSource {
             config,
             snapshot,
             schemas: HashMap::new(),
+            retry_policy: RetryPolicy::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
     }
 
     async fn validate_source(&mut self) -> Result<()> {
@@ -376,15 +384,16 @@ impl SourceConnector for PostgresSource {
             snapshot: Some(if snapshot_needed { "export" } else { "nothing" }.into()),
             ..ReplicationSlotOptions::default()
         };
+        let retry_config = postgres_retry_config(self.retry_policy, self.config.connect_timeout);
         let stream_config = ReplicationStreamConfig::new(
             self.config.slot_name.clone(),
             self.config.publication.clone(),
             2,
             StreamingMode::On,
             Duration::from_secs(10),
-            self.config.connect_timeout,
+            retry_config.max_duration,
             Duration::from_secs(30),
-            RetryConfig::default(),
+            retry_config,
         )
         .with_messages(false)
         .with_slot_options(slot_options);
@@ -458,6 +467,9 @@ impl SourceConnector for PostgresSource {
         info!(
             connector = %self.connector_name,
             slot = %self.config.slot_name,
+            max_retries = self.retry_policy.max_retries,
+            initial_retry_delay_ms = self.retry_policy.initial_delay.as_millis(),
+            max_retry_delay_ms = self.retry_policy.max_delay.as_millis(),
             "PostgreSQL streaming started"
         );
 
@@ -562,7 +574,11 @@ impl SourceConnector for PostgresSource {
                         delivery.into_acknowledgement(),
                     ).await?;
                 }
-                event = stream.next_event_with_retry(&context.cancellation) => {
+                event = next_postgres_event(
+                    &mut stream,
+                    &context.cancellation,
+                    self.retry_policy.max_retries != 0,
+                ) => {
                     let event = match event {
                         Ok(event) => event,
                         Err(pg_walstream::ReplicationError::Cancelled(_))
@@ -734,6 +750,58 @@ impl SourceConnector for PostgresSource {
                 }
             }
         }
+    }
+}
+
+const EFFECTIVELY_UNBOUNDED_RETRY_DURATION: Duration = Duration::from_secs(4_294_967_295);
+
+fn postgres_retry_config(policy: RetryPolicy, connect_timeout: Duration) -> RetryConfig {
+    let max_attempts = if policy.max_retries < 0 {
+        u32::MAX
+    } else {
+        u32::try_from(policy.max_retries)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1)
+    };
+    let max_duration = if policy.max_retries < 0 {
+        EFFECTIVELY_UNBOUNDED_RETRY_DURATION
+    } else {
+        connect_timeout
+            .saturating_mul(max_attempts)
+            .saturating_add(retry_delay_budget(policy))
+    };
+    RetryConfig {
+        max_attempts,
+        initial_delay: policy.initial_delay,
+        max_delay: policy.max_delay,
+        multiplier: 2.0,
+        max_duration,
+        jitter: false,
+    }
+}
+
+fn retry_delay_budget(policy: RetryPolicy) -> Duration {
+    let retries = u32::try_from(policy.max_retries).unwrap_or_default();
+    let mut remaining = retries;
+    let mut delay = policy.initial_delay;
+    let mut total = Duration::ZERO;
+    while remaining > 0 && delay < policy.max_delay {
+        total = total.saturating_add(delay);
+        delay = delay.saturating_mul(2).min(policy.max_delay);
+        remaining -= 1;
+    }
+    total.saturating_add(policy.max_delay.saturating_mul(remaining))
+}
+
+async fn next_postgres_event(
+    stream: &mut LogicalReplicationStream,
+    cancellation: &tokio_util::sync::CancellationToken,
+    retry_enabled: bool,
+) -> pg_walstream::Result<WalEvent> {
+    if retry_enabled {
+        stream.next_event_with_retry(cancellation).await
+    } else {
+        stream.next_event(cancellation).await
     }
 }
 
@@ -2198,6 +2266,46 @@ mod tests {
             event.after.unwrap().get("ts_ms"),
             Some(DataValue::Int64(_))
         ));
+    }
+
+    #[test]
+    fn maps_shared_retry_policy_to_postgresql_recovery() {
+        let disabled = postgres_retry_config(
+            RetryPolicy {
+                max_retries: 0,
+                initial_delay: Duration::from_millis(100),
+                max_delay: Duration::from_millis(250),
+            },
+            Duration::from_secs(2),
+        );
+        assert_eq!(disabled.max_attempts, 1);
+        assert_eq!(disabled.max_duration, Duration::from_secs(2));
+
+        let finite = postgres_retry_config(
+            RetryPolicy {
+                max_retries: 3,
+                initial_delay: Duration::from_millis(100),
+                max_delay: Duration::from_millis(250),
+            },
+            Duration::from_secs(2),
+        );
+        assert_eq!(finite.max_attempts, 4);
+        assert_eq!(finite.initial_delay, Duration::from_millis(100));
+        assert_eq!(finite.max_delay, Duration::from_millis(250));
+        assert_eq!(finite.max_duration, Duration::from_millis(8_550));
+        assert_eq!(finite.multiplier, 2.0);
+        assert!(!finite.jitter);
+
+        let unlimited = postgres_retry_config(
+            RetryPolicy {
+                max_retries: -1,
+                initial_delay: Duration::from_millis(50),
+                max_delay: Duration::from_secs(1),
+            },
+            Duration::from_secs(2),
+        );
+        assert_eq!(unlimited.max_attempts, u32::MAX);
+        assert_eq!(unlimited.max_duration, EFFECTIVELY_UNBOUNDED_RETRY_DURATION);
     }
 
     #[test]

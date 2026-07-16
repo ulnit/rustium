@@ -2,7 +2,7 @@
 
 > Status: Implemented alpha baseline
 > Document version: 0.2
-> Last updated: 2026-07-15
+> Last updated: 2026-07-16
 
 ## Language Policy
 
@@ -231,6 +231,8 @@ The slot retains changes committed during the snapshot, so no handoff gap exists
 
 `pg_walstream` provides replication transport and protocol parsing. Rustium converts begin, insert, update, delete, truncate, commit, and streamed-transaction events. Same-LSN ordinals make positions total and replayable. Missing unchanged TOAST columns become `Unavailable`.
 
+PostgreSQL connection establishment and transient stream recovery consume the shared Debezium-compatible `errors.max.retries`, `errors.retry.delay.initial.ms`, and `errors.retry.delay.max.ms` policy. The configured retry count is interpreted after the initial attempt; `0` disables automatic stream recovery and `-1` is effectively unbounded. Backoff and connection attempts stay inside `pg_walstream`, while Rustium retains ownership of the replayable LSN, slot continuity checks, decoded transaction state, and checkpoint acknowledgements.
+
 The PostgreSQL connector-state payload persists the snapshot table layout plus each column's type OID and typmod. On restart it restores that baseline before opening the slot. Each `Relation` message then supplies the historical column names, order, type identity, and key flags for the following row events. Exact catalog matches supplement type names and optionality without replacing the WAL layout. Changed schemas increment their version and the updated state is attached to the next checkpointable source record.
 
 Before resuming a completed checkpoint, Rustium verifies that the original replication slot still exists, still uses `pgoutput`, and has not entered PostgreSQL `wal_status=unreserved` or `lost`. A failed continuity check stops before the replication transport can create a replacement slot and instructs the operator to reset the checkpoint and run a new initial snapshot. This deliberately prefers an explicit recovery operation over a silent WAL gap.
@@ -269,7 +271,7 @@ If current catalog discovery fails while replaying a historical `Relation`, Rust
 
 #### 9.5 PostgreSQL extension fixture
 
-`scripts/test-postgresql-extensions.sh` builds a PostgreSQL 17 image from the repository Dockerfile, installs matching pgvector and PostGIS packages, enables logical replication, creates both extensions, and runs the exact snapshot/WAL equality test. The strict fixture requires vector, halfvec, sparsevec, geometry, and geography to exist; the dedicated GitHub CI job runs it on every push and pull request.
+`scripts/test-postgresql-extensions.sh` builds a PostgreSQL 17 image from the repository Dockerfile, installs matching pgvector and PostGIS packages, enables logical replication, and runs two required gates. The type gate requires vector, halfvec, sparsevec, geometry, and geography to exist and remain identical across snapshot/WAL paths. The recovery gate forcibly terminates the active replication backend, commits a transaction while the original connection is down, and requires the new backend to deliver it. The dedicated `postgresql-cdc` GitHub CI job runs both on every push and pull request.
 
 ### 10. MySQL Connector
 
@@ -342,7 +344,7 @@ The MySQL 8.4 Docker gate covers:
 - checkpoint stop before an old-schema row, destructive drop/add-column DDL, and a new-schema row;
 - restart after the database already exposes the final schema, with correct old-schema decoding, DDL state checkpointing, and new-schema decoding.
 
-Unit gates cover checkpoint/state atomicity, version 1/2/3 checkpoint compatibility, schema-history serialization, incremental keyset progress/control, completed-signal replay, PostgreSQL snapshot/file/in-process signal parsing, MySQL signal parsing, durable runtime signal acknowledgement, management gating, replay-state rewind, scalar and extension conversions, heartbeat encoding, selected-table isolation, create/alter/drop/rename DDL application, and JKS plus modern PKCS#12 TLS-store conversion and failure handling. A librdkafka MockCluster gate verifies Kafka key filtering, single-partition consumption, and no offset commit before durable signal acknowledgement. The external PostgreSQL 17 gate verifies forced replication-backend termination and automatic recovery, explicit failure after a checkpoint's slot is lost, periodic heartbeat emission, successful execution of `heartbeat.action.query`, heartbeat-table filtering, source/file/in-process-signaled chunking, immediate external-signal checkpointing, file and in-process read-only signaling without a signal table, checkpoint restart, additional conditions, concurrent-update deduplication, pause/resume/scoped-stop control, read-only transaction watermarks under a held update, restricted table permissions, zero connector watermark writes, unique surrogate-key ordering, completion cleanup, signal-table isolation, and snapshot/WAL equality for hstore, domains, enums, and tsvector. An opt-in superuser fixture temporarily limits `max_slot_wal_keep_size`, drives a slot to `wal_status=lost`, verifies fail-closed resume, and restores the original setting; it must be run on an isolated PostgreSQL instance. A required Docker/CI fixture verifies vector/halfvec/sparsevec and PostGIS geometry/geography on PostgreSQL 17. The external MySQL 8.4 gate verifies periodic heartbeat emission during an idle stream, exact-server-UUID GTID startup, checkpoint recovery, destructive-DDL recovery including schema-invariant index/default operations, in-process incremental snapshot execution, typed keyset restart after deletion/insertion, durable completed signal IDs, concurrent-window deduplication, the core plus OGC spatial snapshot/binlog type matrix, and real-broker Kafka replay across the connector-checkpoint/offset-commit crash window; the test requires temporary free space on the MySQL data volume.
+Unit gates cover checkpoint/state atomicity, version 1/2/3 checkpoint compatibility, schema-history serialization, incremental keyset progress/control, completed-signal replay, PostgreSQL snapshot/file/in-process signal parsing, MySQL signal parsing, durable runtime signal acknowledgement, management gating, replay-state rewind, scalar and extension conversions, heartbeat encoding, selected-table isolation, create/alter/drop/rename DDL application, and JKS plus modern PKCS#12 TLS-store conversion and failure handling. A librdkafka MockCluster gate verifies Kafka key filtering, single-partition consumption, and no offset commit before durable signal acknowledgement. The external PostgreSQL 17 gate verifies forced replication-backend termination and automatic recovery, explicit failure after a checkpoint's slot is lost, periodic heartbeat emission, successful execution of `heartbeat.action.query`, heartbeat-table filtering, source/file/in-process-signaled chunking, immediate external-signal checkpointing, file and in-process read-only signaling without a signal table, checkpoint restart, additional conditions, concurrent-update deduplication, pause/resume/scoped-stop control, read-only transaction watermarks under a held update, restricted table permissions, zero connector watermark writes, unique surrogate-key ordering, completion cleanup, signal-table isolation, and snapshot/WAL equality for hstore, domains, enums, and tsvector. An opt-in superuser fixture temporarily limits `max_slot_wal_keep_size`, drives a slot to `wal_status=lost`, verifies fail-closed resume, and restores the original setting; it must be run on an isolated PostgreSQL instance. The required Docker/CI fixture enforces both vector/halfvec/sparsevec and PostGIS geometry/geography equality plus replication-backend recovery on PostgreSQL 17. The external MySQL 8.4 gate verifies periodic heartbeat emission during an idle stream, exact-server-UUID GTID startup, checkpoint recovery, destructive-DDL recovery including schema-invariant index/default operations, in-process incremental snapshot execution, typed keyset restart after deletion/insertion, durable completed signal IDs, concurrent-window deduplication, the core plus OGC spatial snapshot/binlog type matrix, and real-broker Kafka replay across the connector-checkpoint/offset-commit crash window; the test requires temporary free space on the MySQL data volume.
 
 ### 11. SQL Server Connector
 
@@ -381,7 +383,7 @@ With `tombstones.on.delete=true`, which is the Debezium-compatible default, enco
 
 stdout is best-effort and intended for development; it prints tombstones as a `null` line. Kafka uses `librdkafka`, sends tombstones as a true null value, and requires `acks=all` or `-1` so `write` returns only after replica acknowledgement. Producer idempotence is always enabled. Rustium owns bootstrap, acknowledgement, compression, idempotence, and delivery-timeout properties; pass-through properties cannot replace these durability settings. Producer idempotence does not make source-to-Kafka delivery exactly-once.
 
-The shared runtime retries only failures explicitly classified as retryable by a Sink. It maps Debezium's `errors.max.retries`, `errors.retry.delay.initial.ms`, and `errors.retry.delay.max.ms`, with native equivalents under `runtime`; Rustium's finite defaults are 10 retries, 300 ms initial delay, and a 10 s ceiling. Backoff doubles after each attempt and cancellation interrupts the wait. Delivery holds and replays the same batch without checkpointing until success. This provides at-least-once progress without source-position gaps, while a partially delivered attempt can still produce duplicates. Each Source retains responsibility for reconnect and cursor reconstruction because that recovery depends on connector-specific durable state.
+The shared retry policy maps Debezium's `errors.max.retries`, `errors.retry.delay.initial.ms`, and `errors.retry.delay.max.ms`, with native equivalents under `runtime`; Rustium's finite defaults are 10 retries, 300 ms initial delay, and a 10 s ceiling. PostgreSQL consumes this policy for transient replication recovery, and the runtime consumes it only for failures explicitly classified as retryable by a Sink. Sink backoff doubles after each attempt and cancellation interrupts the wait. Delivery holds and replays the same batch without checkpointing until success. This provides at-least-once progress without source-position gaps, while a partially delivered attempt can still produce duplicates. Each Source retains responsibility for reconnect and cursor reconstruction because recovery depends on connector-specific durable state.
 
 ### 13. Control Plane and Observability
 
@@ -402,8 +404,8 @@ Metrics expose connector state, delivered events, failed events, pipeline queue 
 
 - Configuration and capability errors fail before capture.
 - Unknown protocol/data errors stop the connector.
-- Retryable Sink operations use a shared, finite-by-default retry budget and cancellation-aware exponential backoff.
-- Source reconnect remains connector-owned; MySQL currently has finite, logged binlog reconnect handling.
+- Retryable PostgreSQL Source and Sink operations use a shared, finite-by-default retry budget and exponential backoff.
+- Source reconnect remains connector-owned; PostgreSQL and MySQL have tested connector-specific recovery, while SQL Server recovery remains open.
 - Queues are bounded, and a blocked or retrying Sink propagates backpressure to source output.
 - Database and Kafka TLS are configuration-controlled.
 - The management server binds to loopback by default.
@@ -501,7 +503,7 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. Roadmap
 
-1. Add long-running backpressure/reconnect soak gates and connector-specific recovery for the remaining Sources.
+1. Add long-running backpressure/reconnect soak gates and connector-specific SQL Server recovery.
 2. Add Schema Registry formats, packaging, security policy, operational runbooks, and stable upgrade migrations before `1.0`.
 3. Consider additional databases only after the current three connectors and shared runtime pass the `1.0` gates.
 
@@ -726,6 +728,8 @@ Slot 会保留快照期间提交的变更，因此切换不存在缺口。
 
 `pg_walstream` 提供复制传输和协议解析。Rustium 转换 begin、insert、update、delete、truncate、commit 和流式事务事件。同 LSN 序号让位点可全序和重放。缺失的未变化 TOAST 列成为 `Unavailable`。
 
+PostgreSQL 建立连接和暂时性 stream 恢复使用共享的 Debezium 兼容 `errors.max.retries`、`errors.retry.delay.initial.ms` 和 `errors.retry.delay.max.ms` 策略。配置的重试次数不包含首次尝试；`0` 关闭自动 stream 恢复，`-1` 表示实际上无界。退避和连接尝试位于 `pg_walstream` 内，Rustium 继续拥有可重放 LSN、slot 连续性检查、已解码事务状态和 checkpoint 确认。
+
 PostgreSQL connector-state payload 持久化快照表布局，以及每列的类型 OID 和 typmod。重启时先恢复该基线，再打开 slot。随后每个 `Relation` 消息提供后续行事件对应的历史列名、顺序、类型身份和 key 标记。只有精确匹配的 catalog 元数据用于补充类型名和可空性，不会覆盖 WAL 列布局。schema 变化时版本递增，更新状态附着到下一条可 checkpoint 的 SourceRecord。
 
 恢复已完成 checkpoint 之前，Rustium 会验证原 replication slot 仍然存在、仍使用 `pgoutput`，且没有进入 PostgreSQL `wal_status=unreserved` 或 `lost`。连续性检查失败时会在复制传输可能创建替代 slot 之前停止，并要求 reset checkpoint 后重新执行 initial snapshot。该契约有意选择显式恢复，而不是接受静默 WAL 缺口。
@@ -764,7 +768,7 @@ Connector-state version 5 保存 signal ID、展开后的集合、每集合 cond
 
 #### 9.5 PostgreSQL 扩展 fixture
 
-`scripts/test-postgresql-extensions.sh` 使用仓库 Dockerfile 构建 PostgreSQL 17 镜像，安装同主版本 pgvector 和 PostGIS 包，启用逻辑复制，创建两个扩展并运行精确的快照/WAL 等值测试。严格 fixture 要求 vector、halfvec、sparsevec、geometry、geography 全部存在；独立 GitHub CI job 会在每次 push 和 pull request 时运行。
+`scripts/test-postgresql-extensions.sh` 使用仓库 Dockerfile 构建 PostgreSQL 17 镜像，安装同主版本 pgvector 和 PostGIS 包，启用逻辑复制，并执行两个强制门槛。类型门槛要求 vector、halfvec、sparsevec、geometry、geography 存在且在快照/WAL 路径上一致。恢复门槛强制终止活动 replication backend，在原连接断开期间提交事务，并要求新 backend 投递该事务。独立的 `postgresql-cdc` GitHub CI job 会在每次 push 和 pull request 时运行两项测试。
 
 ### 10. MySQL 连接器
 
@@ -876,7 +880,7 @@ SQL Server 支持 Debezium 兼容的 source table、file、有界 in-process 和
 
 stdout 是 best-effort，仅用于开发，并将 tombstone 输出为一行 `null`。Kafka 使用 `librdkafka`，将 tombstone 发送为真正的 null value，并要求 `acks=all` 或 `-1`，使 `write` 只在副本确认后返回。Producer 幂等始终启用。Rustium 拥有 bootstrap、确认、压缩、幂等和投递超时参数，透传属性不能替换这些持久性设置。Producer 幂等并不会把 Source 到 Kafka 变为 exactly-once。
 
-共享 runtime 只重试 Sink 明确分类为可重试的失败。它映射 Debezium 的 `errors.max.retries`、`errors.retry.delay.initial.ms` 和 `errors.retry.delay.max.ms`，原生等价项位于 `runtime` 下；Rustium 的有限默认值为重试 10 次、初始等待 300 ms、上限 10 s。每次尝试后退避时间倍增，取消信号可以中断等待。投递会保留并重放同一批次，成功前不写 checkpoint。这提供不会跳过源位点的 at-least-once 进度，但部分投递成功的尝试仍可能产生重复。各 Source 继续负责重连和 cursor 重建，因为恢复依赖连接器特有的持久状态。
+共享重试策略映射 Debezium 的 `errors.max.retries`、`errors.retry.delay.initial.ms` 和 `errors.retry.delay.max.ms`，原生等价项位于 `runtime` 下；Rustium 的有限默认值为重试 10 次、初始等待 300 ms、上限 10 s。PostgreSQL 使用该策略处理暂时性复制恢复，runtime 只对 Sink 明确分类为可重试的失败使用它。Sink 每次尝试后的退避时间倍增，取消信号可以中断等待。投递会保留并重放同一批次，成功前不写 checkpoint。这提供不会跳过源位点的 at-least-once 进度，但部分投递成功的尝试仍可能产生重复。各 Source 继续负责重连和 cursor 重建，因为恢复依赖连接器特有的持久状态。
 
 ### 13. 控制平面与可观测性
 
@@ -897,8 +901,8 @@ stdout 是 best-effort，仅用于开发，并将 tombstone 输出为一行 `nul
 
 - 配置和能力错误在捕获前失败。
 - 未知协议/数据错误停止连接器。
-- 可重试的 Sink 操作使用共享的、默认有限的重试预算和可被取消的指数退避。
-- Source 重连仍由连接器负责；MySQL 当前已具备有限且记录日志的 binlog 重连处理。
+- 可重试的 PostgreSQL Source 和 Sink 操作使用共享的、默认有限的重试预算和指数退避。
+- Source 重连仍由连接器负责；PostgreSQL 和 MySQL 已有经过测试的连接器特有恢复，SQL Server 恢复仍待完成。
 - 队列有界，阻塞或重试中的 Sink 会将背压传回 Source 输出。
 - 数据库和 Kafka TLS 由配置控制。
 - 管理 Server 默认绑定 loopback。
@@ -996,6 +1000,6 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. 路线图
 
-1. 增加长时间背压/重连 soak 门槛，并为其余 Source 补齐连接器特有的恢复能力。
+1. 增加长时间背压/重连 soak 门槛，并补齐 SQL Server 连接器特有的恢复能力。
 2. 在 `1.0` 前补 Schema Registry 格式、打包、安全策略、运维手册和稳定升级迁移。
 3. 只有当当前三个连接器和共享运行时通过 `1.0` 门槛后，才考虑更多数据库。
