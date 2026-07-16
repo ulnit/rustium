@@ -6,7 +6,7 @@ use futures::TryStreamExt;
 use rustium_config::{SnapshotConfig, SnapshotMode, SqlServerSourceConfig};
 use rustium_core::{
     ChangeEvent, DataValue, Error, EventId, EventSchema, FieldSchema, Operation, RecordBoundary,
-    Result, Row, SignalAcknowledgement, SignalRecord, SourceConnector, SourceContext,
+    Result, RetryPolicy, Row, SignalAcknowledgement, SignalRecord, SourceConnector, SourceContext,
     SourceMetadata, SourcePosition, SourceRecord, SqlServerPosition, TransactionMetadata,
 };
 use tiberius::{
@@ -14,7 +14,7 @@ use tiberius::{
 };
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::state::{
     IncrementalSnapshotProgress, SqlServerKeyValue, decode_connector_state, encode_connector_state,
@@ -592,6 +592,7 @@ pub struct SqlServerSource {
     config: SqlServerSourceConfig,
     snapshot: SnapshotConfig,
     captures: Vec<CaptureTable>,
+    retry_policy: RetryPolicy,
 }
 
 impl SqlServerSource {
@@ -606,7 +607,14 @@ impl SqlServerSource {
             config,
             snapshot,
             captures: Vec::new(),
+            retry_policy: RetryPolicy::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
     }
 
     fn database(&self) -> &str {
@@ -1066,6 +1074,9 @@ impl SourceConnector for SqlServerSource {
             connector = %self.connector_name,
             database = %self.database(),
             commit_lsn = %format_lsn(&state.cursor.commit_lsn),
+            max_retries = self.retry_policy.max_retries,
+            initial_retry_delay_ms = self.retry_policy.initial_delay.as_millis(),
+            max_retry_delay_ms = self.retry_policy.max_delay.as_millis(),
             "SQL Server CDC streaming started"
         );
 
@@ -1148,22 +1159,14 @@ impl SourceConnector for SqlServerSource {
                     incremental.mark_checkpointed();
                 }
                 _ = interval.tick() => {
-                    let max_lsn = current_max_lsn(&mut client).await?;
-                    if max_lsn < state.cursor.commit_lsn
-                        || (max_lsn == state.cursor.commit_lsn && state.cursor.commit_complete())
-                    {
-                        continue;
-                    }
-                    validate_retention(&mut client, &self.captures, &state.cursor.commit_lsn).await?;
-                    let records = read_change_batch(
+                    let Some(records) = poll_change_batch_with_retry(
+                        self,
                         &mut client,
-                        self.database(),
-                        &self.connector_name,
-                        &self.captures,
                         &mut state,
-                        &max_lsn,
-                        self.config.streaming_fetch_size,
-                    ).await?;
+                        &context.cancellation,
+                    ).await? else {
+                        continue;
+                    };
                     for mut record in records {
                         if let Some(signal_row) = source_signal_row(&record, &self.config) {
                             if let Some(signal_row) = signal_row {
@@ -1229,6 +1232,108 @@ impl SourceConnector for SqlServerSource {
             }
         }
     }
+}
+
+async fn poll_change_batch_with_retry(
+    source: &SqlServerSource,
+    client: &mut SqlClient,
+    state: &mut StreamingState,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<Option<Vec<SourceRecord>>> {
+    let mut retries = 0_u64;
+    let mut delay = source.retry_policy.initial_delay;
+    let mut reconnect = false;
+    loop {
+        if reconnect {
+            match connect(&source.config, source.database()).await {
+                Ok(reconnected) => {
+                    *client = reconnected;
+                    info!(
+                        connector = %source.connector_name,
+                        database = %source.database(),
+                        retries,
+                        "SQL Server CDC polling connection recovered"
+                    );
+                }
+                Err(error @ Error::RetryableSource(_)) => {
+                    if !wait_for_sqlserver_retry(source, retries, &mut delay, &error, cancellation)
+                        .await?
+                    {
+                        return Err(error);
+                    }
+                    retries += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        match poll_change_batch_once(source, client, state).await {
+            Ok(records) => return Ok(records),
+            Err(error @ Error::RetryableSource(_)) => {
+                if !wait_for_sqlserver_retry(source, retries, &mut delay, &error, cancellation)
+                    .await?
+                {
+                    return Err(error);
+                }
+                retries += 1;
+                reconnect = true;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn wait_for_sqlserver_retry(
+    source: &SqlServerSource,
+    retries: u64,
+    delay: &mut std::time::Duration,
+    error: &Error,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<bool> {
+    if source.retry_policy.max_retries >= 0 && retries >= source.retry_policy.max_retries as u64 {
+        return Ok(false);
+    }
+    warn!(
+        connector = %source.connector_name,
+        database = %source.database(),
+        retry = retries + 1,
+        max_retries = source.retry_policy.max_retries,
+        delay_ms = delay.as_millis(),
+        %error,
+        "retryable SQL Server CDC polling failure; reconnecting"
+    );
+    tokio::select! {
+        () = cancellation.cancelled() => return Err(Error::Cancelled),
+        () = tokio::time::sleep(*delay) => {}
+    }
+    *delay = delay.saturating_mul(2).min(source.retry_policy.max_delay);
+    Ok(true)
+}
+
+async fn poll_change_batch_once(
+    source: &SqlServerSource,
+    client: &mut SqlClient,
+    state: &mut StreamingState,
+) -> Result<Option<Vec<SourceRecord>>> {
+    let max_lsn = current_max_lsn(client).await?;
+    if max_lsn < state.cursor.commit_lsn
+        || (max_lsn == state.cursor.commit_lsn && state.cursor.commit_complete())
+    {
+        return Ok(None);
+    }
+    validate_retention(client, &source.captures, &state.cursor.commit_lsn).await?;
+    read_change_batch(
+        client,
+        source.database(),
+        &source.connector_name,
+        &source.captures,
+        state,
+        &max_lsn,
+        source.config.streaming_fetch_size,
+    )
+    .await
+    .map(Some)
 }
 
 fn heartbeat_timer(interval: std::time::Duration) -> Option<tokio::time::Interval> {
@@ -2029,15 +2134,15 @@ async fn connect(config: &SqlServerSourceConfig, database: &str) -> Result<SqlCl
     let address = tds.get_addr();
     let tcp = tokio::time::timeout(config.connect_timeout, TcpStream::connect(&address))
         .await
-        .map_err(|_| Error::Source("timed out connecting to SQL Server".into()))?
-        .map_err(sqlserver_error)?;
-    tcp.set_nodelay(true).map_err(sqlserver_error)?;
+        .map_err(|_| Error::RetryableSource("timed out connecting to SQL Server".into()))?
+        .map_err(sqlserver_io_error)?;
+    tcp.set_nodelay(true).map_err(sqlserver_io_error)?;
     tokio::time::timeout(
         config.connect_timeout,
         Client::connect(tds, tcp.compat_write()),
     )
     .await
-    .map_err(|_| Error::Source("timed out negotiating SQL Server TDS".into()))?
+    .map_err(|_| Error::RetryableSource("timed out negotiating SQL Server TDS".into()))?
     .map_err(sqlserver_error)
 }
 
@@ -2616,8 +2721,37 @@ fn max_lsn_bytes() -> Vec<u8> {
     vec![u8::MAX; LSN_SIZE]
 }
 
-fn sqlserver_error(error: impl std::fmt::Display) -> Error {
-    Error::Source(error.to_string())
+fn sqlserver_error(error: tiberius::error::Error) -> Error {
+    let retryable = matches!(error, tiberius::error::Error::Io { .. })
+        || error.code().is_some_and(is_transient_sqlserver_code);
+    if retryable {
+        Error::RetryableSource(error.to_string())
+    } else {
+        Error::Source(error.to_string())
+    }
+}
+
+fn sqlserver_io_error(error: std::io::Error) -> Error {
+    Error::RetryableSource(error.to_string())
+}
+
+const fn is_transient_sqlserver_code(code: u32) -> bool {
+    matches!(
+        code,
+        233 | 1205
+            | 1222
+            | 10_053
+            | 10_054
+            | 10_060
+            | 10_928
+            | 10_929
+            | 40_197
+            | 40_501
+            | 40_613
+            | 49_918
+            | 49_919
+            | 49_920
+    )
 }
 
 #[cfg(test)]
@@ -2641,6 +2775,26 @@ mod tests {
             raw_operation: RAW_UPDATE_BEFORE,
         };
         assert!(!incomplete.commit_complete());
+    }
+
+    #[test]
+    fn classifies_only_transient_sqlserver_failures_for_retry() {
+        let io_error = tiberius::error::Error::Io {
+            kind: std::io::ErrorKind::ConnectionReset,
+            message: "connection reset".into(),
+        };
+        assert!(matches!(
+            sqlserver_error(io_error),
+            Error::RetryableSource(message) if message.contains("connection reset")
+        ));
+        assert!(is_transient_sqlserver_code(1205));
+        assert!(is_transient_sqlserver_code(40_613));
+        assert!(!is_transient_sqlserver_code(208));
+
+        assert!(matches!(
+            sqlserver_error(tiberius::error::Error::Protocol("invalid token".into())),
+            Error::Source(message) if message.contains("invalid token")
+        ));
     }
 
     #[test]

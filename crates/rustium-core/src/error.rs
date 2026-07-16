@@ -6,6 +6,8 @@ pub enum Error {
     Configuration(String),
     #[error("source error: {0}")]
     Source(String),
+    #[error("retryable source error: {0}")]
+    RetryableSource(String),
     #[error("encoding error: {0}")]
     Encoding(String),
     #[error("sink error: {0}")]

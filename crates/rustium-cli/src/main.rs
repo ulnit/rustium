@@ -276,11 +276,14 @@ fn build_source(config: &Config) -> Result<Box<dyn SourceConnector>> {
             source.clone(),
             config.snapshot.clone(),
         ))),
-        SourceConfig::Sqlserver(source) => Ok(Box::new(SqlServerSource::new(
-            &config.metadata.name,
-            source.clone(),
-            config.snapshot.clone(),
-        ))),
+        SourceConfig::Sqlserver(source) => Ok(Box::new(
+            SqlServerSource::new(
+                &config.metadata.name,
+                source.clone(),
+                config.snapshot.clone(),
+            )
+            .with_retry_policy(config.runtime.retry_policy()),
+        )),
     }
 }
 

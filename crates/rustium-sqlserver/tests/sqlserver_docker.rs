@@ -1,7 +1,14 @@
-use std::{process::Command, time::Duration};
+use std::{
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
+use futures::FutureExt;
 use rustium_config::{SnapshotConfig, SnapshotMode, SqlServerSourceConfig, TableSelection};
-use rustium_core::{DataValue, Operation, RecordBoundary, Row, SourceConnector, SourceContext};
+use rustium_core::{
+    DataValue, Operation, RecordBoundary, RetryPolicy, Row, SourceConnector, SourceContext,
+};
 use rustium_sqlserver::SqlServerSource;
 use tiberius::{AuthMethod, Client, Config};
 use tokio::{
@@ -17,7 +24,27 @@ struct DockerContainer(String);
 
 impl Drop for DockerContainer {
     fn drop(&mut self) {
-        let _ = Command::new("docker").args(["rm", "-f", &self.0]).output();
+        let Ok(mut child) = Command::new("docker")
+            .args(["rm", "-f", &self.0])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -241,14 +268,19 @@ async fn snapshots_and_streams_cdc_changes() {
             mode: SnapshotMode::Initial,
             fetch_size: 128,
         },
-    );
+    )
+    .with_retry_policy(RetryPolicy {
+        max_retries: 5,
+        initial_delay: Duration::from_millis(50),
+        max_delay: Duration::from_millis(250),
+    });
     source.validate().await.unwrap();
 
     let (output_tx, mut output_rx) = mpsc::channel(64);
     let (_ack_tx, ack_rx) = watch::channel(None);
     let cancellation = CancellationToken::new();
     let source_cancel = cancellation.clone();
-    let source_task = tokio::spawn(async move {
+    let mut source_task = tokio::spawn(async move {
         source
             .run(SourceContext {
                 output: output_tx,
@@ -260,31 +292,32 @@ async fn snapshots_and_streams_cdc_changes() {
             .await
     });
 
-    let mut snapshot_rows = 0;
-    let mut snapshot_extended = None;
-    loop {
-        let record = tokio::time::timeout(Duration::from_secs(30), output_rx.recv())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        if record.boundary == RecordBoundary::SnapshotComplete {
-            break;
+    let capture_result = std::panic::AssertUnwindSafe(async {
+        let mut snapshot_rows = 0;
+        let mut snapshot_extended = None;
+        loop {
+            let record = tokio::time::timeout(Duration::from_secs(30), output_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if record.boundary == RecordBoundary::SnapshotComplete {
+                break;
+            }
+            let event = record.event.unwrap();
+            assert_eq!(event.operation, Operation::Read);
+            if snapshot_extended.is_none() {
+                snapshot_extended = event.after;
+            }
+            snapshot_rows += 1;
         }
-        let event = record.event.unwrap();
-        assert_eq!(event.operation, Operation::Read);
-        if snapshot_extended.is_none() {
-            snapshot_extended = event.after;
-        }
-        snapshot_rows += 1;
-    }
-    assert_eq!(snapshot_rows, 2);
-    let snapshot_extended = snapshot_extended.expect("SQL Server snapshot row exists");
-    require_extended_values(&snapshot_extended);
+        assert_eq!(snapshot_rows, 2);
+        let snapshot_extended = snapshot_extended.expect("SQL Server snapshot row exists");
+        require_extended_values(&snapshot_extended);
 
-    admin
-        .simple_query(
-            "BEGIN TRANSACTION; \
+        admin
+            .simple_query(
+                "BEGIN TRANSACTION; \
              INSERT INTO dbo.orders VALUES (\
                 3, N'Cara', 10.25, CONVERT(xml, N'<root><value>Rustium</value></root>'), \
                 hierarchyid::Parse('/1/2/'), geometry::STGeomFromText('POINT (1 2)', 4326), \
@@ -293,47 +326,143 @@ async fn snapshots_and_streams_cdc_changes() {
              UPDATE dbo.orders SET amount = 13.30 WHERE id = 1; \
              DELETE FROM dbo.orders WHERE id = 2; \
              COMMIT TRANSACTION;",
-        )
-        .await
-        .unwrap()
-        .into_results()
-        .await
-        .unwrap();
-
-    let mut operations = Vec::new();
-    let mut create_extended = None;
-    loop {
-        let record = tokio::time::timeout(Duration::from_secs(60), output_rx.recv())
+            )
             .await
             .unwrap()
-            .unwrap()
+            .into_results()
+            .await
             .unwrap();
-        if record.boundary == RecordBoundary::TransactionCommit {
-            break;
-        }
-        if let Some(event) = record.event {
-            if event.operation == Operation::Create {
-                create_extended = event.after.clone();
+
+        let mut operations = Vec::new();
+        let mut create_extended = None;
+        loop {
+            let record = tokio::time::timeout(Duration::from_secs(60), output_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if record.boundary == RecordBoundary::TransactionCommit {
+                break;
             }
-            operations.push(event.operation);
+            if let Some(event) = record.event {
+                if event.operation == Operation::Create {
+                    create_extended = event.after.clone();
+                }
+                operations.push(event.operation);
+            }
         }
-    }
-    assert_eq!(
-        operations,
-        [Operation::Create, Operation::Update, Operation::Delete]
-    );
-    let create_extended = create_extended.expect("SQL Server CDC create row exists");
-    require_extended_values(&create_extended);
-    for field in [
-        "xml_value",
-        "hierarchy_value",
-        "geometry_value",
-        "geography_value",
-    ] {
-        assert_eq!(snapshot_extended.get(field), create_extended.get(field));
-    }
+        assert_eq!(
+            operations,
+            [Operation::Create, Operation::Update, Operation::Delete]
+        );
+        let create_extended = create_extended.expect("SQL Server CDC create row exists");
+        require_extended_values(&create_extended);
+        for field in [
+            "xml_value",
+            "hierarchy_value",
+            "geometry_value",
+            "geography_value",
+        ] {
+            assert_eq!(snapshot_extended.get(field), create_extended.get(field));
+        }
+
+        let original_session = admin
+            .simple_query(
+                "SELECT TOP (1) CAST(s.session_id AS int) AS session_id, \
+                        CONVERT(nvarchar(36), c.connection_id) AS connection_id \
+             FROM sys.dm_exec_sessions s \
+             JOIN sys.dm_exec_connections c ON c.session_id = s.session_id \
+             WHERE s.program_name = N'rustium' AND s.login_name = N'rustium' \
+             ORDER BY s.login_time DESC",
+            )
+            .await
+            .unwrap()
+            .into_row()
+            .await
+            .unwrap()
+            .expect("active Rustium SQL Server polling session");
+        let original_session_id = original_session
+            .get::<i32, _>("session_id")
+            .expect("active Rustium SQL Server polling session ID");
+        let original_connection_id = original_session
+            .get::<&str, _>("connection_id")
+            .expect("active Rustium SQL Server polling connection ID")
+            .to_owned();
+        admin
+            .simple_query(format!("KILL {original_session_id}"))
+            .await
+            .unwrap()
+            .into_results()
+            .await
+            .unwrap();
+        admin
+            .simple_query(
+                "INSERT INTO dbo.orders VALUES (\
+                4, N'Dora', 99.75, CONVERT(xml, N'<root><value>Reconnect</value></root>'), \
+                hierarchyid::Parse('/2/'), geometry::STGeomFromText('POINT (3 4)', 4326), \
+                geography::STGeomFromText('POINT (3 4)', 4326)\
+             );",
+            )
+            .await
+            .unwrap()
+            .into_results()
+            .await
+            .unwrap();
+
+        let mut saw_reconnected_row = false;
+        loop {
+            let record = tokio::time::timeout(Duration::from_secs(60), output_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if record.event.as_ref().is_some_and(|event| {
+                event.operation == Operation::Create
+                    && event.after.as_ref().and_then(|row| row.get("id"))
+                        == Some(&DataValue::Int64(4))
+            }) {
+                saw_reconnected_row = true;
+            }
+            if saw_reconnected_row && record.boundary == RecordBoundary::TransactionCommit {
+                break;
+            }
+        }
+        let reconnected_connection_id = admin
+            .simple_query(
+                "SELECT TOP (1) CONVERT(nvarchar(36), c.connection_id) AS connection_id \
+             FROM sys.dm_exec_sessions s \
+             JOIN sys.dm_exec_connections c ON c.session_id = s.session_id \
+             WHERE s.program_name = N'rustium' AND s.login_name = N'rustium' \
+             ORDER BY s.login_time DESC",
+            )
+            .await
+            .unwrap()
+            .into_row()
+            .await
+            .unwrap()
+            .and_then(|row| row.get::<&str, _>("connection_id").map(str::to_owned))
+            .expect("reconnected Rustium SQL Server polling connection");
+        assert_ne!(reconnected_connection_id, original_connection_id);
+    })
+    .catch_unwind()
+    .await;
 
     cancellation.cancel();
-    source_task.await.unwrap().unwrap();
-    admin.close().await.unwrap();
+    let source_result = match tokio::time::timeout(Duration::from_secs(5), &mut source_task).await {
+        Ok(result) => Some(result),
+        Err(_) => {
+            source_task.abort();
+            let _ = source_task.await;
+            None
+        }
+    };
+    let _ = admin.close().await;
+
+    if let Err(panic) = capture_result {
+        std::panic::resume_unwind(panic);
+    }
+    source_result
+        .expect("SQL Server source stopped after cancellation")
+        .expect("SQL Server source task joined")
+        .expect("SQL Server source completed without error");
 }
