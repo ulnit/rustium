@@ -10,6 +10,9 @@ use tokio::{
 };
 use tokio_util::{compat::TokioAsyncWriteCompatExt, sync::CancellationToken};
 
+const SA_PASSWORD: &str = "Rustium_Strong_2026!";
+const CONNECTOR_PASSWORD: &str = "Cdc_Connector#2026!";
+
 struct DockerContainer(String);
 
 impl Drop for DockerContainer {
@@ -92,7 +95,7 @@ async fn snapshots_and_streams_cdc_changes() {
             "-e",
             "ACCEPT_EULA=Y",
             "-e",
-            "MSSQL_SA_PASSWORD=Rustium_Strong_2026!",
+            &format!("MSSQL_SA_PASSWORD={SA_PASSWORD}"),
             "-e",
             "MSSQL_AGENT_ENABLED=true",
             "mcr.microsoft.com/mssql/server:2022-latest",
@@ -109,7 +112,7 @@ async fn snapshots_and_streams_cdc_changes() {
 
     let mut admin = None;
     for _ in 0..180 {
-        match connect(port, "master", "sa", "Rustium_Strong_2026!").await {
+        match connect(port, "master", "sa", SA_PASSWORD).await {
             Ok(client) => {
                 admin = Some(client);
                 break;
@@ -119,11 +122,11 @@ async fn snapshots_and_streams_cdc_changes() {
     }
     let mut admin = admin.expect("SQL Server container did not become ready");
     admin
-        .simple_query(
+        .simple_query(&format!(
             "CREATE DATABASE inventory; \
-             ALTER DATABASE inventory SET ALLOW_SNAPSHOT_ISOLATION ON; \
-             CREATE LOGIN rustium WITH PASSWORD = 'Rustium_Connector_2026!';",
-        )
+                 ALTER DATABASE inventory SET ALLOW_SNAPSHOT_ISOLATION ON; \
+                 CREATE LOGIN rustium WITH PASSWORD = '{CONNECTOR_PASSWORD}';"
+        ))
         .await
         .unwrap()
         .into_results()
@@ -131,9 +134,7 @@ async fn snapshots_and_streams_cdc_changes() {
         .unwrap();
     admin.close().await.unwrap();
 
-    let mut admin = connect(port, "inventory", "sa", "Rustium_Strong_2026!")
-        .await
-        .unwrap();
+    let mut admin = connect(port, "inventory", "sa", SA_PASSWORD).await.unwrap();
     admin
         .simple_query(
             "EXEC sys.sp_cdc_enable_db; \
@@ -191,7 +192,7 @@ async fn snapshots_and_streams_cdc_changes() {
         hostname: "127.0.0.1".into(),
         port,
         username: "rustium".into(),
-        password: "Rustium_Connector_2026!".into(),
+        password: CONNECTOR_PASSWORD.into(),
         databases: vec!["inventory".into()],
         tables: TableSelection {
             include: vec![r"dbo\.orders".into()],
