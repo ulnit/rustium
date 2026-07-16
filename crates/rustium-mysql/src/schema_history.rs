@@ -752,6 +752,7 @@ mod tests {
             server_id: 5_401,
             tables: TableSelection::default(),
             ssl_mode: "disabled".into(),
+            connection_time_zone: "UTC".into(),
             ssl_ca: None,
             ssl_cert: None,
             ssl_key: None,

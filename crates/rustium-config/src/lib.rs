@@ -539,6 +539,8 @@ pub struct MySqlSourceConfig {
     pub tables: TableSelection,
     #[serde(default = "default_mysql_ssl_mode")]
     pub ssl_mode: String,
+    #[serde(default = "default_mysql_connection_time_zone")]
+    pub connection_time_zone: String,
     #[serde(default)]
     pub ssl_ca: Option<String>,
     #[serde(default)]
@@ -621,6 +623,7 @@ impl MySqlSourceConfig {
                     .into(),
             ));
         }
+        self.session_time_zone()?;
         validate_heartbeat(
             &self.heartbeat_topics_prefix,
             self.heartbeat_topic_name.as_deref(),
@@ -761,6 +764,22 @@ impl MySqlSourceConfig {
             }
         }
         validate_table_patterns(&self.tables)
+    }
+
+    pub fn session_time_zone(&self) -> Result<&'static str> {
+        let value = self.connection_time_zone.trim();
+        if value == "+00:00"
+            || value.eq_ignore_ascii_case("UTC")
+            || value.eq_ignore_ascii_case("Z")
+            || value.eq_ignore_ascii_case("Etc/UTC")
+        {
+            return Ok("+00:00");
+        }
+
+        Err(Error::Configuration(format!(
+            "source.connection_time_zone currently supports only UTC, Z, Etc/UTC, or +00:00; found {:?}",
+            self.connection_time_zone
+        )))
     }
 
     pub fn connection_url(&self) -> Result<String> {
@@ -1369,6 +1388,9 @@ const fn default_mysql_server_id() -> u32 {
 fn default_mysql_ssl_mode() -> String {
     "preferred".into()
 }
+fn default_mysql_connection_time_zone() -> String {
+    "UTC".into()
+}
 fn default_mysql_keep_alive_interval() -> Duration {
     Duration::from_secs(60)
 }
@@ -1539,8 +1561,7 @@ sink:
 
     #[test]
     fn parses_native_mysql_heartbeat_settings() {
-        let config = Config::from_yaml(
-            r#"
+        let raw = r#"
 api_version: rustium.io/v1alpha1
 kind: Connector
 metadata:
@@ -1550,22 +1571,27 @@ source:
   username: rustium
   password: secret
   databases: [inventory]
+  connection_time_zone: Etc/UTC
   heartbeat_interval: 5s
   heartbeat_topics_prefix: __heartbeat
   heartbeat_topic_name: shared-heartbeat
 sink:
   type: stdout
   topic_prefix: inventory
-"#,
-        )
-        .unwrap();
+"#;
+        let config = Config::from_yaml(raw).unwrap();
         let source = config.source.as_mysql().unwrap();
+        assert_eq!(source.connection_time_zone, "Etc/UTC");
+        assert_eq!(source.session_time_zone().unwrap(), "+00:00");
         assert_eq!(source.heartbeat_interval, Duration::from_secs(5));
         assert_eq!(source.heartbeat_topics_prefix, "__heartbeat");
         assert_eq!(
             source.heartbeat_topic_name.as_deref(),
             Some("shared-heartbeat")
         );
+        let implicit_utc =
+            Config::from_yaml(&raw.replace("  connection_time_zone: Etc/UTC\n", "")).unwrap();
+        assert_eq!(config.fingerprint(), implicit_utc.fingerprint());
     }
 
     #[test]

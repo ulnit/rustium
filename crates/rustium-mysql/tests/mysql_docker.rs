@@ -114,6 +114,7 @@ async fn snapshots_streams_reconnects_and_preserves_transaction_order() {
             exclude: Vec::new(),
         },
         ssl_mode: "disabled".into(),
+        connection_time_zone: "UTC".into(),
         ssl_ca: None,
         ssl_cert: None,
         ssl_key: None,

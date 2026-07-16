@@ -2305,8 +2305,9 @@ async fn connect_with_options(config: &MySqlSourceConfig, builder: OptsBuilder) 
         .await
         .map_err(|_| Error::Source("timed out connecting to MySQL".into()))?
         .map_err(mysql_error)?;
+    let session_time_zone = config.session_time_zone()?;
     connection
-        .query_drop("SET SESSION time_zone = '+00:00'")
+        .exec_drop("SET SESSION time_zone = ?", (session_time_zone,))
         .await
         .map_err(mysql_error)?;
     Ok(connection)
@@ -3101,6 +3102,7 @@ mod tests {
             server_id: 5_401,
             tables: TableSelection::default(),
             ssl_mode: "disabled".into(),
+            connection_time_zone: "UTC".into(),
             ssl_ca: None,
             ssl_cert: None,
             ssl_key: None,

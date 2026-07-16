@@ -295,6 +295,10 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
                 .get("database.ssl.mode")
                 .cloned()
                 .unwrap_or_else(default_mysql_ssl_mode),
+            connection_time_zone: properties
+                .get("database.connectionTimeZone")
+                .cloned()
+                .unwrap_or_else(default_mysql_connection_time_zone),
             ssl_ca: properties.get("database.ssl.ca").cloned(),
             ssl_cert: properties.get("database.ssl.cert").cloned(),
             ssl_key: properties.get("database.ssl.key").cloned(),
@@ -878,6 +882,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "database.server.id",
         "database.server.id.offset",
         "database.ssl.mode",
+        "database.connectionTimeZone",
         "database.ssl.ca",
         "database.ssl.cert",
         "database.ssl.key",
@@ -1150,6 +1155,7 @@ database.hostname=mysql
 database.user=rustium
 database.password=secret
 database.server.id=7001
+database.connectionTimeZone=Etc/UTC
 database.ssl.ca=/etc/mysql/ca.pem
 database.ssl.cert=/etc/mysql/client.pem
 database.ssl.key=/etc/mysql/client-key.pem
@@ -1172,6 +1178,8 @@ topic.heartbeat.name=shared-heartbeat
         .unwrap();
         let source = config.source.as_mysql().unwrap();
         assert_eq!(source.server_id, 7001);
+        assert_eq!(source.connection_time_zone, "Etc/UTC");
+        assert_eq!(source.session_time_zone().unwrap(), "+00:00");
         assert_eq!(source.ssl_ca.as_deref(), Some("/etc/mysql/ca.pem"));
         assert_eq!(source.ssl_cert.as_deref(), Some("/etc/mysql/client.pem"));
         assert_eq!(source.ssl_key.as_deref(), Some("/etc/mysql/client-key.pem"));
@@ -1237,6 +1245,23 @@ gtid.source.includes=(unterminated
                 .to_string()
                 .contains("valid regular expression")
         );
+    }
+
+    #[test]
+    fn rejects_unsupported_mysql_connection_time_zone() {
+        let error = parse(
+            r#"
+name=mysql
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+database.connectionTimeZone=America/Los_Angeles
+topic.prefix=inventory
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("connection_time_zone"));
     }
 
     #[test]

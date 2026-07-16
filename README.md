@@ -426,6 +426,8 @@ Set `heartbeat.interval.ms` to a positive interval to emit heartbeat records. Th
 
 `heartbeat.action.query` optionally runs first on a separate ordinary MySQL connection at each positive heartbeat interval. Query failures stop the source with the database error; the query's binlog changes are not treated as source progress until the replication stream observes them. Native YAML uses `source.heartbeat_action_query`.
 
+`database.connectionTimeZone` maps to native `source.connection_time_zone` and defaults to `UTC`. Rustium normalizes the accepted `UTC`, `Z`, `Etc/UTC`, and `+00:00` values to a `+00:00` session time zone so snapshot `TIMESTAMP` values match UTC binlog values. Other offsets, named regions, and Debezium's `SERVER` mode fail configuration validation until both capture paths can guarantee identical temporal conversion.
+
 DDL parsing failures stop the connector by default. Debezium-compatible `schema.history.internal.skip.unparseable.ddl=true` can advance past unsupported DDL with a warning, but doing so can leave schema metadata incomplete.
 
 `gtid.source.includes` and `gtid.source.excludes` accept comma-separated, case-insensitive regular expressions matched against the complete GTID source UUID; configure at most one of them. When either property is present, Rustium filters a complete captured executed-GTID SID set and uses GTID-based startup when at least one source remains. If no executed source matches, it logs the condition and falls back to the captured binlog file and position. Streaming checkpoints contain a transaction GTID rather than a complete executed set, so reconnect from those checkpoints deliberately stays on the exact file/position path. With the default `gtid.source.filter.dml.events=true`, row events from a non-matching source are suppressed, but their transaction commit boundary still advances the safe checkpoint and DDL remains visible to schema history. Set the property to `false` to retain all DML while still filtering complete GTID recovery anchors. Native YAML uses `source.gtid_source_includes`, `source.gtid_source_excludes`, and `source.gtid_source_filter_dml_events`.
@@ -965,6 +967,8 @@ MySQL Debezium 风格示例见 [examples/mysql.properties](examples/mysql.proper
 将 `heartbeat.interval.ms` 设置为正数即可发送 heartbeat record。默认 topic 为 `__debezium-heartbeat.<topic.prefix>`；`topic.heartbeat.prefix` 可修改前缀，迁移时仍兼容 `heartbeat.topics.prefix`，`topic.heartbeat.name` 可覆盖完整 topic。heartbeat key 为 `{"serverName":"<connector-name>"}`，value 为 `{"ts_ms":...}`。原生 YAML 使用 `source.heartbeat_interval`、`source.heartbeat_topics_prefix` 和 `source.heartbeat_topic_name`。
 
 `heartbeat.action.query` 可选地在每个正 heartbeat 周期先通过独立普通 MySQL 连接执行。查询失败会携带数据库错误停止 Source；查询产生的 binlog 变化只有在复制流实际读到后才算源进度。原生 YAML 使用 `source.heartbeat_action_query`。
+
+`database.connectionTimeZone` 映射到原生 `source.connection_time_zone`，默认值为 `UTC`。Rustium 会把允许的 `UTC`、`Z`、`Etc/UTC` 和 `+00:00` 规范化为 `+00:00` session time zone，使 `TIMESTAMP` 快照值与 UTC binlog 值一致。其他偏移量、地区名称以及 Debezium 的 `SERVER` 模式会在配置校验阶段失败，直到两条捕获路径能够保证完全一致的时间转换。
 
 DDL 默认解析失败即停止连接器。可使用 Debezium 兼容参数 `schema.history.internal.skip.unparseable.ddl=true` 警告后跳过不支持的 DDL，但这可能导致 schema 元数据不完整。
 
