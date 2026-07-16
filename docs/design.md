@@ -438,7 +438,7 @@ The security response and deployment baseline are normative in [SECURITY.md](../
 
 #### 14.1 Container and Kubernetes Packaging
 
-The repository ships a multi-stage `Dockerfile` and `deploy/helm/rustium` chart. The runtime image contains the Rustium binary and only the native Kafka/TLS libraries required at runtime, runs as UID/GID `65532`, uses `/var/lib/rustium` as its writable state directory, and exposes management port `8080`. The chart deliberately enforces one replica and `Recreate` because SQLite checkpoint ownership and source ordering are single-owner contracts. Its default pod uses a retained `ReadWriteOnce` PVC, a read-only root filesystem, dropped Linux capabilities, disabled ServiceAccount token mounting, and live/ready probes. Configuration is mounted from a Secret; production installations should use an externally managed Secret and interpolate database, Kafka, and Registry credentials through environment variables. `scripts/test-packaging.sh` builds the image, executes `rustium --version`, checks OCI/non-root metadata, lints and renders the chart, verifies persistence/probe/security invariants, and rejects multiple replicas. Matching protected `v*` tags run `.github/workflows/release.yml`, which publishes signed multi-architecture GHCR images with SBOM/provenance, a Helm OCI artifact, and a GitHub Release with checksums. Crates.io publication remains reviewed and ordered from leaf crates to the CLI.
+The repository ships a multi-stage `Dockerfile` and `deploy/helm/rustium` chart. The runtime image contains the Rustium binary and only the native Kafka/TLS libraries required at runtime, runs as UID/GID `65532`, uses `/var/lib/rustium` as its writable state directory, and exposes management port `8080`. The chart deliberately enforces one replica and `Recreate` because SQLite checkpoint ownership and source ordering are single-owner contracts. Its default pod uses a retained `ReadWriteOnce` PVC, a read-only root filesystem, dropped Linux capabilities, disabled ServiceAccount token mounting, and live/ready probes. Configuration is mounted from a Secret; production installations should use an externally managed Secret and interpolate database, Kafka, and Registry credentials through environment variables. `scripts/test-packaging.sh` builds the image, executes `rustium --version`, checks OCI/non-root metadata, lints and renders the chart, verifies persistence/probe/security invariants, and rejects multiple replicas. Matching protected `v*` tags run `.github/workflows/release.yml`, which publishes signed multi-architecture GHCR images with SBOM/provenance, a Helm OCI artifact, and a GitHub Release with checksums. Crates.io publication is isolated to the manual `.github/workflows/publish-crates.yml` workflow, which requires an explicitly rotated Secret and publishes from leaf crates to the CLI.
 
 ### 15. Testing and Release Gates
 
@@ -542,8 +542,8 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. Roadmap
 
-1. Freeze the public configuration, event, and persisted-state compatibility contracts after the remaining release gates pass; tagged image/Helm/GitHub Release automation is implemented, while crates.io publication remains a reviewed ordered operation.
-2. Freeze the public configuration, event, and persisted-state compatibility contracts after the remaining release gates pass.
+1. Freeze the public configuration, event, and persisted-state compatibility contracts after the remaining release gates pass.
+2. Publish crates in dependency order through the manual crates.io workflow after a reviewed release and a rotated `CARGO_REGISTRY_TOKEN` secret.
 3. Consider additional databases only after the current three connectors and shared runtime pass the full `1.0` gates.
 
 ---
@@ -974,7 +974,7 @@ stdout 是 best-effort，仅用于开发，并将 tombstone 输出为一行 `nul
 
 #### 14.1 容器与 Kubernetes 打包
 
-仓库提供多阶段 `Dockerfile` 和 `deploy/helm/rustium` Chart。运行时镜像只包含 Rustium 二进制及 Kafka/TLS client 所需的原生运行库，以 UID/GID `65532` 运行，将 `/var/lib/rustium` 作为可写状态目录，并暴露 `8080` 管理端口。由于 SQLite checkpoint 所有权与源顺序都是单所有者契约，Chart 强制单副本和 `Recreate`。默认 Pod 使用保留的 `ReadWriteOnce` PVC、只读根文件系统、删除全部 Linux capabilities、关闭 ServiceAccount token 挂载，以及 live/ready probe。配置从 Secret 挂载；生产部署应使用外部管理的 Secret，并通过环境变量插入数据库、Kafka 和 Registry 凭据。`scripts/test-packaging.sh` 会构建镜像、执行 `rustium --version`、检查 OCI/非 root 元数据、lint/render Chart、验证持久化/probe/安全不变量，并拒绝多副本。匹配的受保护 `v*` tag 会运行 `.github/workflows/release.yml`，发布带签名、SBOM/provenance 的多架构 GHCR 镜像、Helm OCI artifact 和带 checksum 的 GitHub Release。crates.io 仍需审查后按叶子 crate 到 CLI 的顺序发布。
+仓库提供多阶段 `Dockerfile` 和 `deploy/helm/rustium` Chart。运行时镜像只包含 Rustium 二进制及 Kafka/TLS client 所需的原生运行库，以 UID/GID `65532` 运行，将 `/var/lib/rustium` 作为可写状态目录，并暴露 `8080` 管理端口。由于 SQLite checkpoint 所有权与源顺序都是单所有者契约，Chart 强制单副本和 `Recreate`。默认 Pod 使用保留的 `ReadWriteOnce` PVC、只读根文件系统、删除全部 Linux capabilities、关闭 ServiceAccount token 挂载，以及 live/ready probe。配置从 Secret 挂载；生产部署应使用外部管理的 Secret，并通过环境变量插入数据库、Kafka 和 Registry 凭据。`scripts/test-packaging.sh` 会构建镜像、执行 `rustium --version`、检查 OCI/非 root 元数据、lint/render Chart、验证持久化/probe/安全不变量，并拒绝多副本。匹配的受保护 `v*` tag 会运行 `.github/workflows/release.yml`，发布带签名、SBOM/provenance 的多架构 GHCR 镜像、Helm OCI artifact 和带 checksum 的 GitHub Release。crates.io 仅通过手动 `.github/workflows/publish-crates.yml` workflow 发布，该 workflow 要求显式轮换的 Secret，并按叶子 crate 到 CLI 的顺序执行。
 
 ### 15. 测试与发布门槛
 
@@ -1078,6 +1078,6 @@ cargo test -p rustium-sqlserver --test sqlserver_docker -- --ignored --nocapture
 
 ### 16. 路线图
 
-1. 剩余重点是冻结公共配置、事件和持久化状态兼容契约；tagged image/Helm/GitHub Release 自动化已实现，crates.io 仍需审查后有序发布。
-2. 剩余发布门槛通过后，冻结公共配置、事件和持久化状态兼容契约。
+1. 剩余重点是冻结公共配置、事件和持久化状态兼容契约；tagged image/Helm/GitHub Release 自动化已实现。
+2. 在完成审查并轮换 `CARGO_REGISTRY_TOKEN` secret 后，通过手动 crates.io workflow 按依赖顺序发布各 crate。
 3. 只有当当前三个连接器和共享运行时通过完整 `1.0` 门槛后，才考虑更多数据库。

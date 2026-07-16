@@ -647,6 +647,8 @@ The mounted configuration should use `server.bind: 0.0.0.0:8080` and `state.path
 
 Tagged releases run [.github/workflows/release.yml](.github/workflows/release.yml). The workflow checks that the tag, Cargo workspace, and Chart versions match, repeats the locked Rust gates, publishes signed multi-architecture (`linux/amd64` and `linux/arm64`) images to GHCR with SBOM/provenance, pushes the Helm chart as an OCI artifact, and creates a GitHub Release with image-digest and SHA-256 checksum files. Crates.io publication remains a separate, reviewed, ordered operation because internal crates must be published from leaves to the CLI.
 
+Crates.io publication is available only through the manual [.github/workflows/publish-crates.yml](.github/workflows/publish-crates.yml) workflow. It requires typing `publish` at dispatch time and configuring the rotated `CARGO_REGISTRY_TOKEN` repository Secret; it verifies the full workspace and publishes core, foundation, connector, and CLI crates in dependency order. The workflow is never triggered by a push or tag.
+
 ### Documentation and Contribution Policy
 
 - User-facing documentation is complete English first, followed by complete Simplified Chinese.
@@ -1286,6 +1288,8 @@ helm upgrade --install rustium deploy/helm/rustium \
 挂载配置应使用 `server.bind: 0.0.0.0:8080` 和 `state.path: /var/lib/rustium/rustium.db`。数据库、Kafka 和 Schema Registry 凭据应通过 Kubernetes Secret 环境变量插入，不要提交到 values 文件。完整英中部署契约见 [deploy/helm/rustium/README.md](deploy/helm/rustium/README.md)。
 
 Tagged release 会运行 [.github/workflows/release.yml](.github/workflows/release.yml)。Workflow 会检查 tag、Cargo workspace 和 Chart 版本一致，重复 locked Rust 门禁，向 GHCR 发布带签名、SBOM/provenance 的多架构（`linux/amd64`、`linux/arm64`）镜像，以 OCI artifact 推送 Helm Chart，并创建带 image digest 与 SHA-256 checksum 文件的 GitHub Release。crates.io 发布仍是单独的人工审查、有序操作，因为内部 crate 必须从叶子 crate 逐步发布到 CLI。
+
+crates.io 发布只能通过手动 [.github/workflows/publish-crates.yml](.github/workflows/publish-crates.yml) workflow 执行。触发时必须输入 `publish`，并配置已轮换的 `CARGO_REGISTRY_TOKEN` repository Secret；workflow 会先验证完整 workspace，再按 core、foundation、connector、CLI 依赖顺序发布。普通 push 或 tag 不会触发该 workflow。
 
 ### 文档与贡献策略
 
