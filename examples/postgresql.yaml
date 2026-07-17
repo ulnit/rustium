@@ -56,6 +56,19 @@ source:
   logical_decoding_messages: false
   # message_prefix_include_list: [orders\..*, audit]
   # message_prefix_exclude_list: [internal\..*]
+  # Debezium-compatible column transformations apply to snapshot and WAL values.
+  # column_transformations:
+  #   - kind: truncate
+  #     length: 3
+  #     columns: ['public\.orders\.customer_name']
+  #   - kind: mask
+  #     length: 5
+  #     columns: ['public\.customers\.email']
+  #   - kind: hash
+  #     algorithm: sha256
+  #     salt: ${COLUMN_HASH_SALT}
+  #     version: v2
+  #     columns: ['public\.customers\.tax_id']
 
 snapshot:
   mode: initial

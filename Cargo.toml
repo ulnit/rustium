@@ -39,6 +39,8 @@ hex = "0.4.3"
 humantime-serde = "1.1.1"
 indexmap = { version = "2.10.0", features = ["serde"] }
 jks = { version = "0.3.3", default-features = false, features = ["rand"] }
+md-5 = "0.10.6"
+md2 = "0.10.2"
 mysql_async = { version = "0.37.0", default-features = false, features = ["binlog", "chrono", "default-rustls"] }
 mockito = "1.7.0"
 p12-keystore = "0.3.1"
@@ -67,7 +69,9 @@ schema_registry_converter = { version = "4.10.0", default-features = false, feat
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 serde_yaml = "0.9.34"
+sha1 = "0.10.6"
 sha2 = "0.10.9"
+sha3 = "0.10.8"
 sqlparser = "0.62.0"
 tempfile = "3.20.0"
 thiserror = "2.0.12"

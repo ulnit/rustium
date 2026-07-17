@@ -299,6 +299,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
             message_prefix_exclude_list: csv_property(
                 properties.get("message.prefix.exclude.list"),
             ),
+            column_transformations: postgres_column_transformations(&properties)?,
         })),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -1409,6 +1410,96 @@ fn postgres_replica_identity_rules(
     )
 }
 
+fn postgres_column_transformations(
+    properties: &BTreeMap<String, String>,
+) -> Result<Vec<ColumnTransformRule>> {
+    let mut rules = Vec::new();
+    for (name, value) in properties {
+        if let Some(length) = dynamic_length(name, "column.truncate.to.", ".chars")? {
+            rules.push(ColumnTransformRule::Truncate {
+                length,
+                columns: split_csv(value),
+            });
+        }
+    }
+    for (name, value) in properties {
+        if let Some(length) = dynamic_length(name, "column.mask.with.", ".chars")? {
+            rules.push(ColumnTransformRule::Mask {
+                length,
+                columns: split_csv(value),
+            });
+        }
+    }
+    for version in [ColumnHashVersion::V1, ColumnHashVersion::V2] {
+        let prefix = match version {
+            ColumnHashVersion::V1 => "column.mask.hash.",
+            ColumnHashVersion::V2 => "column.mask.hash.v2.",
+        };
+        for (name, value) in properties {
+            let Some((algorithm, salt)) = dynamic_hash(name, prefix) else {
+                continue;
+            };
+            rules.push(ColumnTransformRule::Hash {
+                algorithm: column_hash_algorithm(algorithm)?,
+                salt: salt.to_string(),
+                version,
+                columns: split_csv(value),
+            });
+        }
+    }
+    Ok(rules)
+}
+
+fn dynamic_length(name: &str, prefix: &str, suffix: &str) -> Result<Option<u32>> {
+    let Some(value) = name
+        .strip_prefix(prefix)
+        .and_then(|value| value.strip_suffix(suffix))
+    else {
+        return Ok(None);
+    };
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
+    }
+    value.parse::<u32>().map(Some).map_err(|error| {
+        Error::Configuration(format!(
+            "Debezium column transformation length in {name:?} is invalid: {error}"
+        ))
+    })
+}
+
+fn dynamic_hash<'a>(name: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
+    let value = name.strip_prefix(prefix)?;
+    let (algorithm, salt) = value.split_once(".with.salt.")?;
+    (!algorithm.is_empty() && !algorithm.contains('.') && !salt.is_empty())
+        .then_some((algorithm, salt))
+}
+
+fn column_hash_algorithm(algorithm: &str) -> Result<ColumnHashAlgorithm> {
+    let normalized = algorithm
+        .chars()
+        .filter(|character| !matches!(character, '-' | '_' | '/'))
+        .flat_map(char::to_uppercase)
+        .collect::<String>();
+    match normalized.as_str() {
+        "MD2" => Ok(ColumnHashAlgorithm::Md2),
+        "MD5" => Ok(ColumnHashAlgorithm::Md5),
+        "SHA" | "SHA1" => Ok(ColumnHashAlgorithm::Sha1),
+        "SHA224" => Ok(ColumnHashAlgorithm::Sha224),
+        "SHA256" => Ok(ColumnHashAlgorithm::Sha256),
+        "SHA384" => Ok(ColumnHashAlgorithm::Sha384),
+        "SHA512" => Ok(ColumnHashAlgorithm::Sha512),
+        "SHA512224" => Ok(ColumnHashAlgorithm::Sha512_224),
+        "SHA512256" => Ok(ColumnHashAlgorithm::Sha512_256),
+        "SHA3224" => Ok(ColumnHashAlgorithm::Sha3_224),
+        "SHA3256" => Ok(ColumnHashAlgorithm::Sha3_256),
+        "SHA3384" => Ok(ColumnHashAlgorithm::Sha3_384),
+        "SHA3512" => Ok(ColumnHashAlgorithm::Sha3_512),
+        _ => Err(Error::Configuration(format!(
+            "unsupported JCA column masking hash algorithm {algorithm:?}; expected MD2, MD5, SHA-1, SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224, SHA-512/256, or SHA3-224/256/384/512"
+        ))),
+    }
+}
+
 fn csv_property(value: Option<&String>) -> Vec<String> {
     value.map_or_else(Vec::new, |value| split_csv(value))
 }
@@ -1596,9 +1687,17 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
             !SUPPORTED.contains(&key.as_str())
                 && !key.starts_with("rustium.kafka.property.")
                 && !key.starts_with("signal.consumer.")
+                && !is_column_transformation_property(key)
         })
         .map(|key| format!("Debezium property {key} is not implemented and was ignored"))
         .collect()
+}
+
+fn is_column_transformation_property(name: &str) -> bool {
+    dynamic_length(name, "column.truncate.to.", ".chars").is_ok_and(|length| length.is_some())
+        || dynamic_length(name, "column.mask.with.", ".chars").is_ok_and(|length| length.is_some())
+        || dynamic_hash(name, "column.mask.hash.").is_some()
+        || dynamic_hash(name, "column.mask.hash.v2.").is_some()
 }
 
 #[cfg(test)]
@@ -3203,6 +3302,112 @@ value.converter.schema.registry.url=http://registry:8081
             no_registration
                 .to_string()
                 .contains("auto.register.schemas=false")
+        );
+    }
+
+    #[test]
+    fn maps_postgres_column_transformations_with_debezium_priority() {
+        let config = parse(
+            r#"
+name=postgres-columns
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+column.mask.hash.v2.SHA3-256.with.salt.v2.salt=public\\.customers\\.v2_secret
+column.mask.hash.SHA-256.with.salt.private.salt=public\\.customers\\.legacy_secret
+column.mask.with.5.chars=public\\.customers\\.masked
+column.truncate.to.3.chars=public\\.customers\\.summary
+"#,
+        )
+        .unwrap();
+        let source = config.source.as_postgresql().unwrap();
+        assert_eq!(source.column_transformations.len(), 4);
+        assert!(matches!(
+            &source.column_transformations[0],
+            ColumnTransformRule::Truncate { length: 3, columns }
+                if columns == &[r"public\.customers\.summary"]
+        ));
+        assert!(matches!(
+            &source.column_transformations[1],
+            ColumnTransformRule::Mask { length: 5, columns }
+                if columns == &[r"public\.customers\.masked"]
+        ));
+        assert!(matches!(
+            &source.column_transformations[2],
+            ColumnTransformRule::Hash {
+                algorithm: ColumnHashAlgorithm::Sha256,
+                salt,
+                version: ColumnHashVersion::V1,
+                ..
+            } if salt == "private.salt"
+        ));
+        assert!(matches!(
+            &source.column_transformations[3],
+            ColumnTransformRule::Hash {
+                algorithm: ColumnHashAlgorithm::Sha3_256,
+                salt,
+                version: ColumnHashVersion::V2,
+                ..
+            } if salt == "v2.salt"
+        ));
+        assert!(config.compatibility_warnings.iter().all(|warning| {
+            !warning.contains("column.mask") && !warning.contains("column.truncate")
+        }));
+    }
+
+    #[test]
+    fn fingerprints_postgres_column_rules_without_exposing_salts() {
+        let raw = |salt: &str| {
+            format!(
+                r#"
+name=postgres-columns
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+column.mask.hash.v2.SHA-256.with.salt.{salt}=public\.customers\.secret
+"#
+            )
+        };
+        let first = parse(&raw("private-salt-one")).unwrap();
+        let second = parse(&raw("private-salt-two")).unwrap();
+        assert_ne!(first.fingerprint(), second.fingerprint());
+        let semantic = first.source.semantic_config().to_string();
+        assert!(!semantic.contains("private-salt-one"));
+        assert!(semantic.contains(&hex_digest(b"private-salt-one")));
+    }
+
+    #[test]
+    fn rejects_invalid_postgres_column_transformation_properties() {
+        let base = r#"
+name=postgres-columns
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+"#;
+        let invalid_algorithm = format!(
+            "{base}column.mask.hash.NOT-A-DIGEST.with.salt.salt=public\\.customers\\.secret\n"
+        );
+        assert!(
+            parse(&invalid_algorithm)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported JCA")
+        );
+        let invalid_selector = format!("{base}column.truncate.to.3.chars=public\\.customers\\.[\n");
+        assert!(
+            parse(&invalid_selector)
+                .unwrap_err()
+                .to_string()
+                .contains("selector")
         );
     }
 }

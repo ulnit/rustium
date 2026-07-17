@@ -363,6 +363,17 @@ impl SourceConfig {
                             }),
                         );
                 }
+                if !config.column_transformations.is_empty() {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "column_transformations".into(),
+                            serde_json::Value::Array(column_transformation_semantics(
+                                &config.column_transformations,
+                            )),
+                        );
+                }
                 semantic
             }
             Self::Mysql(config) => {
@@ -577,6 +588,8 @@ pub struct PostgresSourceConfig {
     pub message_prefix_include_list: Vec<String>,
     #[serde(default)]
     pub message_prefix_exclude_list: Vec<String>,
+    #[serde(default)]
+    pub column_transformations: Vec<ColumnTransformRule>,
 }
 
 impl PostgresSourceConfig {
@@ -759,6 +772,9 @@ impl PostgresSourceConfig {
                     "PostgreSQL logical decoding message prefix selector {pattern:?} is not a valid regular expression"
                 )));
             }
+        }
+        for rule in &self.column_transformations {
+            rule.validate()?;
         }
         if self.signal_poll_interval.is_zero() {
             return Err(Error::Configuration(
@@ -1445,6 +1461,112 @@ pub enum PostgresSchemaRefreshMode {
     ColumnsDiffExcludeUnchangedToast,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ColumnTransformRule {
+    Truncate {
+        length: u32,
+        columns: Vec<String>,
+    },
+    Mask {
+        length: u32,
+        columns: Vec<String>,
+    },
+    Hash {
+        algorithm: ColumnHashAlgorithm,
+        salt: String,
+        #[serde(default)]
+        version: ColumnHashVersion,
+        columns: Vec<String>,
+    },
+}
+
+impl ColumnTransformRule {
+    #[must_use]
+    pub const fn priority(&self) -> u8 {
+        match self {
+            Self::Truncate { .. } => 0,
+            Self::Mask { .. } => 1,
+            Self::Hash {
+                version: ColumnHashVersion::V1,
+                ..
+            } => 2,
+            Self::Hash {
+                version: ColumnHashVersion::V2,
+                ..
+            } => 3,
+        }
+    }
+
+    #[must_use]
+    pub fn columns(&self) -> &[String] {
+        match self {
+            Self::Truncate { columns, .. }
+            | Self::Mask { columns, .. }
+            | Self::Hash { columns, .. } => columns,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        let length = match self {
+            Self::Truncate { length, .. } | Self::Mask { length, .. } => Some(*length),
+            Self::Hash { salt, .. } => {
+                if salt.is_empty() {
+                    return Err(Error::Configuration(
+                        "source.column_transformations hash salt must not be empty".into(),
+                    ));
+                }
+                None
+            }
+        };
+        if length.is_some_and(|length| length > i32::MAX as u32) {
+            return Err(Error::Configuration(format!(
+                "source.column_transformations length must not exceed {}",
+                i32::MAX
+            )));
+        }
+        if self.columns().is_empty() {
+            return Err(Error::Configuration(
+                "source.column_transformations columns must not be empty".into(),
+            ));
+        }
+        for selector in self.columns() {
+            if selector.trim().is_empty() || Regex::new(&format!("^(?:{selector})$")).is_err() {
+                return Err(Error::Configuration(format!(
+                    "column transformation selector {selector:?} is not a valid regular expression"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnHashAlgorithm {
+    Md2,
+    Md5,
+    Sha1,
+    Sha224,
+    Sha256,
+    Sha384,
+    Sha512,
+    Sha512_224,
+    Sha512_256,
+    Sha3_224,
+    Sha3_256,
+    Sha3_384,
+    Sha3_512,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnHashVersion {
+    #[default]
+    V1,
+    V2,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PostgresSnapshotLockingMode {
@@ -2078,6 +2200,38 @@ fn add_heartbeat_semantics(
                 "topic_name": topic_name,
             }),
         );
+}
+
+fn column_transformation_semantics(rules: &[ColumnTransformRule]) -> Vec<serde_json::Value> {
+    let mut ordered = rules.iter().enumerate().collect::<Vec<_>>();
+    ordered.sort_by_key(|(index, rule)| (rule.priority(), *index));
+    ordered
+        .into_iter()
+        .map(|(_, rule)| match rule {
+            ColumnTransformRule::Truncate { length, columns } => serde_json::json!({
+                "kind": "truncate",
+                "length": length,
+                "columns": columns,
+            }),
+            ColumnTransformRule::Mask { length, columns } => serde_json::json!({
+                "kind": "mask",
+                "length": length,
+                "columns": columns,
+            }),
+            ColumnTransformRule::Hash {
+                algorithm,
+                salt,
+                version,
+                columns,
+            } => serde_json::json!({
+                "kind": "hash",
+                "algorithm": algorithm,
+                "salt_sha256": hex_digest(salt.as_bytes()),
+                "version": version,
+                "columns": columns,
+            }),
+        })
+        .collect()
 }
 
 fn hex_digest(input: &[u8]) -> String {
@@ -2771,6 +2925,32 @@ sink:
         ))
         .unwrap_err();
         assert!(invalid.to_string().contains("dirty_read"));
+    }
+
+    #[test]
+    fn parses_native_postgresql_column_transformations_into_fingerprint() {
+        let baseline = Config::from_yaml(CONFIG).unwrap();
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  column_transformations:\n    - kind: truncate\n      length: 3\n      columns: ['public\\.orders\\.customer_name']\n    - kind: hash\n      algorithm: sha256\n      salt: private-salt\n      version: v2\n      columns: ['public\\.orders\\.email']\n",
+        ))
+        .unwrap();
+        let source = configured.source.as_postgresql().unwrap();
+        assert_eq!(source.column_transformations.len(), 2);
+        assert!(matches!(
+            &source.column_transformations[0],
+            ColumnTransformRule::Truncate { length: 3, .. }
+        ));
+        assert_ne!(baseline.fingerprint(), configured.fingerprint());
+        let semantic = configured.source.semantic_config().to_string();
+        assert!(!semantic.contains("private-salt"));
+
+        let invalid = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  column_transformations:\n    - kind: hash\n      algorithm: sha256\n      salt: ''\n      columns: ['public.orders.email']\n",
+        ))
+        .unwrap_err();
+        assert!(invalid.to_string().contains("salt"));
     }
 
     #[test]

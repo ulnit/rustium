@@ -15,10 +15,11 @@ use rdkafka::{
     util::Timeout,
 };
 use rustium_config::{
-    PostgresLsnFlushMode, PostgresLsnFlushTimeoutAction, PostgresOffsetMismatchStrategy,
-    PostgresReplicaIdentity, PostgresReplicaIdentityRule, PostgresSchemaRefreshMode,
-    PostgresSnapshotIsolationMode, PostgresSnapshotLockingMode, PostgresSourceConfig,
-    PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode, TableSelection,
+    ColumnHashAlgorithm, ColumnHashVersion, ColumnTransformRule, PostgresLsnFlushMode,
+    PostgresLsnFlushTimeoutAction, PostgresOffsetMismatchStrategy, PostgresReplicaIdentity,
+    PostgresReplicaIdentityRule, PostgresSchemaRefreshMode, PostgresSnapshotIsolationMode,
+    PostgresSnapshotLockingMode, PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership,
+    SnapshotConfig, SnapshotMode, TableSelection,
 };
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
@@ -130,6 +131,7 @@ impl TestSettings {
             logical_decoding_messages: false,
             message_prefix_include_list: Vec::new(),
             message_prefix_exclude_list: Vec::new(),
+            column_transformations: Vec::new(),
         }
     }
 }
@@ -2123,6 +2125,207 @@ async fn keeps_snapshot_and_streaming_type_conversion_identical() -> TestResult 
             return Err(cleanup_error);
         }
         eprintln!("PostgreSQL type test cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn applies_debezium_column_transformations_across_snapshot_and_wal() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_columns_{}", &suffix[..12]);
+    let publication = format!("rustium_columns_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_columns_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-columns-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (\
+                    id BIGINT PRIMARY KEY,\
+                    summary TEXT NOT NULL,\
+                    masked TEXT,\
+                    legacy VARCHAR(20),\
+                    modern TEXT,\
+                    bounded VARCHAR(20),\
+                    untouched INTEGER NOT NULL\
+                ); \
+                 INSERT INTO public.{table_name} \
+                    (id, summary, masked, legacy, modern, bounded, untouched) \
+                    VALUES (1, 'abcdef', NULL, 'test', \
+                            '12345678901234567890', '12345678901234567890', 42); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        let qualified = |column: &str| format!(r"public\.{table_name}\.{column}");
+        config.column_transformations = vec![
+            ColumnTransformRule::Hash {
+                algorithm: ColumnHashAlgorithm::Sha256,
+                salt: "unused-priority-salt".into(),
+                version: ColumnHashVersion::V2,
+                columns: vec![qualified("summary")],
+            },
+            ColumnTransformRule::Truncate {
+                length: 3,
+                columns: vec![qualified("summary")],
+            },
+            ColumnTransformRule::Mask {
+                length: 5,
+                columns: vec![qualified("masked")],
+            },
+            ColumnTransformRule::Hash {
+                algorithm: ColumnHashAlgorithm::Sha256,
+                salt: "CzQMA0cB5K".into(),
+                version: ColumnHashVersion::V1,
+                columns: vec![qualified("legacy")],
+            },
+            ColumnTransformRule::Hash {
+                algorithm: ColumnHashAlgorithm::Sha256,
+                salt: "salt123".into(),
+                version: ColumnHashVersion::V2,
+                columns: vec![qualified("modern"), qualified("bounded")],
+            },
+        ];
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let capture_result: TestResult = async {
+            let snapshot = loop {
+                let record = receive_with_context(
+                    &mut output,
+                    "waiting for PostgreSQL column transformation snapshot",
+                )
+                .await?;
+                if record.boundary == RecordBoundary::SnapshotComplete {
+                    continue;
+                }
+                let event = record
+                    .event
+                    .ok_or_else(|| test_error("column transformation snapshot has no event"))?;
+                break event.after.ok_or_else(|| {
+                    test_error("column transformation snapshot has no after row")
+                })?;
+            };
+            loop {
+                if receive_with_context(
+                    &mut output,
+                    "waiting for PostgreSQL column transformation snapshot completion",
+                )
+                .await?
+                .boundary
+                    == RecordBoundary::SnapshotComplete
+                {
+                    break;
+                }
+            }
+            require(
+                snapshot.get("summary") == Some(&DataValue::String("abc".into())),
+                "column.truncate.to.3.chars was not applied to the snapshot",
+            )?;
+            require(
+                snapshot.get("masked") == Some(&DataValue::String("*****".into())),
+                "column.mask.with.5.chars did not replace a snapshot NULL",
+            )?;
+            require(
+                snapshot.get("legacy") == Some(&DataValue::String("8e68c68edbbac316dfe2".into())),
+                "V1 hash did not match Debezium's PostgreSQL snapshot fixture",
+            )?;
+            require(
+                snapshot.get("modern")
+                    == Some(&DataValue::String(
+                        "b65875d34a3dedf070f3a012970bf3b5da424560d7be3d2c23b986b525d2d7f3".into(),
+                    )),
+                "V2 hash did not match Debezium's PostgreSQL snapshot fixture",
+            )?;
+            require(
+                snapshot.get("bounded") == Some(&DataValue::String("b65875d34a3dedf070f3".into())),
+                "bounded PostgreSQL hash was not shortened to the declared column length",
+            )?;
+            require(
+                snapshot.get("untouched") == Some(&DataValue::Int32(42)),
+                "column transformation changed a non-character column",
+            )?;
+
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO public.{table_name} \
+                         (id, summary, masked, legacy, modern, bounded, untouched) \
+                         VALUES (2, 'uvwxyz', 'visible', 'hello', \
+                                 'hello', 'hello', 84)"
+                    ),
+                    &[],
+                )
+                .await?;
+            let streaming = loop {
+                let record = receive_with_context(
+                    &mut output,
+                    "waiting for PostgreSQL column transformation WAL",
+                )
+                .await?;
+                let Some(event) = record.event else {
+                    continue;
+                };
+                if event.operation == Operation::Create {
+                    break event
+                        .after
+                        .ok_or_else(|| test_error("column transformation WAL has no after row"))?;
+                }
+            };
+            require(
+                streaming.get("summary") == Some(&DataValue::String("uvw".into())),
+                "column transformation priority did not prefer truncate over hash",
+            )?;
+            require(
+                streaming.get("masked") == Some(&DataValue::String("*****".into())),
+                "fixed mask was not applied to a WAL value",
+            )?;
+            require(
+                streaming.get("legacy") == Some(&DataValue::String("b4d39ab0d198fb4cac8b".into())),
+                "V1 hash did not match Debezium's WAL fixture",
+            )?;
+            require(
+                streaming.get("modern")
+                    == Some(&DataValue::String(
+                        "7f14a764313a07245bf188b0812604f0a033577ad9798d82f6863d8dbec54542".into(),
+                    )),
+                "V2 hash did not match the WAL value",
+            )?;
+            require(
+                streaming.get("bounded") == Some(&DataValue::String("7f14a764313a07245bf1".into())),
+                "bounded WAL hash was not shortened to 20 characters",
+            )?;
+            require(
+                streaming.get("untouched") == Some(&DataValue::Int32(84)),
+                "column transformation changed a WAL non-character column",
+            )?;
+            Ok(())
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)
+    }
+    .await;
+
+    let cleanup_result = cleanup(&client, &publication, &slot_name, &[&table_name]).await;
+    connection_task.abort();
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL column transformation cleanup also failed: {cleanup_error}");
     }
     outcome
 }

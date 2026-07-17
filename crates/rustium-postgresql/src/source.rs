@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::{
+    column_transform::ColumnTransformer,
     file_signal,
     incremental_snapshot::{ClosedWindow, IncrementalSnapshotController, Signal},
     schema_history::{
@@ -84,6 +85,7 @@ pub struct PostgresSource {
     snapshot: SnapshotConfig,
     schemas: HashMap<(String, String), TableSchema>,
     retry_policy: RetryPolicy,
+    column_transformer: Option<ColumnTransformer>,
 }
 
 impl PostgresSource {
@@ -99,6 +101,7 @@ impl PostgresSource {
             snapshot,
             schemas: HashMap::new(),
             retry_policy: RetryPolicy::default(),
+            column_transformer: None,
         }
     }
 
@@ -109,6 +112,8 @@ impl PostgresSource {
     }
 
     async fn validate_source(&mut self) -> Result<()> {
+        self.column_transformer =
+            Some(ColumnTransformer::new(&self.config.column_transformations)?);
         let config = self.config.clone();
         let schemas = tokio::task::spawn_blocking(move || {
             let mut connection = connect_regular(&config)?;
@@ -288,6 +293,9 @@ impl PostgresSource {
         snapshot_name: Option<String>,
         output: mpsc::Sender<Result<SourceRecord>>,
     ) -> Result<SnapshotOutcome> {
+        let column_transformer = self.column_transformer.clone().ok_or_else(|| {
+            Error::Invariant("PostgreSQL source was run before validation".into())
+        })?;
         let config = self.config.clone();
         let connector_name = self.connector_name.clone();
         let snapshot_config = self.snapshot.clone();
@@ -334,6 +342,7 @@ impl PostgresSource {
                     fetch_size,
                     &mut ordinal,
                     &output,
+                    &column_transformer,
                 )?;
             }
 
@@ -593,6 +602,11 @@ impl SourceConnector for PostgresSource {
     }
 
     async fn run(&mut self, mut context: SourceContext) -> Result<()> {
+        let column_transformer = self.column_transformer.clone().map_or_else(
+            || ColumnTransformer::new(&self.config.column_transformations),
+            Ok,
+        )?;
+        self.column_transformer = Some(column_transformer.clone());
         let checkpoint = context.initial_checkpoint.clone();
         let validated_schemas = self.schemas.clone();
         let mut resume_slot_resolution = None;
@@ -1059,6 +1073,7 @@ impl SourceConnector for PostgresSource {
                                             &self.connector_name,
                                             &self.config,
                                             closed,
+                                            &column_transformer,
                                         )
                                         .await?;
                                     }
@@ -1084,6 +1099,7 @@ impl SourceConnector for PostgresSource {
                                 &self.connector_name,
                                 &self.config,
                                 closed,
+                                &column_transformer,
                             )
                             .await?;
                         }
@@ -1115,6 +1131,7 @@ impl SourceConnector for PostgresSource {
                                 &self.connector_name,
                                 &self.config,
                                 closed,
+                                &column_transformer,
                             )
                             .await?;
                         }
@@ -1132,6 +1149,13 @@ impl SourceConnector for PostgresSource {
                     )? {
                         if let Some(event) = &record.event {
                             incremental.deduplicate(event);
+                        }
+                        if let Some(event) = &mut record.event {
+                            transform_emitted_event(
+                                &column_transformer,
+                                &state.schemas,
+                                event,
+                            )?;
                         }
                         let incremental_dirty = incremental.take_state_dirty();
                         if state.schema_dirty || incremental_dirty {
@@ -1268,13 +1292,35 @@ async fn send_incremental_window(
     connector_name: &str,
     config: &PostgresSourceConfig,
     closed: ClosedWindow,
+    column_transformer: &ColumnTransformer,
 ) -> Result<()> {
-    for record in state.incremental_snapshot_records(lsn, connector_name, config, closed) {
+    for record in
+        state.incremental_snapshot_records(lsn, connector_name, config, closed, column_transformer)
+    {
         output
             .send(Ok(record))
             .await
             .map_err(|_| Error::Cancelled)?;
     }
+    Ok(())
+}
+
+fn transform_emitted_event(
+    transformer: &ColumnTransformer,
+    schemas: &HashMap<(String, String), TableSchema>,
+    event: &mut ChangeEvent,
+) -> Result<()> {
+    let (Some(schema), Some(table)) = (&event.source.schema, &event.source.table) else {
+        return Ok(());
+    };
+    let table_schema = schemas
+        .get(&(schema.clone(), table.clone()))
+        .ok_or_else(|| {
+            Error::Invariant(format!(
+                "PostgreSQL emitted event has no schema for {schema}.{table}"
+            ))
+        })?;
+    transformer.transform_event(event, table_schema);
     Ok(())
 }
 
@@ -2011,6 +2057,7 @@ impl StreamingState {
         connector_name: &str,
         config: &PostgresSourceConfig,
         closed: ClosedWindow,
+        column_transformer: &ColumnTransformer,
     ) -> Vec<SourceRecord> {
         closed
             .rows
@@ -2036,7 +2083,7 @@ impl StreamingState {
                 source
                     .attributes
                     .insert("rustium.snapshot.kind".into(), "incremental".into());
-                let event = ChangeEvent {
+                let mut event = ChangeEvent {
                     id: EventId::deterministic(
                         connector_name,
                         &config.database,
@@ -2057,6 +2104,7 @@ impl StreamingState {
                     source_time: None,
                     observed_time: Utc::now(),
                 };
+                column_transformer.transform_event(&mut event, &closed.schema);
                 SourceRecord::data(event)
             })
             .collect()
@@ -2429,6 +2477,7 @@ fn snapshot_table(
     fetch_size: usize,
     ordinal: &mut u64,
     output: &mpsc::Sender<Result<SourceRecord>>,
+    column_transformer: &ColumnTransformer,
 ) -> Result<()> {
     let qualified = format!(
         "{}.{}",
@@ -2498,7 +2547,10 @@ fn snapshot_table(
                         .map_or(DataValue::Null, |value| {
                             convert_snapshot_value(&value, field, schema, config)
                         });
-                    Ok((field.name.clone(), value))
+                    Ok((
+                        field.name.clone(),
+                        column_transformer.transform_value(schema, &field.name, value),
+                    ))
                 })
                 .collect::<Result<Row>>()?;
             let event = ChangeEvent {
@@ -5004,6 +5056,7 @@ sink:
             logical_decoding_messages: false,
             message_prefix_include_list: Vec::new(),
             message_prefix_exclude_list: Vec::new(),
+            column_transformations: Vec::new(),
         };
         let mut source = PostgresSource::new(
             "inventory-postgresql",
