@@ -318,6 +318,12 @@ impl SourceConfig {
                             config.interval_handling_mode.clone().into(),
                         );
                 }
+                if config.include_unknown_datatypes {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert("include_unknown_datatypes".into(), true.into());
+                }
                 if config.captures_logical_decoding_messages() {
                     semantic
                         .as_object_mut()
@@ -515,6 +521,8 @@ pub struct PostgresSourceConfig {
     pub hstore_handling_mode: String,
     #[serde(default = "default_postgres_interval_handling_mode")]
     pub interval_handling_mode: String,
+    #[serde(default)]
+    pub include_unknown_datatypes: bool,
     #[serde(default)]
     pub logical_decoding_messages: bool,
     #[serde(default)]
@@ -2166,6 +2174,7 @@ sink:
         assert!(postgres.slot_stream_params.is_empty());
         assert!(postgres.database_initial_statements.is_empty());
         assert!(postgres.ssl_root_cert.is_none());
+        assert!(!postgres.include_unknown_datatypes);
         let connection_url = Url::parse(&postgres.connection_url(true).unwrap()).unwrap();
         assert!(
             connection_url
@@ -2239,6 +2248,10 @@ sink:
         assert!(
             config.source.semantic_config()["interval_handling_mode"].is_null(),
             "the native PostgreSQL interval mode must preserve the old fingerprint shape"
+        );
+        assert!(
+            config.source.semantic_config()["include_unknown_datatypes"].is_null(),
+            "omitting unknown PostgreSQL datatypes must preserve the old fingerprint shape"
         );
         assert!(
             config.source.semantic_config()["logical_decoding_messages"].is_null(),
@@ -2557,6 +2570,30 @@ sink:
         ))
         .unwrap_err();
         assert!(invalid.to_string().contains("postgres, numeric, or string"));
+    }
+
+    #[test]
+    fn parses_native_postgresql_unknown_datatype_mode() {
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  include_unknown_datatypes: true\n",
+        ))
+        .unwrap();
+        assert!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .include_unknown_datatypes
+        );
+        assert_eq!(
+            configured.source.semantic_config()["include_unknown_datatypes"],
+            true
+        );
+        assert_ne!(
+            Config::from_yaml(CONFIG).unwrap().fingerprint(),
+            configured.fingerprint()
+        );
     }
 
     #[test]

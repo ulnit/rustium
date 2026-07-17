@@ -5,7 +5,7 @@ use rustium_core::{ConnectorStateEnvelope, Error, EventSchema, FieldSchema, Resu
 use serde::{Deserialize, Serialize};
 
 pub(crate) const POSTGRES_SCHEMA_HISTORY_FORMAT: &str = "rustium.postgresql.schema-history";
-const POSTGRES_SCHEMA_HISTORY_VERSION: u32 = 5;
+const POSTGRES_SCHEMA_HISTORY_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PostgresColumnType {
@@ -20,6 +20,8 @@ pub(crate) struct TableSchema {
     pub(crate) table: String,
     pub(crate) event_schema: EventSchema,
     pub(crate) column_types: Vec<PostgresColumnType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) opaque_columns: Vec<String>,
 }
 
 impl TableSchema {
@@ -125,38 +127,62 @@ pub(crate) fn decode_connector_state(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn schema_from_relation(
     namespace: &str,
     relation_name: &str,
     schema_name: String,
     columns: &[RelationColumn],
-    resolved_type_names: &[String],
+    resolved_types: &[(String, bool)],
+    include_unknown_datatypes: bool,
     previous: Option<&TableSchema>,
     catalog: Option<&TableSchema>,
 ) -> Result<TableSchema> {
-    if columns.len() != resolved_type_names.len() {
+    if columns.len() != resolved_types.len() {
         return Err(Error::Invariant(format!(
             "PostgreSQL relation has {} columns but {} resolved type names",
             columns.len(),
-            resolved_type_names.len()
+            resolved_types.len()
         )));
     }
 
     let mut fields = Vec::with_capacity(columns.len());
     let mut column_types = Vec::with_capacity(columns.len());
-    for (column, resolved_type_name) in columns.iter().zip(resolved_type_names) {
-        let previous_field = matching_field(previous, column);
+    let mut opaque_columns = Vec::new();
+    for (column, (resolved_type_name, supported)) in columns.iter().zip(resolved_types) {
         let catalog_field = matching_field(catalog, column);
+        let previous_field = matching_field(previous, column);
         let metadata = catalog_field.or(previous_field);
-        fields.push(FieldSchema {
-            name: column.name.to_string(),
-            type_name: metadata.map_or_else(
-                || resolved_type_name.clone(),
-                |field| field.type_name.clone(),
-            ),
-            optional: metadata.is_none_or(|field| field.optional),
-            primary_key: column.is_key,
-        });
+        if *supported {
+            fields.push(FieldSchema {
+                name: column.name.to_string(),
+                type_name: catalog_field
+                    .or_else(|| {
+                        previous_field.filter(|_| {
+                            previous.is_none_or(|schema| {
+                                !schema
+                                    .opaque_columns
+                                    .iter()
+                                    .any(|name| name == column.name.as_ref())
+                            })
+                        })
+                    })
+                    .map_or_else(
+                        || resolved_type_name.clone(),
+                        |field| field.type_name.clone(),
+                    ),
+                optional: metadata.is_none_or(|field| field.optional),
+                primary_key: column.is_key,
+            });
+        } else if include_unknown_datatypes {
+            fields.push(FieldSchema {
+                name: column.name.to_string(),
+                type_name: "bytea".into(),
+                optional: metadata.is_none_or(|field| field.optional),
+                primary_key: column.is_key,
+            });
+            opaque_columns.push(column.name.to_string());
+        }
         column_types.push(PostgresColumnType {
             name: column.name.to_string(),
             type_oid: column.type_id,
@@ -173,6 +199,7 @@ pub(crate) fn schema_from_relation(
             fields,
         },
         column_types,
+        opaque_columns,
     })
 }
 
@@ -233,6 +260,7 @@ mod tests {
                     type_modifier: -1,
                 },
             ],
+            opaque_columns: Vec::new(),
         }
     }
 
@@ -243,7 +271,7 @@ mod tests {
         let envelope = encode_schema_history(&schemas).unwrap();
 
         assert_eq!(envelope.format, POSTGRES_SCHEMA_HISTORY_FORMAT);
-        assert_eq!(envelope.version, 5);
+        assert_eq!(envelope.version, 6);
         assert!(envelope.payload.get("incremental_snapshot").is_none());
         assert_eq!(decode_schema_history(&envelope).unwrap(), schemas);
     }
@@ -265,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_version_five_incremental_snapshot_progress() {
+    fn round_trips_version_six_incremental_snapshot_progress() {
         let table = baseline();
         let schemas = HashMap::from([(table.key(), table)]);
         let progress = IncrementalSnapshotProgress {
@@ -287,7 +315,7 @@ mod tests {
             encode_connector_state(&schemas, Some(&progress), &["snapshot-0".into()]).unwrap();
         let decoded = decode_connector_state(&envelope).unwrap();
 
-        assert_eq!(envelope.version, 5);
+        assert_eq!(envelope.version, 6);
         assert_eq!(decoded.schemas, schemas);
         assert_eq!(decoded.incremental_snapshot, Some(progress));
         assert_eq!(decoded.completed_signal_ids, ["snapshot-0"]);
@@ -367,7 +395,8 @@ mod tests {
             "orders",
             previous.event_schema.name.clone(),
             &columns,
-            &["bigint".into(), "text".into()],
+            &[("bigint".into(), true), ("text".into(), true)],
+            false,
             Some(&previous),
             Some(&catalog),
         )
@@ -383,5 +412,82 @@ mod tests {
             ["id", "status"]
         );
         assert!(!evolved.event_schema.fields[1].optional);
+    }
+
+    #[test]
+    fn omits_or_captures_unknown_relation_columns() {
+        let columns = vec![
+            RelationColumn {
+                name: Arc::from("id"),
+                type_id: 20,
+                type_modifier: -1,
+                is_key: true,
+            },
+            RelationColumn {
+                name: Arc::from("payload"),
+                type_id: 1_640_123,
+                type_modifier: -1,
+                is_key: false,
+            },
+        ];
+        let resolved = [("bigint".into(), true), ("public.payload".into(), false)];
+
+        let omitted = schema_from_relation(
+            "public",
+            "events",
+            "test.public.events.Envelope".into(),
+            &columns,
+            &resolved,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(omitted.event_schema.fields.len(), 1);
+        assert!(omitted.opaque_columns.is_empty());
+        assert_eq!(omitted.column_types.len(), 2);
+
+        let captured = schema_from_relation(
+            "public",
+            "events",
+            "test.public.events.Envelope".into(),
+            &columns,
+            &resolved,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(captured.event_schema.fields.len(), 2);
+        assert_eq!(captured.event_schema.fields[1].type_name, "bytea");
+        assert_eq!(captured.opaque_columns, ["payload"]);
+    }
+
+    #[test]
+    fn upgrades_historical_opaque_columns_when_the_type_becomes_supported() {
+        let mut previous = baseline();
+        previous.event_schema.fields[1].type_name = "bytea".into();
+        previous.opaque_columns.push("customer".into());
+        let column = RelationColumn {
+            name: Arc::from("customer"),
+            type_id: 25,
+            type_modifier: -1,
+            is_key: false,
+        };
+
+        let upgraded = schema_from_relation(
+            "public",
+            "orders",
+            previous.event_schema.name.clone(),
+            &[column],
+            &[("text".into(), true)],
+            true,
+            Some(&previous),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(upgraded.event_schema.fields[0].type_name, "text");
+        assert!(upgraded.opaque_columns.is_empty());
     }
 }

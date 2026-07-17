@@ -210,18 +210,21 @@ impl PostgresSource {
                     None
                 }
             };
-            let resolved_type_names = columns
+            let resolved_types = columns
                 .iter()
                 .map(|column| {
-                    scalar(
+                    resolve_postgres_type(
                         &mut connection,
-                        &format!(
-                            "SELECT format_type({}::oid, {})",
-                            column.type_id, column.type_modifier
-                        ),
+                        column.type_id,
+                        column.type_modifier,
                     )
                     .unwrap_or_else(|error| {
                         let fallback = relation_type_name_fallback(previous.as_ref(), column);
+                        let supported = relation_type_supported_fallback(
+                            catalog.as_ref(),
+                            previous.as_ref(),
+                            column,
+                        );
                         warn!(
                             schema = %schema,
                             table = %table,
@@ -230,7 +233,7 @@ impl PostgresSource {
                             fallback = %fallback,
                             "PostgreSQL relation type metadata is unavailable; retaining a conservative type name"
                         );
-                        fallback
+                        (fallback, supported)
                     })
                 })
                 .collect::<Vec<_>>();
@@ -242,7 +245,8 @@ impl PostgresSource {
                     config.slot_name, config.database, schema, table
                 ),
                 &columns,
-                &resolved_type_names,
+                &resolved_types,
+                config.include_unknown_datatypes,
                 previous.as_ref(),
                 catalog.as_ref(),
             )
@@ -361,6 +365,202 @@ fn relation_type_name_fallback(previous: Option<&TableSchema>, column: &Relation
         .unwrap_or_else(|| format!("unknown_oid_{}", column.type_id))
 }
 
+fn relation_type_supported_fallback(
+    catalog: Option<&TableSchema>,
+    previous: Option<&TableSchema>,
+    column: &RelationColumn,
+) -> bool {
+    let supported = |schema: &TableSchema| {
+        schema.column_types.iter().find_map(|candidate| {
+            (candidate.name == column.name.as_ref()
+                && candidate.type_oid == column.type_id
+                && candidate.type_modifier == column.type_modifier)
+                .then(|| {
+                    schema
+                        .event_schema
+                        .fields
+                        .iter()
+                        .any(|field| field.name == candidate.name)
+                        && !schema
+                            .opaque_columns
+                            .iter()
+                            .any(|name| name == &candidate.name)
+                })
+        })
+    };
+    catalog
+        .and_then(supported)
+        .or_else(|| previous.and_then(supported))
+        .unwrap_or(false)
+}
+
+#[derive(Clone, Copy)]
+struct PostgresTypeIdentity<'a> {
+    kind: &'a str,
+    namespace: &'a str,
+    name: &'a str,
+}
+
+fn resolve_postgres_type(
+    connection: &mut PgReplicationConnection,
+    type_oid: u32,
+    type_modifier: i32,
+) -> Result<(String, bool)> {
+    let result = connection
+        .exec(&format!(
+            r#"SELECT format_type(t.oid, {type_modifier}),
+                      t.typtype::text, n.nspname, t.typname,
+                      COALESCE(element.typtype::text, ''),
+                      COALESCE(element_namespace.nspname, ''),
+                      COALESCE(element.typname, ''),
+                      COALESCE(base.typtype::text, ''),
+                      COALESCE(base_namespace.nspname, ''),
+                      COALESCE(base.typname, ''),
+                      COALESCE(element_base.typtype::text, ''),
+                      COALESCE(element_base_namespace.nspname, ''),
+                      COALESCE(element_base.typname, '')
+               FROM pg_type t
+               JOIN pg_namespace n ON n.oid = t.typnamespace
+               LEFT JOIN pg_type element ON element.oid = t.typelem
+               LEFT JOIN pg_namespace element_namespace ON element_namespace.oid = element.typnamespace
+               LEFT JOIN pg_type base ON base.oid = t.typbasetype
+               LEFT JOIN pg_namespace base_namespace ON base_namespace.oid = base.typnamespace
+               LEFT JOIN pg_type element_base ON element_base.oid = element.typbasetype
+               LEFT JOIN pg_namespace element_base_namespace ON element_base_namespace.oid = element_base.typnamespace
+               WHERE t.oid = {type_oid}::oid"#
+        ))
+        .map_err(pg_error)?;
+    if result.ntuples() != 1 {
+        return Err(Error::Source(format!(
+            "PostgreSQL type OID {type_oid} does not exist"
+        )));
+    }
+    let type_name = required_value(&result, 0, 0, "resolved column type")?;
+    let values = (1..=12)
+        .map(|index| required_value(&result, 0, index, "resolved type metadata"))
+        .collect::<Result<Vec<_>>>()?;
+    let supported = postgres_type_supported([
+        PostgresTypeIdentity {
+            kind: &values[0],
+            namespace: &values[1],
+            name: &values[2],
+        },
+        PostgresTypeIdentity {
+            kind: &values[3],
+            namespace: &values[4],
+            name: &values[5],
+        },
+        PostgresTypeIdentity {
+            kind: &values[6],
+            namespace: &values[7],
+            name: &values[8],
+        },
+        PostgresTypeIdentity {
+            kind: &values[9],
+            namespace: &values[10],
+            name: &values[11],
+        },
+    ]);
+    Ok((type_name, supported))
+}
+
+fn postgres_type_supported(types: [PostgresTypeIdentity<'_>; 4]) -> bool {
+    let [root, element, base, element_base] = types;
+    match root.kind {
+        "e" => true,
+        "d" => base.kind == "e" || postgres_scalar_type_supported(base),
+        _ if !element.kind.is_empty() => {
+            element.kind == "e"
+                || postgres_scalar_type_supported(element)
+                || (element.kind == "d"
+                    && (element_base.kind == "e" || postgres_scalar_type_supported(element_base)))
+        }
+        _ => postgres_scalar_type_supported(root),
+    }
+}
+
+fn postgres_scalar_type_supported(identity: PostgresTypeIdentity<'_>) -> bool {
+    if matches!(identity.kind, "r" | "m") {
+        return true;
+    }
+    if identity.namespace != "pg_catalog" {
+        return matches!(
+            identity.name,
+            "citext"
+                | "hstore"
+                | "ltree"
+                | "isbn"
+                | "geometry"
+                | "geography"
+                | "vector"
+                | "halfvec"
+                | "sparsevec"
+        );
+    }
+    matches!(
+        identity.name,
+        "bool"
+            | "bytea"
+            | "char"
+            | "name"
+            | "int8"
+            | "int2"
+            | "int4"
+            | "text"
+            | "oid"
+            | "tid"
+            | "xid"
+            | "xid8"
+            | "cid"
+            | "json"
+            | "jsonb"
+            | "jsonpath"
+            | "xml"
+            | "point"
+            | "lseg"
+            | "path"
+            | "box"
+            | "polygon"
+            | "line"
+            | "circle"
+            | "float4"
+            | "float8"
+            | "money"
+            | "macaddr"
+            | "macaddr8"
+            | "inet"
+            | "cidr"
+            | "bpchar"
+            | "varchar"
+            | "date"
+            | "time"
+            | "timestamp"
+            | "timestamptz"
+            | "interval"
+            | "timetz"
+            | "bit"
+            | "varbit"
+            | "numeric"
+            | "uuid"
+            | "pg_lsn"
+            | "tsvector"
+            | "tsquery"
+            | "regproc"
+            | "regprocedure"
+            | "regoper"
+            | "regoperator"
+            | "regclass"
+            | "regcollation"
+            | "regtype"
+            | "regrole"
+            | "regnamespace"
+            | "regconfig"
+            | "regdictionary"
+            | "pg_snapshot"
+            | "txid_snapshot"
+    )
+}
+
 #[async_trait]
 impl SourceConnector for PostgresSource {
     fn source_type(&self) -> &'static str {
@@ -373,6 +573,7 @@ impl SourceConnector for PostgresSource {
 
     async fn run(&mut self, mut context: SourceContext) -> Result<()> {
         let checkpoint = context.initial_checkpoint.clone();
+        let validated_schemas = self.schemas.clone();
         let mut resume_slot_resolution = None;
         let mut resume_state_dirty = false;
         let mut snapshot_needed = match self.snapshot.mode {
@@ -389,7 +590,10 @@ impl SourceConnector for PostgresSource {
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.connector_state.as_ref())
             {
-                let state = decode_connector_state(connector_state)?;
+                let mut state = decode_connector_state(connector_state)?;
+                resume_state_dirty |=
+                    normalize_checkpoint_schemas(&mut state.schemas, &validated_schemas);
+                resume_state_dirty |= connector_state.version < 6;
                 self.schemas = state.schemas;
                 incremental_progress = state.incremental_snapshot;
                 completed_signal_ids = state.completed_signal_ids;
@@ -1540,7 +1744,8 @@ impl StreamingState {
         let changed = match self.schemas.get(&key) {
             Some(current)
                 if current.event_schema.fields == refreshed.event_schema.fields
-                    && current.column_types == refreshed.column_types =>
+                    && current.column_types == refreshed.column_types
+                    && current.opaque_columns == refreshed.opaque_columns =>
             {
                 refreshed.event_schema.version = current.event_schema.version;
                 false
@@ -1633,7 +1838,7 @@ impl StreamingState {
             return Ok(None);
         }
         let key = (schema_name.to_string(), table_name.to_string());
-        let event_schema = {
+        let table_schema = {
             let schema = self.schemas.get_mut(&key).ok_or_else(|| {
                 Error::Source(format!(
                     "received an event for unknown table {schema_name}.{table_name}; restart after schema refresh"
@@ -1644,8 +1849,9 @@ impl StreamingState {
                     field.primary_key = key_columns.iter().any(|column| column == &field.name);
                 }
             }
-            schema.event_schema.clone()
+            schema.clone()
         };
+        let event_schema = table_schema.event_schema.clone();
 
         let event_serial = self.next_serial(lsn);
         let transaction_id = self.transaction.as_ref().map(|transaction| transaction.id);
@@ -1663,7 +1869,7 @@ impl StreamingState {
         let before = old_data.as_ref().map(|row| {
             convert_row(
                 row,
-                &event_schema,
+                &table_schema,
                 &config.hstore_handling_mode,
                 &config.interval_handling_mode,
             )
@@ -1671,7 +1877,7 @@ impl StreamingState {
         let mut after = new_data.as_ref().map(|row| {
             convert_row(
                 row,
-                &event_schema,
+                &table_schema,
                 &config.hstore_handling_mode,
                 &config.interval_handling_mode,
             )
@@ -1888,6 +2094,82 @@ impl StreamingState {
     }
 }
 
+fn normalize_checkpoint_schemas(
+    schemas: &mut HashMap<(String, String), TableSchema>,
+    current_schemas: &HashMap<(String, String), TableSchema>,
+) -> bool {
+    let before = schemas.clone();
+    for (key, historical) in schemas.iter_mut() {
+        let Some(current) = current_schemas.get(key) else {
+            continue;
+        };
+        let previous_fields = historical.event_schema.fields.clone();
+        let previous_opaque_columns = historical.opaque_columns.clone();
+        for current_type in &current.column_types {
+            let Some(historical_type) = historical.column_types.iter().find(|candidate| {
+                candidate.name == current_type.name
+                    && candidate.type_oid == current_type.type_oid
+                    && candidate.type_modifier == current_type.type_modifier
+            }) else {
+                continue;
+            };
+            let historical_name = historical_type.name.clone();
+            let current_field = current
+                .event_schema
+                .fields
+                .iter()
+                .find(|field| field.name == current_type.name);
+            match current_field {
+                Some(current_field) => {
+                    if let Some(historical_field) = historical
+                        .event_schema
+                        .fields
+                        .iter_mut()
+                        .find(|field| field.name == historical_name)
+                    {
+                        historical_field.type_name = current_field.type_name.clone();
+                        historical_field.optional = current_field.optional;
+                    } else {
+                        historical.event_schema.fields.push(current_field.clone());
+                    }
+                    let opaque = current
+                        .opaque_columns
+                        .iter()
+                        .any(|name| name == &current_type.name);
+                    historical
+                        .opaque_columns
+                        .retain(|name| name != &historical_name);
+                    if opaque {
+                        historical.opaque_columns.push(historical_name);
+                    }
+                }
+                None => {
+                    historical
+                        .event_schema
+                        .fields
+                        .retain(|field| field.name != historical_name);
+                    historical
+                        .opaque_columns
+                        .retain(|name| name != &historical_name);
+                }
+            }
+        }
+        historical.event_schema.fields.sort_by_key(|field| {
+            historical
+                .column_types
+                .iter()
+                .position(|column| column.name == field.name)
+                .unwrap_or(usize::MAX)
+        });
+        if historical.event_schema.fields != previous_fields
+            || historical.opaque_columns != previous_opaque_columns
+        {
+            historical.event_schema.version = historical.event_schema.version.saturating_add(1);
+        }
+    }
+    schemas != &before
+}
+
 #[allow(clippy::too_many_arguments)]
 fn snapshot_table(
     connection: &mut PgReplicationConnection,
@@ -1927,6 +2209,11 @@ fn snapshot_table(
         })
         .collect::<Result<Vec<_>>>()?
         .join(", ");
+    let projection = if projection.is_empty() {
+        "NULL".to_string()
+    } else {
+        projection
+    };
 
     let mut offset = 0_usize;
     loop {
@@ -1956,17 +2243,11 @@ fn snapshot_table(
                     let column_index = i32::try_from(column_index).map_err(|_| {
                         Error::Invariant("PostgreSQL snapshot has too many columns".into())
                     })?;
-                    let value = result.get_value(row_index, column_index).map_or(
-                        DataValue::Null,
-                        |value| {
-                            convert_text_with_modes(
-                                &value,
-                                &field.type_name,
-                                &config.hstore_handling_mode,
-                                &config.interval_handling_mode,
-                            )
-                        },
-                    );
+                    let value = result
+                        .get_value(row_index, column_index)
+                        .map_or(DataValue::Null, |value| {
+                            convert_snapshot_value(&value, field, schema, config)
+                        });
                     Ok((field.name.clone(), value))
                 })
                 .collect::<Result<Row>>()?;
@@ -2389,12 +2670,30 @@ pub(crate) fn query_table_schema(
                           AND a.attnum = ANY(i.indkey::smallint[])
                       ),
                       a.atttypid::oid::text,
-                      a.atttypmod::text
+                      a.atttypmod::text,
+                      t.typtype::text,
+                      type_namespace.nspname,
+                      t.typname,
+                      COALESCE(element_type.typtype::text, ''),
+                      COALESCE(element_namespace.nspname, ''),
+                      COALESCE(element_type.typname, ''),
+                      COALESCE(base_type.typtype::text, ''),
+                      COALESCE(base_namespace.nspname, ''),
+                      COALESCE(base_type.typname, ''),
+                      COALESCE(element_base_type.typtype::text, ''),
+                      COALESCE(element_base_namespace.nspname, ''),
+                      COALESCE(element_base_type.typname, '')
                FROM pg_attribute a
                JOIN pg_class c ON c.oid = a.attrelid
                JOIN pg_namespace n ON n.oid = c.relnamespace
                JOIN pg_type t ON t.oid = a.atttypid
+               JOIN pg_namespace type_namespace ON type_namespace.oid = t.typnamespace
                LEFT JOIN pg_type element_type ON element_type.oid = t.typelem
+               LEFT JOIN pg_namespace element_namespace ON element_namespace.oid = element_type.typnamespace
+               LEFT JOIN pg_type base_type ON base_type.oid = t.typbasetype
+               LEFT JOIN pg_namespace base_namespace ON base_namespace.oid = base_type.typnamespace
+               LEFT JOIN pg_type element_base_type ON element_base_type.oid = element_type.typbasetype
+               LEFT JOIN pg_namespace element_base_namespace ON element_base_namespace.oid = element_base_type.typnamespace
                WHERE n.nspname = {schema_literal}
                  AND c.relname = {table_literal}
                  AND a.attnum > 0
@@ -2404,14 +2703,49 @@ pub(crate) fn query_table_schema(
         .map_err(pg_error)?;
     let mut fields = Vec::with_capacity(result.ntuples() as usize);
     let mut column_types = Vec::with_capacity(result.ntuples() as usize);
+    let mut opaque_columns = Vec::new();
     for index in 0..result.ntuples() {
         let name = required_value(&result, index, 0, "column name")?;
-        fields.push(FieldSchema {
-            name: name.clone(),
-            type_name: required_value(&result, index, 1, "column type")?,
-            optional: required_value(&result, index, 2, "column optionality")? == "t",
-            primary_key: required_value(&result, index, 3, "column key state")? == "t",
-        });
+        let values = (6..=17)
+            .map(|column| required_value(&result, index, column, "column type metadata"))
+            .collect::<Result<Vec<_>>>()?;
+        let supported = postgres_type_supported([
+            PostgresTypeIdentity {
+                kind: &values[0],
+                namespace: &values[1],
+                name: &values[2],
+            },
+            PostgresTypeIdentity {
+                kind: &values[3],
+                namespace: &values[4],
+                name: &values[5],
+            },
+            PostgresTypeIdentity {
+                kind: &values[6],
+                namespace: &values[7],
+                name: &values[8],
+            },
+            PostgresTypeIdentity {
+                kind: &values[9],
+                namespace: &values[10],
+                name: &values[11],
+            },
+        ]);
+        if supported || config.include_unknown_datatypes {
+            fields.push(FieldSchema {
+                name: name.clone(),
+                type_name: if supported {
+                    required_value(&result, index, 1, "column type")?
+                } else {
+                    "bytea".into()
+                },
+                optional: required_value(&result, index, 2, "column optionality")? == "t",
+                primary_key: required_value(&result, index, 3, "column key state")? == "t",
+            });
+            if !supported {
+                opaque_columns.push(name.clone());
+            }
+        }
         column_types.push(PostgresColumnType {
             name,
             type_oid: required_value(&result, index, 4, "column type OID")?
@@ -2422,7 +2756,7 @@ pub(crate) fn query_table_schema(
                 .map_err(|error| Error::Source(format!("invalid column type modifier: {error}")))?,
         });
     }
-    if fields.is_empty() {
+    if column_types.is_empty() {
         return Ok(None);
     }
     Ok(Some(TableSchema {
@@ -2437,33 +2771,72 @@ pub(crate) fn query_table_schema(
             fields,
         },
         column_types,
+        opaque_columns,
     }))
 }
 
 fn convert_row(
     row: &RowData,
-    schema: &EventSchema,
+    schema: &TableSchema,
     hstore_handling_mode: &str,
     interval_handling_mode: &str,
 ) -> Row {
     row.iter()
-        .map(|(name, value)| {
+        .filter_map(|(name, value)| {
             let type_name = schema
+                .event_schema
                 .fields
                 .iter()
                 .find(|field| field.name == name.as_ref())
-                .map_or("text", |field| field.type_name.as_str());
-            (
+                .map(|field| field.type_name.as_str())?;
+            Some((
                 name.to_string(),
-                convert_value(
-                    value,
-                    type_name,
-                    hstore_handling_mode,
-                    interval_handling_mode,
-                ),
-            )
+                if schema
+                    .opaque_columns
+                    .iter()
+                    .any(|column| column == name.as_ref())
+                {
+                    convert_opaque_value(value)
+                } else {
+                    convert_value(
+                        value,
+                        type_name,
+                        hstore_handling_mode,
+                        interval_handling_mode,
+                    )
+                },
+            ))
         })
         .collect()
+}
+
+pub(crate) fn convert_snapshot_value(
+    value: &str,
+    field: &FieldSchema,
+    schema: &TableSchema,
+    config: &PostgresSourceConfig,
+) -> DataValue {
+    if schema
+        .opaque_columns
+        .iter()
+        .any(|column| column == &field.name)
+    {
+        DataValue::Bytes(value.as_bytes().to_vec())
+    } else {
+        convert_text_with_modes(
+            value,
+            &field.type_name,
+            &config.hstore_handling_mode,
+            &config.interval_handling_mode,
+        )
+    }
+}
+
+fn convert_opaque_value(value: &ColumnValue) -> DataValue {
+    match value {
+        ColumnValue::Null => DataValue::Null,
+        ColumnValue::Text(value) | ColumnValue::Binary(value) => DataValue::Bytes(value.to_vec()),
+    }
 }
 
 fn convert_value(
@@ -3780,6 +4153,7 @@ sink:
                 type_oid: 20,
                 type_modifier: -1,
             }],
+            opaque_columns: Vec::new(),
         };
         let mut state = StreamingState::new(
             HashMap::from([(original.key(), original.clone())]),
@@ -3810,6 +4184,77 @@ sink:
     }
 
     #[test]
+    fn normalizes_legacy_unknown_datatype_state_from_the_current_catalog() {
+        let historical = TableSchema {
+            schema: "public".into(),
+            table: "events".into(),
+            event_schema: EventSchema {
+                name: "test.public.events.Envelope".into(),
+                version: 3,
+                fields: vec![
+                    FieldSchema {
+                        name: "id".into(),
+                        type_name: "bigint".into(),
+                        optional: false,
+                        primary_key: true,
+                    },
+                    FieldSchema {
+                        name: "payload".into(),
+                        type_name: "public.payload_type".into(),
+                        optional: false,
+                        primary_key: false,
+                    },
+                ],
+            },
+            column_types: vec![
+                PostgresColumnType {
+                    name: "id".into(),
+                    type_oid: 20,
+                    type_modifier: -1,
+                },
+                PostgresColumnType {
+                    name: "payload".into(),
+                    type_oid: 1_640_100,
+                    type_modifier: -1,
+                },
+            ],
+            opaque_columns: Vec::new(),
+        };
+        let mut omitted = historical.clone();
+        omitted
+            .event_schema
+            .fields
+            .retain(|field| field.name != "payload");
+        let mut included = historical.clone();
+        included.event_schema.fields[1].type_name = "bytea".into();
+        included.opaque_columns.push("payload".into());
+
+        let key = historical.key();
+        let mut schemas = HashMap::from([(key.clone(), historical.clone())]);
+        assert!(normalize_checkpoint_schemas(
+            &mut schemas,
+            &HashMap::from([(key.clone(), omitted)])
+        ));
+        assert_eq!(schemas[&key].event_schema.version, 4);
+        assert!(
+            schemas[&key]
+                .event_schema
+                .fields
+                .iter()
+                .all(|field| field.name != "payload")
+        );
+
+        let mut schemas = HashMap::from([(key.clone(), historical)]);
+        assert!(normalize_checkpoint_schemas(
+            &mut schemas,
+            &HashMap::from([(key.clone(), included)])
+        ));
+        assert_eq!(schemas[&key].event_schema.version, 4);
+        assert_eq!(schemas[&key].event_schema.fields[1].type_name, "bytea");
+        assert_eq!(schemas[&key].opaque_columns, ["payload"]);
+    }
+
+    #[test]
     fn reuses_historical_type_name_when_catalog_type_resolution_fails() {
         let previous = TableSchema {
             schema: "public".into(),
@@ -3829,6 +4274,7 @@ sink:
                 type_oid: 1_640_001,
                 type_modifier: 1_310_728,
             }],
+            opaque_columns: Vec::new(),
         };
         let relation_column = RelationColumn {
             name: Arc::from("legacy_amount"),
@@ -3913,6 +4359,7 @@ sink:
             read_only: false,
             hstore_handling_mode: "json".into(),
             interval_handling_mode: "postgres".into(),
+            include_unknown_datatypes: false,
             logical_decoding_messages: false,
             message_prefix_include_list: Vec::new(),
             message_prefix_exclude_list: Vec::new(),

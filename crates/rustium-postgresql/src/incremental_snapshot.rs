@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use crate::{
     schema_history::{IncrementalSnapshotProgress, TableSchema},
-    source::{connect_regular, convert_text_with_modes, query_table_schema},
+    source::{connect_regular, convert_snapshot_value, query_table_schema},
 };
 
 const EXECUTE_SNAPSHOT: &str = "execute-snapshot";
@@ -718,6 +718,7 @@ fn prepare_chunk(
     })?;
     if catalog.event_schema.fields != input.schema.event_schema.fields
         || catalog.column_types != input.schema.column_types
+        || catalog.opaque_columns != input.schema.opaque_columns
     {
         return Err(Error::Source(format!(
             "PostgreSQL schema changed for {}.{} while an incremental snapshot window was active; stop the snapshot or restart it after the schema change",
@@ -816,11 +817,11 @@ fn prepare_chunk(
                     result
                         .get_value(row_index, column_index)
                         .map_or(DataValue::Null, |value| {
-                            convert_text_with_modes(
+                            convert_snapshot_value(
                                 &value,
-                                &field.type_name,
-                                &input.catalog_config.hstore_handling_mode,
-                                &input.catalog_config.interval_handling_mode,
+                                field,
+                                &input.schema,
+                                &input.catalog_config,
                             )
                         });
                 Ok((field.name.clone(), value))

@@ -116,6 +116,7 @@ impl TestSettings {
             read_only: false,
             hstore_handling_mode: "json".into(),
             interval_handling_mode: "postgres".into(),
+            include_unknown_datatypes: false,
             logical_decoding_messages: false,
             message_prefix_include_list: Vec::new(),
             message_prefix_exclude_list: Vec::new(),
@@ -1650,6 +1651,96 @@ async fn keeps_snapshot_and_streaming_type_conversion_identical() -> TestResult 
             return Err(cleanup_error);
         }
         eprintln!("PostgreSQL type test cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn handles_debezium_unknown_datatypes_across_snapshot_and_wal() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let type_name = format!("rustium_payload_{}", &suffix[..12]);
+    let omitted_table = format!("rustium_pg_unknown_off_{}", &suffix[..12]);
+    let included_table = format!("rustium_pg_unknown_on_{}", &suffix[..12]);
+    let omitted_publication = format!("rustium_unknown_off_pub_{}", &suffix[..12]);
+    let included_publication = format!("rustium_unknown_on_pub_{}", &suffix[..12]);
+    let omitted_slot = format!("rustium_unknown_off_slot_{}", &suffix[..12]);
+    let included_slot = format!("rustium_unknown_on_slot_{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TYPE public.{type_name} AS (label TEXT, amount INTEGER); \
+                 CREATE TABLE public.{omitted_table} (\
+                    id BIGINT PRIMARY KEY, payload public.{type_name} NOT NULL\
+                 ); \
+                 INSERT INTO public.{omitted_table} VALUES (1, ROW('alpha', 1)); \
+                 CREATE PUBLICATION {omitted_publication} FOR TABLE public.{omitted_table}; \
+                 CREATE TABLE public.{included_table} (\
+                    id BIGINT PRIMARY KEY, payload public.{type_name} NOT NULL\
+                 ); \
+                 INSERT INTO public.{included_table} VALUES (1, ROW('alpha', 1)); \
+                 CREATE PUBLICATION {included_publication} FOR TABLE public.{included_table};"
+            ))
+            .await?;
+
+        let omitted_config =
+            settings.source_config(&omitted_publication, &omitted_slot, &omitted_table);
+        capture_unknown_datatype_mode(
+            &client,
+            &format!("postgresql-unknown-off-{}", &suffix[..12]),
+            &omitted_table,
+            &omitted_slot,
+            omitted_config,
+            false,
+        )
+        .await?;
+
+        let mut included_config =
+            settings.source_config(&included_publication, &included_slot, &included_table);
+        included_config.include_unknown_datatypes = true;
+        capture_unknown_datatype_mode(
+            &client,
+            &format!("postgresql-unknown-on-{}", &suffix[..12]),
+            &included_table,
+            &included_slot,
+            included_config,
+            true,
+        )
+        .await
+    }
+    .await;
+
+    let cleanup_result: TestResult = async {
+        cleanup(
+            &client,
+            &omitted_publication,
+            &omitted_slot,
+            &[&omitted_table],
+        )
+        .await?;
+        cleanup(
+            &client,
+            &included_publication,
+            &included_slot,
+            &[&included_table],
+        )
+        .await?;
+        client
+            .batch_execute(&format!("DROP TYPE IF EXISTS public.{type_name}"))
+            .await?;
+        Ok(())
+    }
+    .await;
+    connection_task.abort();
+
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL unknown datatype cleanup also failed: {cleanup_error}");
     }
     outcome
 }
@@ -4039,8 +4130,8 @@ async fn resumes_signal_incremental_snapshot_from_chunk_checkpoint() -> TestResu
                         test_error("completed incremental snapshot has no connector state")
                     })?;
                     require(
-                        state.version == 5,
-                        "PostgreSQL connector state did not upgrade to version 5",
+                        state.version == 6,
+                        "PostgreSQL connector state did not upgrade to version 6",
                     )?;
                     require(
                         state.payload.get("incremental_snapshot").is_none(),
@@ -4231,7 +4322,7 @@ async fn controls_and_deduplicates_filtered_incremental_snapshot() -> TestResult
                 }
                 if record.boundary == RecordBoundary::TransactionCommit
                     && record.connector_state.as_ref().is_some_and(|state| {
-                        state.version == 5
+                        state.version == 6
                             && state.payload.get("incremental_snapshot").is_none()
                     })
                 {
@@ -4386,7 +4477,7 @@ async fn runs_incremental_snapshot_with_read_only_table_permissions() -> TestRes
                 }
                 if record.boundary == RecordBoundary::TransactionCommit
                     && record.connector_state.as_ref().is_some_and(|state| {
-                        state.version == 5 && state.payload.get("incremental_snapshot").is_none()
+                        state.version == 6 && state.payload.get("incremental_snapshot").is_none()
                     })
                 {
                     break;
@@ -4531,7 +4622,7 @@ async fn orders_incremental_chunks_by_unique_surrogate_key() -> TestResult {
                 }
                 if record.boundary == RecordBoundary::TransactionCommit
                     && record.connector_state.as_ref().is_some_and(|state| {
-                        state.version == 5 && state.payload.get("incremental_snapshot").is_none()
+                        state.version == 6 && state.payload.get("incremental_snapshot").is_none()
                     })
                 {
                     break;
@@ -5040,6 +5131,112 @@ async fn run_initial_capture(
 
     let stop_result = stop_source(cancellation, source_task).await;
     combine_capture_and_stop(capture_result, stop_result)
+}
+
+async fn capture_unknown_datatype_mode(
+    client: &Client,
+    connector_name: &str,
+    table_name: &str,
+    slot_name: &str,
+    config: PostgresSourceConfig,
+    include_unknown_datatypes: bool,
+) -> TestResult {
+    let mut source = PostgresSource::new(
+        connector_name,
+        config,
+        SnapshotConfig {
+            mode: SnapshotMode::Initial,
+            fetch_size: 1,
+            include_collections: Vec::new(),
+        },
+    );
+    source.validate().await?;
+    let (mut output, cancellation, source_task) = start_source(source, None);
+
+    let capture_result: TestResult = async {
+        let snapshot_event = loop {
+            let record = receive(&mut output).await?;
+            if record.boundary == RecordBoundary::SnapshotComplete {
+                return Err(test_error(
+                    "PostgreSQL unknown datatype snapshot emitted no row",
+                ));
+            }
+            if let Some(event) = record.event
+                && event.operation == Operation::Read
+            {
+                break event;
+            }
+        };
+        verify_unknown_datatype_event(&snapshot_event, 1, include_unknown_datatypes, "alpha")?;
+
+        loop {
+            if receive(&mut output).await?.boundary == RecordBoundary::SnapshotComplete {
+                break;
+            }
+        }
+        wait_for_active_slot(client, slot_name).await?;
+        client
+            .batch_execute(&format!(
+                "INSERT INTO public.{table_name} VALUES (2, ROW('beta', 2));"
+            ))
+            .await?;
+        let streaming_event = loop {
+            let record = receive(&mut output).await?;
+            if let Some(event) = record.event
+                && event.operation == Operation::Create
+            {
+                break event;
+            }
+        };
+        verify_unknown_datatype_event(&streaming_event, 2, include_unknown_datatypes, "beta")
+    }
+    .await;
+
+    let stop_result = stop_source(cancellation, source_task).await;
+    combine_capture_and_stop(capture_result, stop_result)
+}
+
+fn verify_unknown_datatype_event(
+    event: &rustium_core::ChangeEvent,
+    expected_id: i64,
+    include_unknown_datatypes: bool,
+    expected_label: &str,
+) -> TestResult {
+    let row = event
+        .after
+        .as_ref()
+        .ok_or_else(|| test_error("PostgreSQL unknown datatype event has no after row"))?;
+    require(
+        row.get("id") == Some(&DataValue::Int64(expected_id)),
+        "PostgreSQL unknown datatype event has the wrong id",
+    )?;
+    if include_unknown_datatypes {
+        require(
+            event
+                .schema
+                .fields
+                .iter()
+                .any(|field| field.name == "payload" && field.type_name == "bytea"),
+            "included PostgreSQL unknown datatype has no bytea schema field",
+        )?;
+        require(
+            row.get("payload")
+                == Some(&DataValue::Bytes(
+                    format!("({expected_label},{expected_id})").into_bytes(),
+                )),
+            "included PostgreSQL unknown datatype did not preserve its pgoutput text bytes",
+        )
+    } else {
+        require(
+            event
+                .schema
+                .fields
+                .iter()
+                .all(|field| field.name != "payload")
+                && !row.contains_key("payload"),
+            "PostgreSQL unknown datatype was not omitted by default",
+        )
+    }
 }
 
 async fn run_resumed_capture(

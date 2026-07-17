@@ -254,6 +254,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                     .get("interval.handling.mode")
                     .map_or("numeric", String::as_str),
             )?,
+            include_unknown_datatypes: bool_value(&properties, "include.unknown.datatypes", false)?,
             logical_decoding_messages: true,
             message_prefix_include_list: csv_property(
                 properties.get("message.prefix.include.list"),
@@ -1410,6 +1411,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "connection.validation.timeout.ms",
         "status.update.interval.ms",
         "database.tcpKeepAlive",
+        "include.unknown.datatypes",
         "slot.max.retries",
         "slot.retry.delay.ms",
         "slot.stream.params",
@@ -2182,6 +2184,33 @@ database.sslfactory=com.example.CustomFactory
         )
         .unwrap_err();
         assert!(ssl_factory.to_string().contains("JVM-specific"));
+    }
+
+    #[test]
+    fn maps_postgres_unknown_datatype_mode() {
+        let configured = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+include.unknown.datatypes=true
+"#,
+        )
+        .unwrap();
+        assert!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .include_unknown_datatypes
+        );
+        assert!(configured.compatibility_warnings.iter().all(|warning| {
+            !warning.contains("include.unknown.datatypes is recognized but not implemented")
+        }));
     }
 
     #[test]
