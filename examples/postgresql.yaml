@@ -23,6 +23,7 @@ source:
   slot_name: rustium_inventory
   slot_failover: false
   slot_ownership: managed
+  offset_mismatch_strategy: no_validation
   tables:
     include:
       - public\.(orders|customers)

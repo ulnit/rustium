@@ -95,6 +95,23 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 .into(),
         ));
     }
+    let offset_mismatch_strategy =
+        if let Some(strategy) = properties.get("offset.mismatch.strategy") {
+            postgres_offset_mismatch_strategy(strategy)?
+        } else if properties.contains_key("slot.seek.to.known.offset.on.start") {
+            if bool_value(&properties, "slot.seek.to.known.offset.on.start", false)? {
+                PostgresOffsetMismatchStrategy::TrustOffset
+            } else {
+                PostgresOffsetMismatchStrategy::NoValidation
+            }
+        } else {
+            PostgresOffsetMismatchStrategy::default()
+        };
+    if properties.contains_key("slot.seek.to.known.offset.on.start") {
+        warnings.push(
+            "slot.seek.to.known.offset.on.start is deprecated; use offset.mismatch.strategy".into(),
+        );
+    }
 
     assemble_config(
         &properties,
@@ -130,6 +147,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 .unwrap_or_else(|| "debezium".into()),
             slot_failover: bool_value(&properties, "slot.failover", false)?,
             slot_ownership: SlotOwnership::Managed,
+            offset_mismatch_strategy,
             tables: TableSelection { include, exclude },
             ssl_mode: properties
                 .get("database.sslmode")
@@ -1117,6 +1135,18 @@ fn postgres_interval_handling_mode(mode: &str) -> Result<String> {
     }
 }
 
+fn postgres_offset_mismatch_strategy(strategy: &str) -> Result<PostgresOffsetMismatchStrategy> {
+    match strategy.trim().to_ascii_lowercase().as_str() {
+        "no_validation" => Ok(PostgresOffsetMismatchStrategy::NoValidation),
+        "trust_offset" => Ok(PostgresOffsetMismatchStrategy::TrustOffset),
+        "trust_slot" => Ok(PostgresOffsetMismatchStrategy::TrustSlot),
+        "trust_greater_lsn" => Ok(PostgresOffsetMismatchStrategy::TrustGreaterLsn),
+        _ => Err(Error::Configuration(format!(
+            "offset.mismatch.strategy={strategy:?} must be no_validation, trust_offset, trust_slot, or trust_greater_lsn"
+        ))),
+    }
+}
+
 fn postgres_replica_identity_rules(
     value: Option<&String>,
 ) -> Result<Vec<PostgresReplicaIdentityRule>> {
@@ -1277,6 +1307,8 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "database.tcpKeepAlive",
         "slot.max.retries",
         "slot.retry.delay.ms",
+        "offset.mismatch.strategy",
+        "slot.seek.to.known.offset.on.start",
         "unavailable.value.placeholder",
         "tombstones.on.delete",
         "key.converter",
@@ -1772,6 +1804,72 @@ errors.retry.delay.max.ms=200
             shared.runtime.errors_retry_delay_max,
             Duration::from_millis(200)
         );
+    }
+
+    #[test]
+    fn maps_postgres_offset_mismatch_strategies_and_deprecated_alias() {
+        let configured = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+offset.mismatch.strategy=trust_greater_lsn
+slot.seek.to.known.offset.on.start=false
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .offset_mismatch_strategy,
+            PostgresOffsetMismatchStrategy::TrustGreaterLsn
+        );
+        assert!(configured.compatibility_warnings.iter().any(|warning| {
+            warning.contains("slot.seek.to.known.offset.on.start") && warning.contains("deprecated")
+        }));
+
+        let alias = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+slot.seek.to.known.offset.on.start=true
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            alias
+                .source
+                .as_postgresql()
+                .unwrap()
+                .offset_mismatch_strategy,
+            PostgresOffsetMismatchStrategy::TrustOffset
+        );
+
+        let invalid = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+offset.mismatch.strategy=guess
+"#,
+        )
+        .unwrap_err();
+        assert!(invalid.to_string().contains("offset.mismatch.strategy"));
     }
 
     #[test]

@@ -15,13 +15,14 @@ use rdkafka::{
     util::Timeout,
 };
 use rustium_config::{
-    PostgresReplicaIdentity, PostgresReplicaIdentityRule, PostgresSourceConfig,
-    PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode, TableSelection,
+    PostgresOffsetMismatchStrategy, PostgresReplicaIdentity, PostgresReplicaIdentityRule,
+    PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode,
+    TableSelection,
 };
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
-    RecordBoundary, RetryPolicy, Row, SignalRecord, SourceConnector, SourceContext, SourcePosition,
-    SourceRecord,
+    PostgresPosition, RecordBoundary, RetryPolicy, Row, SignalRecord, SourceConnector,
+    SourceContext, SourcePosition, SourceRecord,
 };
 use rustium_postgresql::PostgresSource;
 use rustium_signal_kafka::KafkaSignalChannel;
@@ -81,6 +82,7 @@ impl TestSettings {
             slot_name: slot_name.into(),
             slot_failover: false,
             slot_ownership: SlotOwnership::Managed,
+            offset_mismatch_strategy: PostgresOffsetMismatchStrategy::NoValidation,
             tables: TableSelection {
                 include: vec![format!(r"public\.{table_name}")],
                 exclude: Vec::new(),
@@ -1891,6 +1893,272 @@ async fn advances_confirmed_flush_lsn_on_the_configured_feedback_interval() -> T
     let _ = connection_task.await;
     capture_result?;
     cleanup_result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires external PostgreSQL logical replication"]
+async fn reconciles_debezium_checkpoint_slot_mismatch_strategies() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_offset_{}", &suffix[..12]);
+    let publication = format!("rustium_pg_offset_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_pg_offset_slot_{}", &suffix[..12]);
+    let greater_slot = format!("rustium_pg_greater_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-offset-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let capture_result: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (\
+                    id BIGINT PRIMARY KEY, \
+                    customer TEXT NOT NULL, \
+                    amount NUMERIC(10,2) NOT NULL\
+                 ); \
+                 INSERT INTO public.{table_name} VALUES \
+                    (1, 'Alice', 12.30), \
+                    (2, 'Bob', 45.60); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+
+        let base_config = settings.source_config(&publication, &slot_name, &table_name);
+        let (checkpoint_position, schema_history) = run_initial_capture(
+            &client,
+            &connector_name,
+            &table_name,
+            &slot_name,
+            base_config.clone(),
+        )
+        .await?;
+        let checkpoint_lsn = match &checkpoint_position {
+            SourcePosition::Postgres(position) => position.commit_lsn.unwrap_or(position.lsn),
+            SourcePosition::MySql(_) | SourcePosition::SqlServer(_) => {
+                return Err(test_error(
+                    "offset fixture produced a non-PostgreSQL checkpoint",
+                ));
+            }
+        };
+        let checkpoint = Checkpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            connector_name: connector_name.clone(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: checkpoint_position,
+            snapshot_completed: true,
+            config_fingerprint: "postgresql-offset-strategy-test".into(),
+            updated_at: SystemTime::now(),
+            connector_state: Some(schema_history.clone()),
+        };
+        wait_for_inactive_slot(&client, &slot_name).await?;
+        require(
+            replication_slot_confirmed_lsn(&client, &slot_name).await? < checkpoint_lsn,
+            "offset fixture did not create a checkpoint ahead of the replication slot",
+        )?;
+
+        let mut trust_offset_config = base_config.clone();
+        trust_offset_config.offset_mismatch_strategy = PostgresOffsetMismatchStrategy::TrustOffset;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            trust_offset_config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) =
+            start_source(source, Some(checkpoint.clone()));
+        wait_for_active_slot(&client, &slot_name).await?;
+        require(
+            replication_slot_confirmed_lsn(&client, &slot_name).await? >= checkpoint_lsn,
+            "trust_offset did not advance the slot to the checkpoint",
+        )?;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO public.{table_name} (id, customer, amount) \
+                     VALUES (4, 'Dora', 67.80)"
+                ),
+                &[],
+            )
+            .await?;
+        require(
+            receive_postgres_create_id(&mut output).await? == 4,
+            "trust_offset replayed a record before the checkpoint",
+        )?;
+        stop_source(cancellation, source_task).await?;
+        wait_for_inactive_slot(&client, &slot_name).await?;
+
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE public.{table_name} \
+                 ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
+            ))
+            .await?;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO public.{table_name} (id, customer, amount, status) \
+                     VALUES (5, 'Eve', 78.90, 'skipped')"
+                ),
+                &[],
+            )
+            .await?;
+        let slot_ahead_lsn = current_wal_lsn(&client).await?;
+        advance_replication_slot(&client, &slot_name, slot_ahead_lsn).await?;
+        require(
+            replication_slot_confirmed_lsn(&client, &slot_name).await? > checkpoint_lsn,
+            "offset fixture did not advance the slot ahead of the checkpoint",
+        )?;
+
+        let mut source = PostgresSource::new(
+            &connector_name,
+            trust_offset_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (_output, _cancellation, source_task) = start_source(source, Some(checkpoint.clone()));
+        let source_result = tokio::time::timeout(Duration::from_secs(10), source_task).await??;
+        let source_error =
+            source_result.expect_err("trust_offset must reject a slot ahead of its checkpoint");
+        require(
+            source_error.to_string().contains("ahead of checkpoint"),
+            "trust_offset returned the wrong slot-ahead error",
+        )?;
+
+        let mut trust_slot_config = base_config.clone();
+        trust_slot_config.offset_mismatch_strategy = PostgresOffsetMismatchStrategy::TrustSlot;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            trust_slot_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) =
+            start_source(source, Some(checkpoint.clone()));
+        wait_for_active_slot(&client, &slot_name).await?;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO public.{table_name} (id, customer, amount, status) \
+                     VALUES (6, 'Finn', 89.10, 'ready')"
+                ),
+                &[],
+            )
+            .await?;
+        let trust_slot_record = receive_postgres_create(&mut output).await?;
+        require(
+            postgres_create_id(&trust_slot_record)? == 6,
+            "trust_slot replayed a record behind the authoritative slot",
+        )?;
+        let trust_slot_event = trust_slot_record
+            .event
+            .as_ref()
+            .ok_or_else(|| test_error("trust_slot create record has no event"))?;
+        require(
+            trust_slot_event
+                .after
+                .as_ref()
+                .and_then(|row| row.get("status"))
+                == Some(&DataValue::String("ready".into()))
+                && trust_slot_event
+                    .schema
+                    .fields
+                    .iter()
+                    .any(|field| field.name == "status"),
+            "trust_slot did not decode the schema change skipped by the authoritative slot",
+        )?;
+        let refreshed_schema_history =
+            trust_slot_record.connector_state.clone().ok_or_else(|| {
+                test_error("trust_slot did not checkpoint its refreshed PostgreSQL schema state")
+            })?;
+        stop_source(cancellation, source_task).await?;
+        wait_for_inactive_slot(&client, &slot_name).await?;
+
+        client
+            .query_one(
+                "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+                &[&greater_slot],
+            )
+            .await?;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO public.{table_name} (id, customer, amount, status) \
+                     VALUES (7, 'Gia', 91.20, 'processed')"
+                ),
+                &[],
+            )
+            .await?;
+        let greater_checkpoint_lsn = current_wal_lsn(&client).await?;
+        require(
+            replication_slot_confirmed_lsn(&client, &greater_slot).await? < greater_checkpoint_lsn,
+            "greater-LSN fixture did not create a slot behind the checkpoint",
+        )?;
+        let greater_checkpoint = Checkpoint {
+            source_position: SourcePosition::Postgres(PostgresPosition {
+                lsn: greater_checkpoint_lsn,
+                commit_lsn: Some(greater_checkpoint_lsn),
+                transaction_id: None,
+                event_serial: 0,
+                snapshot: false,
+            }),
+            connector_state: Some(refreshed_schema_history),
+            ..checkpoint
+        };
+        let mut greater_config = base_config;
+        greater_config.slot_name = greater_slot.clone();
+        greater_config.offset_mismatch_strategy = PostgresOffsetMismatchStrategy::TrustGreaterLsn;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            greater_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) =
+            start_source(source, Some(greater_checkpoint));
+        wait_for_active_slot(&client, &greater_slot).await?;
+        require(
+            replication_slot_confirmed_lsn(&client, &greater_slot).await? >= greater_checkpoint_lsn,
+            "trust_greater_lsn did not advance a lagging slot",
+        )?;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO public.{table_name} (id, customer, amount, status) \
+                     VALUES (8, 'Hana', 92.30, 'greater')"
+                ),
+                &[],
+            )
+            .await?;
+        require(
+            receive_postgres_create_id(&mut output).await? == 8,
+            "trust_greater_lsn replayed a record before the selected greater LSN",
+        )?;
+        stop_source(cancellation, source_task).await
+    }
+    .await;
+
+    let greater_slot_cleanup = drop_replication_slot(&client, &greater_slot).await;
+    let primary_cleanup = cleanup(&client, &publication, &slot_name, &[&table_name]).await;
+    connection_task.abort();
+    let _ = connection_task.await;
+    capture_result?;
+    greater_slot_cleanup?;
+    primary_cleanup
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4555,6 +4823,47 @@ async fn receive_with_context(
         .map_err(|error| test_error(&format!("{context}: {error}")))
 }
 
+async fn receive_postgres_create(
+    output: &mut mpsc::Receiver<rustium_core::Result<SourceRecord>>,
+) -> TestResult<SourceRecord> {
+    loop {
+        let record = receive(output).await?;
+        let Some(event) = record.event.as_ref() else {
+            require(
+                record.boundary == RecordBoundary::TransactionCommit,
+                "offset strategy fixture emitted an unexpected position-only record",
+            )?;
+            continue;
+        };
+        require(
+            event.operation == Operation::Create,
+            "offset strategy fixture emitted a non-create event",
+        )?;
+        return Ok(record);
+    }
+}
+
+async fn receive_postgres_create_id(
+    output: &mut mpsc::Receiver<rustium_core::Result<SourceRecord>>,
+) -> TestResult<i64> {
+    let record = receive_postgres_create(output).await?;
+    postgres_create_id(&record)
+}
+
+fn postgres_create_id(record: &SourceRecord) -> TestResult<i64> {
+    match record
+        .event
+        .as_ref()
+        .and_then(|event| event.after.as_ref())
+        .and_then(|row| row.get("id"))
+    {
+        Some(DataValue::Int64(id)) => Ok(*id),
+        _ => Err(test_error(
+            "offset strategy fixture create event has no BIGINT id",
+        )),
+    }
+}
+
 async fn wait_for_active_slot(client: &Client, slot_name: &str) -> TestResult {
     for _ in 0..100 {
         let active = client
@@ -4577,7 +4886,7 @@ async fn wait_for_confirmed_flush_lsn(
     slot_name: &str,
     expected_lsn: u64,
 ) -> TestResult {
-    let expected_lsn = format!("{:X}/{:X}", expected_lsn >> 32, expected_lsn as u32);
+    let expected_lsn = format_postgres_lsn(expected_lsn);
     for _ in 0..150 {
         let reached = client
             .query_opt(
@@ -4595,6 +4904,67 @@ async fn wait_for_confirmed_flush_lsn(
     Err(test_error(
         "replication slot confirmed_flush_lsn did not reach the acknowledged LSN within 3 seconds",
     ))
+}
+
+async fn current_wal_lsn(client: &Client) -> TestResult<u64> {
+    let lsn = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await?
+        .get::<_, String>(0);
+    parse_postgres_lsn(&lsn)
+}
+
+async fn replication_slot_confirmed_lsn(client: &Client, slot_name: &str) -> TestResult<u64> {
+    let lsn = client
+        .query_one(
+            "SELECT COALESCE(confirmed_flush_lsn, restart_lsn)::text \
+             FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot_name],
+        )
+        .await?
+        .get::<_, String>(0);
+    parse_postgres_lsn(&lsn)
+}
+
+async fn advance_replication_slot(client: &Client, slot_name: &str, target_lsn: u64) -> TestResult {
+    let target = format_postgres_lsn(target_lsn);
+    let advanced = client
+        .query_one(
+            "SELECT end_lsn::text \
+             FROM pg_replication_slot_advance($1, ($2::text)::pg_lsn)",
+            &[&slot_name, &target],
+        )
+        .await?
+        .get::<_, String>(0);
+    require(
+        parse_postgres_lsn(&advanced)? >= target_lsn,
+        "PostgreSQL did not advance the replication slot to the requested LSN",
+    )
+}
+
+async fn drop_replication_slot(client: &Client, slot_name: &str) -> TestResult {
+    client
+        .execute(
+            "SELECT pg_drop_replication_slot($1) \
+             WHERE EXISTS (\
+                SELECT 1 FROM pg_replication_slots \
+                WHERE slot_name = $1 AND NOT active\
+             )",
+            &[&slot_name],
+        )
+        .await?;
+    Ok(())
+}
+
+fn parse_postgres_lsn(lsn: &str) -> TestResult<u64> {
+    let (high, low) = lsn
+        .split_once('/')
+        .ok_or_else(|| test_error("PostgreSQL returned an invalid LSN"))?;
+    Ok((u64::from_str_radix(high, 16)? << 32) | u64::from_str_radix(low, 16)?)
+}
+
+fn format_postgres_lsn(lsn: u64) -> String {
+    format!("{:X}/{:X}", lsn >> 32, lsn as u32)
 }
 
 async fn wait_for_inactive_slot(client: &Client, slot_name: &str) -> TestResult {

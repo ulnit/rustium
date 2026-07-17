@@ -225,6 +225,15 @@ impl SourceConfig {
                         .expect("source semantic is an object")
                         .insert("slot_failover".into(), true.into());
                 }
+                if config.offset_mismatch_strategy != PostgresOffsetMismatchStrategy::NoValidation {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "offset_mismatch_strategy".into(),
+                            serde_json::json!(config.offset_mismatch_strategy),
+                        );
+                }
                 add_heartbeat_semantics(
                     &mut semantic,
                     config.heartbeat_interval,
@@ -413,6 +422,8 @@ pub struct PostgresSourceConfig {
     #[serde(default)]
     pub slot_ownership: SlotOwnership,
     #[serde(default)]
+    pub offset_mismatch_strategy: PostgresOffsetMismatchStrategy,
+    #[serde(default)]
     pub tables: TableSelection,
     #[serde(default = "default_ssl_mode")]
     pub ssl_mode: String,
@@ -488,6 +499,14 @@ impl PostgresSourceConfig {
         if self.slot_failover && self.slot_ownership == SlotOwnership::External {
             return Err(Error::Configuration(
                 "source.slot_failover can be enabled only for a managed replication slot".into(),
+            ));
+        }
+        if self.slot_ownership == SlotOwnership::External
+            && self.offset_mismatch_strategy.advances_slot()
+        {
+            return Err(Error::Configuration(
+                "source.offset_mismatch_strategy=trust_offset or trust_greater_lsn requires slot_ownership=managed because it can advance the replication slot"
+                    .into(),
             ));
         }
         if self.connect_timeout.is_zero() {
@@ -1223,6 +1242,23 @@ pub enum SlotOwnership {
     #[default]
     Managed,
     External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostgresOffsetMismatchStrategy {
+    #[default]
+    NoValidation,
+    TrustOffset,
+    TrustSlot,
+    TrustGreaterLsn,
+}
+
+impl PostgresOffsetMismatchStrategy {
+    #[must_use]
+    pub const fn advances_slot(self) -> bool {
+        matches!(self, Self::TrustOffset | Self::TrustGreaterLsn)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -2021,6 +2057,10 @@ sink:
             default_postgres_status_update_interval()
         );
         assert!(postgres.tcp_keepalive);
+        assert_eq!(
+            postgres.offset_mismatch_strategy,
+            PostgresOffsetMismatchStrategy::NoValidation
+        );
         let connection_url = Url::parse(&postgres.connection_url(true).unwrap()).unwrap();
         assert!(
             connection_url
@@ -2074,6 +2114,10 @@ sink:
         assert!(
             config.source.semantic_config()["slot_failover"].is_null(),
             "disabled failover slots must preserve the old fingerprint shape"
+        );
+        assert!(
+            config.source.semantic_config()["offset_mismatch_strategy"].is_null(),
+            "no_validation must preserve the old fingerprint shape"
         );
         assert!(
             config.source.semantic_config()["interval_handling_mode"].is_null(),
@@ -2198,6 +2242,42 @@ sink:
         ))
         .unwrap_err();
         assert!(external.to_string().contains("only for a managed"));
+    }
+
+    #[test]
+    fn parses_native_postgresql_offset_mismatch_strategy() {
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  offset_mismatch_strategy: trust_slot\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .offset_mismatch_strategy,
+            PostgresOffsetMismatchStrategy::TrustSlot
+        );
+        assert_eq!(
+            configured.source.semantic_config()["offset_mismatch_strategy"],
+            "trust_slot"
+        );
+        assert_ne!(
+            Config::from_yaml(CONFIG).unwrap().fingerprint(),
+            configured.fingerprint()
+        );
+
+        let external = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  slot_ownership: external\n  offset_mismatch_strategy: trust_offset\n",
+        ))
+        .unwrap_err();
+        assert!(
+            external
+                .to_string()
+                .contains("requires slot_ownership=managed")
+        );
     }
 
     #[test]

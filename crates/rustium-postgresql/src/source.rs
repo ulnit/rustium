@@ -9,13 +9,13 @@ use chrono::{DateTime, Utc};
 use pg_walstream::{
     ChangeEvent as WalEvent, ColumnValue, EventType, LogicalReplicationStream,
     PgReplicationConnection, RelationColumn, ReplicationSlotOptions, ReplicationStreamConfig,
-    RetryConfig, RowData, StreamingMode, parse_lsn,
+    RetryConfig, RowData, StreamingMode, format_lsn, parse_lsn,
     sql_builder::{quote_ident, quote_literal},
 };
 use regex::Regex;
 use rustium_config::{
-    PostgresReplicaIdentity, PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership,
-    SnapshotConfig, SnapshotMode,
+    PostgresOffsetMismatchStrategy, PostgresReplicaIdentity, PostgresSourceConfig,
+    PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode,
 };
 use rustium_core::{
     ChangeEvent, DataValue, Error, EventId, EventSchema, FieldSchema, Operation, PostgresPosition,
@@ -48,6 +48,19 @@ struct ActiveTransaction {
 struct SnapshotOutcome {
     anchor_lsn: u64,
     schemas: HashMap<(String, String), TableSchema>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeSlotDecision {
+    UseCheckpoint,
+    AdvanceSlot,
+    UseSlot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResumeSlotResolution {
+    start_lsn: u64,
+    preserve_checkpoint_position: bool,
 }
 
 pub struct PostgresSource {
@@ -361,6 +374,8 @@ impl SourceConnector for PostgresSource {
 
     async fn run(&mut self, mut context: SourceContext) -> Result<()> {
         let checkpoint = context.initial_checkpoint.clone();
+        let mut resume_slot_resolution = None;
+        let mut resume_state_dirty = false;
         let mut snapshot_needed = match self.snapshot.mode {
             SnapshotMode::Never => false,
             SnapshotMode::Initial | SnapshotMode::WhenNeeded => checkpoint
@@ -400,23 +415,49 @@ impl SourceConnector for PostgresSource {
 
         if snapshot_needed {
             self.prepare_snapshot_slot().await?;
-        } else if checkpoint.is_some() {
-            if let Err(error) = validate_resume_slot(&self.config).await {
-                if self.snapshot.mode == SnapshotMode::WhenNeeded
-                    && matches!(&error, Error::State(_))
-                {
-                    warn!(
-                        connector = %self.connector_name,
-                        %error,
-                        "PostgreSQL checkpoint history is unavailable; taking a recovery snapshot"
-                    );
-                    snapshot_needed = true;
-                    self.schemas.clear();
-                    incremental_progress = None;
-                    completed_signal_ids.clear();
-                    self.prepare_snapshot_slot().await?;
-                } else {
-                    return Err(error);
+        } else if let Some(checkpoint) = checkpoint.as_ref() {
+            let position = match &checkpoint.source_position {
+                SourcePosition::Postgres(position) => position,
+                SourcePosition::MySql(_) | SourcePosition::SqlServer(_) => {
+                    return Err(Error::State(
+                        "PostgreSQL connector cannot resume from a non-PostgreSQL checkpoint"
+                            .into(),
+                    ));
+                }
+            };
+            match resolve_resume_slot(&self.config, position).await {
+                Ok(resolution) => {
+                    if !resolution.preserve_checkpoint_position {
+                        warn!(
+                            connector = %self.connector_name,
+                            checkpoint_lsn = %format_lsn(position.lsn),
+                            start_lsn = %format_lsn(resolution.start_lsn),
+                            strategy = ?self.config.offset_mismatch_strategy,
+                            "PostgreSQL replication slot is authoritative; refreshing schema and discarding active incremental snapshot progress"
+                        );
+                        self.schemas = load_current_schemas(&self.config).await?;
+                        incremental_progress = None;
+                        resume_state_dirty = true;
+                    }
+                    resume_slot_resolution = Some(resolution);
+                }
+                Err(error) => {
+                    if self.snapshot.mode == SnapshotMode::WhenNeeded
+                        && matches!(&error, Error::State(_))
+                    {
+                        warn!(
+                            connector = %self.connector_name,
+                            %error,
+                            "PostgreSQL checkpoint history is unavailable; taking a recovery snapshot"
+                        );
+                        snapshot_needed = true;
+                        self.schemas.clear();
+                        incremental_progress = None;
+                        completed_signal_ids.clear();
+                        self.prepare_snapshot_slot().await?;
+                    } else {
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -444,20 +485,26 @@ impl SourceConnector for PostgresSource {
         let mut stream = LogicalReplicationStream::new(&replication_url, stream_config)
             .await
             .map_err(pg_error)?;
-        let mut start_lsn = match checkpoint.as_ref() {
-            Some(checkpoint) => match &checkpoint.source_position {
+        let mut start_lsn = match (resume_slot_resolution, checkpoint.as_ref()) {
+            (Some(resolution), _) => Some(resolution.start_lsn),
+            (None, Some(checkpoint)) => match &checkpoint.source_position {
                 SourcePosition::Postgres(position) => Some(position.lsn),
                 SourcePosition::MySql(_) | SourcePosition::SqlServer(_) => {
                     return Err(Error::State(
-                        "PostgreSQL connector cannot resume from a MySQL checkpoint".into(),
+                        "PostgreSQL connector cannot resume from a non-PostgreSQL checkpoint"
+                            .into(),
                     ));
                 }
             },
-            None => None,
+            (None, None) => None,
         };
-        let mut resume_position = checkpoint
-            .as_ref()
-            .map(|checkpoint| checkpoint.source_position.clone());
+        let mut resume_position = match (resume_slot_resolution, checkpoint.as_ref()) {
+            (Some(resolution), _) if !resolution.preserve_checkpoint_position => {
+                Some(postgres_streaming_position(resolution.start_lsn))
+            }
+            (_, Some(checkpoint)) => Some(checkpoint.source_position.clone()),
+            (_, None) => None,
+        };
 
         if self.config.slot_ownership == SlotOwnership::Managed {
             stream.ensure_replication_slot().await.map_err(pg_error)?;
@@ -507,6 +554,7 @@ impl SourceConnector for PostgresSource {
             resume_position,
             !snapshot_needed && checkpoint.is_none(),
         );
+        state.schema_dirty |= resume_state_dirty;
         let mut heartbeat = heartbeat_timer(self.config.heartbeat_interval);
         let mut file_signal_poll = file_signal_timer(&self.config);
         let mut heartbeat_connection = open_heartbeat_connection(&self.config).await?;
@@ -1086,15 +1134,21 @@ async fn configure_slot_failover(replication_url: &str, slot_name: &str) -> Resu
     .map_err(|error| Error::Source(format!("failover slot configuration task failed: {error}")))?
 }
 
-async fn validate_resume_slot(config: &PostgresSourceConfig) -> Result<()> {
+async fn resolve_resume_slot(
+    config: &PostgresSourceConfig,
+    checkpoint: &PostgresPosition,
+) -> Result<ResumeSlotResolution> {
     let connection_url = config.connection_url(false)?;
     let slot_name = config.slot_name.clone();
+    let strategy = config.offset_mismatch_strategy;
+    let checkpoint = checkpoint.clone();
     tokio::task::spawn_blocking(move || {
         let mut connection = connect(&connection_url)?;
         let slot = quote_literal(&slot_name).map_err(pg_error)?;
         let result = connection
             .exec(&format!(
-                "SELECT plugin, COALESCE(wal_status, '') \
+                "SELECT plugin, COALESCE(wal_status, ''), \
+                        COALESCE(confirmed_flush_lsn, restart_lsn)::text \
                  FROM pg_replication_slots WHERE slot_name = {slot}"
             ))
             .map_err(pg_error)?;
@@ -1115,10 +1169,95 @@ async fn validate_resume_slot(config: &PostgresSourceConfig) -> Result<()> {
                 "PostgreSQL replication slot {slot_name:?} has wal_status={wal_status:?}; required WAL may be unavailable, so reset the checkpoint and run a new initial snapshot"
             )));
         }
-        Ok(())
+        let slot_lsn = parse_lsn(&required_value(&result, 0, 2, "slot LSN")?)
+            .map_err(pg_error)?;
+        let checkpoint_lsn = checkpoint.commit_lsn.unwrap_or(checkpoint.lsn);
+        match resume_slot_decision(checkpoint_lsn, slot_lsn, strategy)? {
+            ResumeSlotDecision::UseCheckpoint => Ok(ResumeSlotResolution {
+                start_lsn: checkpoint.lsn,
+                preserve_checkpoint_position: true,
+            }),
+            ResumeSlotDecision::UseSlot => Ok(ResumeSlotResolution {
+                start_lsn: slot_lsn,
+                preserve_checkpoint_position: false,
+            }),
+            ResumeSlotDecision::AdvanceSlot => {
+                if checkpoint.transaction_id.is_some() && checkpoint.commit_lsn.is_none() {
+                    return Err(Error::State(format!(
+                        "PostgreSQL checkpoint {} is inside transaction {:?}; offset.mismatch.strategy={strategy:?} cannot safely advance slot {slot_name:?} to a mid-transaction position; use no_validation or resume through the transaction before enabling slot advancement",
+                        format_lsn(checkpoint.lsn),
+                        checkpoint.transaction_id,
+                    )));
+                }
+                let target = quote_literal(&format_lsn(checkpoint_lsn)).map_err(pg_error)?;
+                let advanced = scalar(
+                    &mut connection,
+                    &format!(
+                        "SELECT end_lsn::text FROM pg_replication_slot_advance({slot}, {target})"
+                    ),
+                )?;
+                let advanced_lsn = parse_lsn(&advanced).map_err(pg_error)?;
+                if advanced_lsn < checkpoint_lsn {
+                    return Err(Error::State(format!(
+                        "PostgreSQL replication slot {slot_name:?} advanced only to {}, before checkpoint {}; required WAL alignment is unavailable",
+                        format_lsn(advanced_lsn),
+                        format_lsn(checkpoint_lsn),
+                    )));
+                }
+                Ok(ResumeSlotResolution {
+                    start_lsn: if advanced_lsn == checkpoint_lsn {
+                        checkpoint.lsn
+                    } else {
+                        advanced_lsn
+                    },
+                    preserve_checkpoint_position: advanced_lsn == checkpoint_lsn,
+                })
+            }
+        }
     })
     .await
     .map_err(|error| Error::Source(format!("slot continuity task failed: {error}")))?
+}
+
+fn resume_slot_decision(
+    checkpoint_lsn: u64,
+    slot_lsn: u64,
+    strategy: PostgresOffsetMismatchStrategy,
+) -> Result<ResumeSlotDecision> {
+    use PostgresOffsetMismatchStrategy::{NoValidation, TrustGreaterLsn, TrustOffset, TrustSlot};
+
+    if checkpoint_lsn == slot_lsn || strategy == NoValidation {
+        return Ok(ResumeSlotDecision::UseCheckpoint);
+    }
+    if checkpoint_lsn > slot_lsn {
+        return Ok(match strategy {
+            TrustOffset | TrustGreaterLsn => ResumeSlotDecision::AdvanceSlot,
+            TrustSlot => ResumeSlotDecision::UseCheckpoint,
+            NoValidation => unreachable!("no_validation returned above"),
+        });
+    }
+    match strategy {
+        TrustOffset => Err(Error::State(format!(
+            "PostgreSQL replication slot is at {}, ahead of checkpoint {}; offset.mismatch.strategy=trust_offset treats the checkpoint as authoritative and refuses to skip source history; reset/resnapshot or choose trust_slot/trust_greater_lsn explicitly",
+            format_lsn(slot_lsn),
+            format_lsn(checkpoint_lsn),
+        ))),
+        TrustSlot | TrustGreaterLsn => Ok(ResumeSlotDecision::UseSlot),
+        NoValidation => unreachable!("no_validation returned above"),
+    }
+}
+
+async fn load_current_schemas(
+    config: &PostgresSourceConfig,
+) -> Result<HashMap<(String, String), TableSchema>> {
+    let connection_url = config.connection_url(false)?;
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut connection = connect(&connection_url)?;
+        discover_tables(&mut connection, &config)
+    })
+    .await
+    .map_err(|error| Error::Source(format!("schema refresh task failed: {error}")))?
 }
 
 async fn execute_heartbeat_action(
@@ -3295,6 +3434,49 @@ sink:
     }
 
     #[test]
+    fn resolves_debezium_offset_mismatch_strategies() {
+        use PostgresOffsetMismatchStrategy::{
+            NoValidation, TrustGreaterLsn, TrustOffset, TrustSlot,
+        };
+
+        assert_eq!(
+            resume_slot_decision(200, 100, NoValidation).unwrap(),
+            ResumeSlotDecision::UseCheckpoint
+        );
+        assert_eq!(
+            resume_slot_decision(100, 200, NoValidation).unwrap(),
+            ResumeSlotDecision::UseCheckpoint
+        );
+        assert_eq!(
+            resume_slot_decision(200, 100, TrustOffset).unwrap(),
+            ResumeSlotDecision::AdvanceSlot
+        );
+        assert!(resume_slot_decision(100, 200, TrustOffset).is_err());
+        assert_eq!(
+            resume_slot_decision(200, 100, TrustSlot).unwrap(),
+            ResumeSlotDecision::UseCheckpoint
+        );
+        assert_eq!(
+            resume_slot_decision(100, 200, TrustSlot).unwrap(),
+            ResumeSlotDecision::UseSlot
+        );
+        assert_eq!(
+            resume_slot_decision(200, 100, TrustGreaterLsn).unwrap(),
+            ResumeSlotDecision::AdvanceSlot
+        );
+        assert_eq!(
+            resume_slot_decision(100, 200, TrustGreaterLsn).unwrap(),
+            ResumeSlotDecision::UseSlot
+        );
+        for strategy in [NoValidation, TrustOffset, TrustSlot, TrustGreaterLsn] {
+            assert_eq!(
+                resume_slot_decision(100, 100, strategy).unwrap(),
+                ResumeSlotDecision::UseCheckpoint
+            );
+        }
+    }
+
+    #[test]
     fn converts_postgres_scalar_types() {
         assert_eq!(convert_text("42", "integer"), DataValue::Int32(42));
         assert_eq!(convert_text("t", "boolean"), DataValue::Boolean(true));
@@ -3642,6 +3824,7 @@ sink:
             slot_name: "orders_slot".into(),
             slot_failover: false,
             slot_ownership: SlotOwnership::Managed,
+            offset_mismatch_strategy: PostgresOffsetMismatchStrategy::NoValidation,
             tables: TableSelection::default(),
             ssl_mode: "disable".into(),
             connect_timeout: Duration::from_secs(1),
