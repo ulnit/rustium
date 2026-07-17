@@ -148,13 +148,16 @@
           "type": "string"
         },
         "source": {
-          "additionalProperties": true,
+          "additionalProperties": false,
           "properties": {
             "connector": {
               "type": "string"
             },
             "db": {
               "type": "string"
+            },
+            "lsn": {
+              "type": "integer"
             },
             "name": {
               "type": "string"
@@ -164,6 +167,9 @@
                 "string",
                 "null"
               ]
+            },
+            "sequence": {
+              "type": "string"
             },
             "snapshot": {
               "type": "string"
@@ -180,8 +186,20 @@
                 "null"
               ]
             },
+            "txId": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "version": {
               "type": "string"
+            },
+            "xmin": {
+              "type": [
+                "integer",
+                "null"
+              ]
             }
           },
           "required": [
@@ -192,7 +210,11 @@
             "snapshot",
             "db",
             "schema",
-            "table"
+            "table",
+            "sequence",
+            "txId",
+            "lsn",
+            "xmin"
           ],
           "type": "object"
         },

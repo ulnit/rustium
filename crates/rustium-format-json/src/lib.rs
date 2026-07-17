@@ -304,6 +304,7 @@ fn debezium_source(event: &ChangeEvent, source_ts: Option<i64>) -> Result<serde_
             );
             source.insert("txId".into(), position.transaction_id.into());
             source.insert("lsn".into(), position.lsn.into());
+            source.insert("xmin".into(), position.xmin.into());
         }
         SourcePosition::MySql(position) => {
             source.insert("server_id".into(), position.server_id.into());
@@ -337,6 +338,70 @@ fn snapshot_marker(event: &ChangeEvent) -> &'static str {
     } else {
         "false"
     }
+}
+
+fn json_source_schema(event: &ChangeEvent) -> serde_json::Value {
+    let mut properties = serde_json::Map::from_iter([
+        ("version".into(), serde_json::json!({"type": "string"})),
+        ("connector".into(), serde_json::json!({"type": "string"})),
+        ("name".into(), serde_json::json!({"type": "string"})),
+        (
+            "ts_ms".into(),
+            serde_json::json!({"type": ["integer", "null"]}),
+        ),
+        ("snapshot".into(), serde_json::json!({"type": "string"})),
+        ("db".into(), serde_json::json!({"type": "string"})),
+        (
+            "schema".into(),
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+        (
+            "table".into(),
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+    ]);
+    let mut required = vec![
+        "version",
+        "connector",
+        "name",
+        "ts_ms",
+        "snapshot",
+        "db",
+        "schema",
+        "table",
+    ];
+    let connector_fields: Vec<(&str, serde_json::Value)> = match &event.position {
+        SourcePosition::Postgres(_) => vec![
+            ("sequence", serde_json::json!({"type": "string"})),
+            ("txId", serde_json::json!({"type": ["integer", "null"]})),
+            ("lsn", serde_json::json!({"type": "integer"})),
+            ("xmin", serde_json::json!({"type": ["integer", "null"]})),
+        ],
+        SourcePosition::MySql(_) => vec![
+            ("server_id", serde_json::json!({"type": "integer"})),
+            ("gtid", serde_json::json!({"type": ["string", "null"]})),
+            ("file", serde_json::json!({"type": "string"})),
+            ("pos", serde_json::json!({"type": "integer"})),
+            ("row", serde_json::json!({"type": "integer"})),
+            ("thread", serde_json::json!({"type": ["integer", "null"]})),
+            ("query", serde_json::json!({"type": ["string", "null"]})),
+        ],
+        SourcePosition::SqlServer(_) => vec![
+            ("change_lsn", serde_json::json!({"type": "string"})),
+            ("commit_lsn", serde_json::json!({"type": "string"})),
+            ("event_serial_no", serde_json::json!({"type": "integer"})),
+        ],
+    };
+    for (name, schema) in connector_fields {
+        properties.insert(name.into(), schema);
+        required.push(name);
+    }
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+        "required": required,
+    })
 }
 
 fn event_key(row: &Row, event: &ChangeEvent, unavailable_value: &str) -> Option<serde_json::Value> {
@@ -421,6 +486,7 @@ fn json_payload_schema(
     destination: &str,
     config: &JsonEncoderConfig,
 ) -> Result<WireSchema> {
+    let source_schema = json_source_schema(event);
     let definition = if is_heartbeat(event) {
         serde_json::json!({
             "$schema": "http://json-schema.org/draft-07/schema#",
@@ -439,21 +505,7 @@ fn json_payload_schema(
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "source": {
-                    "type": "object",
-                    "additionalProperties": true,
-                    "properties": {
-                        "version": {"type": "string"},
-                        "connector": {"type": "string"},
-                        "name": {"type": "string"},
-                        "ts_ms": {"type": ["integer", "null"]},
-                        "snapshot": {"type": "string"},
-                        "db": {"type": "string"},
-                        "schema": {"type": ["string", "null"]},
-                        "table": {"type": ["string", "null"]}
-                    },
-                    "required": ["version", "connector", "name", "ts_ms", "snapshot", "db", "schema", "table"]
-                },
+                "source": source_schema.clone(),
                 "op": {"type": "string", "enum": ["m"]},
                 "ts_ms": {"type": "integer"},
                 "transaction": {
@@ -486,21 +538,7 @@ fn json_payload_schema(
             "properties": {
                 "before": {"anyOf": [{"type": "null"}, row_schema.clone()]},
                 "after": {"anyOf": [{"type": "null"}, row_schema]},
-                "source": {
-                    "type": "object",
-                    "additionalProperties": true,
-                    "properties": {
-                        "version": {"type": "string"},
-                        "connector": {"type": "string"},
-                        "name": {"type": "string"},
-                        "ts_ms": {"type": ["integer", "null"]},
-                        "snapshot": {"type": "string"},
-                        "db": {"type": "string"},
-                        "schema": {"type": ["string", "null"]},
-                        "table": {"type": ["string", "null"]}
-                    },
-                    "required": ["version", "connector", "name", "ts_ms", "snapshot", "db", "schema", "table"]
-                },
+                "source": source_schema,
                 "op": {"type": "string", "enum": ["r", "c", "u", "d", "t", "m"]},
                 "ts_ms": {"type": "integer"},
                 "transaction": {
@@ -685,6 +723,7 @@ mod tests {
                 lsn: 42,
                 commit_lsn: Some(44),
                 transaction_id: Some(7),
+                xmin: Some(9),
                 event_serial: 1,
                 snapshot: false,
             }),
@@ -752,6 +791,7 @@ mod tests {
             lsn: 64,
             commit_lsn: Some(64),
             transaction_id: None,
+            xmin: None,
             event_serial: 1,
             snapshot: false,
         });
@@ -947,6 +987,7 @@ mod tests {
         assert_eq!(value["after"]["name"], "Alice");
         assert_eq!(value["after"]["attributes"]["region"], "global");
         assert!(value["after"]["attributes"]["optional"].is_null());
+        assert_eq!(value["source"]["xmin"], 9);
         assert!(encoded.key.is_some());
     }
 

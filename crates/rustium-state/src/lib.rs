@@ -181,6 +181,7 @@ mod tests {
                 lsn: 42,
                 commit_lsn: Some(42),
                 transaction_id: Some(7),
+                xmin: Some(9),
                 event_serial: 1,
                 snapshot: false,
             }),
@@ -234,6 +235,7 @@ mod tests {
                 lsn: 7,
                 commit_lsn: Some(7),
                 transaction_id: None,
+                xmin: None,
                 event_serial: 1,
                 snapshot: false,
             }),
@@ -244,8 +246,13 @@ mod tests {
         };
         let serialized = serde_json::to_value(&checkpoint).unwrap();
         assert!(serialized.get("connector_state").is_none());
+        assert!(serialized["source_position"].get("xmin").is_none());
 
         let loaded: Checkpoint = serde_json::from_value(serialized).unwrap();
         assert_eq!(loaded.connector_state, None);
+        let SourcePosition::Postgres(position) = loaded.source_position else {
+            panic!("legacy checkpoint changed connector type");
+        };
+        assert_eq!(position.xmin, None);
     }
 }

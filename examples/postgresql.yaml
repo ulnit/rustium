@@ -32,6 +32,7 @@ source:
   snapshot_isolation_mode: serializable
   snapshot_locking_mode: none
   snapshot_lock_timeout: 10s
+  xmin_fetch_interval: 0ms
   tables:
     include:
       - public\.(orders|customers)

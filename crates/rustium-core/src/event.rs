@@ -129,6 +129,8 @@ pub struct PostgresPosition {
     pub lsn: u64,
     pub commit_lsn: Option<u64>,
     pub transaction_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xmin: Option<u32>,
     pub event_serial: u64,
     pub snapshot: bool,
 }

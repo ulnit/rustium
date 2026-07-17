@@ -91,6 +91,7 @@ impl TestSettings {
             snapshot_locking_mode: PostgresSnapshotLockingMode::None,
             snapshot_lock_timeout: Duration::from_secs(10),
             snapshot_isolation_mode: PostgresSnapshotIsolationMode::Serializable,
+            xmin_fetch_interval: Duration::ZERO,
             tables: TableSelection {
                 include: vec![format!(r"public\.{table_name}")],
                 exclude: Vec::new(),
@@ -2830,6 +2831,152 @@ async fn advances_confirmed_flush_lsn_on_the_configured_feedback_interval() -> T
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires external PostgreSQL logical replication"]
+async fn emits_debezium_slot_xmin_when_tracking_is_enabled() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_xmin_{}", &suffix[..12]);
+    let publication = format!("rustium_pg_xmin_pub_{}", &suffix[..12]);
+    let enabled_slot = format!("rustium_pg_xmin_on_{}", &suffix[..12]);
+    let disabled_slot = format!("rustium_pg_xmin_off_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-xmin-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (id BIGINT PRIMARY KEY, note TEXT NOT NULL); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+
+        let mut enabled_config = settings.source_config(&publication, &enabled_slot, &table_name);
+        enabled_config.xmin_fetch_interval = Duration::from_secs(60);
+        let mut enabled_source = PostgresSource::new(
+            format!("{connector_name}-enabled"),
+            enabled_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                ..SnapshotConfig::default()
+            },
+        );
+        enabled_source.validate().await?;
+        let (mut enabled_output, enabled_cancellation, enabled_task) =
+            start_source(enabled_source, None);
+        let enabled_result: TestResult = async {
+            wait_for_active_slot(&client, &enabled_slot).await?;
+            let mut observed_xmin = None;
+            for id in [1_i64, 2] {
+                client
+                    .execute(
+                        &format!("INSERT INTO public.{table_name} VALUES ($1, $2)"),
+                        &[&id, &format!("enabled-{id}")],
+                    )
+                    .await?;
+                loop {
+                    let record = receive(&mut enabled_output).await?;
+                    let Some(event) = record.event else {
+                        continue;
+                    };
+                    if event.source.table.as_deref() != Some(table_name.as_str())
+                        || event.after.as_ref().and_then(|row| row.get("id"))
+                            != Some(&DataValue::Int64(id))
+                    {
+                        continue;
+                    }
+                    let SourcePosition::Postgres(position) = &event.position else {
+                        return Err(test_error("xmin fixture emitted a non-PostgreSQL position"));
+                    };
+                    let xmin = position.xmin.ok_or_else(|| {
+                        test_error("xmin.fetch.interval.ms did not expose slot catalog_xmin")
+                    })?;
+                    require(xmin > 0, "slot catalog_xmin must be positive")?;
+                    if let Some(previous) = observed_xmin {
+                        require(
+                            xmin == previous,
+                            "xmin tracker did not reuse the cached value inside its interval",
+                        )?;
+                    }
+                    observed_xmin = Some(xmin);
+                    break;
+                }
+            }
+            let catalog_xmin = client
+                .query_one(
+                    "SELECT catalog_xmin::text FROM pg_replication_slots WHERE slot_name = $1",
+                    &[&enabled_slot],
+                )
+                .await?
+                .get::<_, Option<String>>(0)
+                .ok_or_else(|| test_error("enabled logical slot has no catalog_xmin"))?
+                .parse::<u32>()?;
+            require(
+                catalog_xmin > 0 && observed_xmin.is_some(),
+                "xmin event metadata did not originate from a live logical slot",
+            )
+        }
+        .await;
+        let enabled_stop = stop_source(enabled_cancellation, enabled_task).await;
+        combine_capture_and_stop(enabled_result, enabled_stop)?;
+
+        let disabled_config = settings.source_config(&publication, &disabled_slot, &table_name);
+        let mut disabled_source = PostgresSource::new(
+            format!("{connector_name}-disabled"),
+            disabled_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                ..SnapshotConfig::default()
+            },
+        );
+        disabled_source.validate().await?;
+        let (mut disabled_output, disabled_cancellation, disabled_task) =
+            start_source(disabled_source, None);
+        let disabled_result: TestResult = async {
+            wait_for_active_slot(&client, &disabled_slot).await?;
+            client
+                .execute(
+                    &format!("INSERT INTO public.{table_name} VALUES (3, 'disabled')"),
+                    &[],
+                )
+                .await?;
+            loop {
+                let record = receive(&mut disabled_output).await?;
+                let Some(event) = record.event else {
+                    continue;
+                };
+                if event.source.table.as_deref() != Some(table_name.as_str())
+                    || event.after.as_ref().and_then(|row| row.get("id"))
+                        != Some(&DataValue::Int64(3))
+                {
+                    continue;
+                }
+                let SourcePosition::Postgres(position) = &event.position else {
+                    return Err(test_error("xmin fixture emitted a non-PostgreSQL position"));
+                };
+                require(
+                    position.xmin.is_none(),
+                    "the zero xmin fetch interval unexpectedly exposed xmin",
+                )?;
+                break;
+            }
+            Ok(())
+        }
+        .await;
+        let disabled_stop = stop_source(disabled_cancellation, disabled_task).await;
+        combine_capture_and_stop(disabled_result, disabled_stop)
+    }
+    .await;
+
+    let cleanup_result = cleanup(&client, &publication, &enabled_slot, &[&table_name]).await;
+    let disabled_cleanup = drop_replication_slot(&client, &disabled_slot).await;
+    connection_task.abort();
+    let _ = connection_task.await;
+    outcome?;
+    cleanup_result?;
+    disabled_cleanup
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires external PostgreSQL logical replication"]
 async fn reconciles_debezium_checkpoint_slot_mismatch_strategies() -> TestResult {
     let settings = TestSettings::from_env()?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -3042,6 +3189,7 @@ async fn reconciles_debezium_checkpoint_slot_mismatch_strategies() -> TestResult
                 lsn: greater_checkpoint_lsn,
                 commit_lsn: Some(greater_checkpoint_lsn),
                 transaction_id: None,
+                xmin: None,
                 event_serial: 0,
                 snapshot: false,
             }),

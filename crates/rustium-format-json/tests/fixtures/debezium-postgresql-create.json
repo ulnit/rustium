@@ -25,7 +25,8 @@
       "table": "customers",
       "ts_ms": 1700000000123,
       "txId": 7,
-      "version": "0.1.0"
+      "version": "0.1.0",
+      "xmin": 9
     },
     "transaction": {
       "data_collection_order": 1,

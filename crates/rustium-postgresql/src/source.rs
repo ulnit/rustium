@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -54,6 +54,14 @@ struct ActiveTransaction {
 struct SnapshotOutcome {
     anchor_lsn: u64,
     schemas: HashMap<(String, String), TableSchema>,
+}
+
+struct SlotXminTracker {
+    connection: Option<PgReplicationConnection>,
+    query: String,
+    interval: Duration,
+    last_fetch: Option<Instant>,
+    last_xmin: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +345,7 @@ impl PostgresSource {
                         lsn: anchor_lsn,
                         commit_lsn: Some(anchor_lsn),
                         transaction_id: None,
+                        xmin: None,
                         event_serial: ordinal,
                         snapshot: true,
                     }),
@@ -804,6 +813,7 @@ impl SourceConnector for PostgresSource {
         let mut heartbeat = heartbeat_timer(self.config.heartbeat_interval);
         let mut file_signal_poll = file_signal_timer(&self.config);
         let mut heartbeat_connection = open_heartbeat_connection(&self.config).await?;
+        let mut xmin_tracker = SlotXminTracker::open(&self.config).await?;
         let mut incremental =
             IncrementalSnapshotController::new(incremental_progress, completed_signal_ids);
         incremental.resume(&self.config, &state.schemas).await?;
@@ -817,6 +827,7 @@ impl SourceConnector for PostgresSource {
             tcp_keepalive = self.config.tcp_keepalive,
             drop_slot_on_stop = self.config.drop_slot_on_stop,
             lsn_flush_mode = ?self.config.lsn_flush_mode,
+            xmin_fetch_interval_ms = self.config.xmin_fetch_interval.as_millis(),
             schema_refresh_mode = ?self.config.schema_refresh_mode,
             "PostgreSQL streaming started"
         );
@@ -1101,10 +1112,15 @@ impl SourceConnector for PostgresSource {
                         }
                         continue;
                     }
+                    let xmin = match &mut xmin_tracker {
+                        Some(tracker) => tracker.current().await?,
+                        None => None,
+                    };
                     if let Some(mut record) = state.convert(
                         event,
                         &self.connector_name,
                         &self.config,
+                        xmin,
                     )? {
                         if let Some(event) = &record.event {
                             incremental.deduplicate(event);
@@ -1308,6 +1324,72 @@ async fn open_heartbeat_connection(
             ))
         })??;
     Ok(Some(connection))
+}
+
+impl SlotXminTracker {
+    async fn open(config: &PostgresSourceConfig) -> Result<Option<Self>> {
+        if config.xmin_fetch_interval.is_zero() {
+            return Ok(None);
+        }
+        let slot = quote_literal(&config.slot_name).map_err(pg_error)?;
+        let connection_config = config.clone();
+        let connection = tokio::task::spawn_blocking(move || connect_regular(&connection_config))
+            .await
+            .map_err(|error| {
+                Error::Source(format!("PostgreSQL xmin connection task failed: {error}"))
+            })??;
+        Ok(Some(Self {
+            connection: Some(connection),
+            query: format!(
+                "SELECT catalog_xmin::text FROM pg_replication_slots WHERE slot_name = {slot}"
+            ),
+            interval: config.xmin_fetch_interval,
+            last_fetch: None,
+            last_xmin: None,
+        }))
+    }
+
+    async fn current(&mut self) -> Result<Option<u32>> {
+        if self.last_xmin.is_some()
+            && self
+                .last_fetch
+                .is_some_and(|last_fetch| last_fetch.elapsed() < self.interval)
+        {
+            return Ok(self.last_xmin);
+        }
+
+        let mut connection = self
+            .connection
+            .take()
+            .ok_or_else(|| Error::Source("PostgreSQL xmin connection is unavailable".into()))?;
+        let query = self.query.clone();
+        let (connection, result) = tokio::task::spawn_blocking(move || {
+            let result = connection.exec(&query).map_err(pg_error).and_then(|result| {
+                if result.ntuples() == 0 {
+                    return Ok(None);
+                }
+                result
+                    .get_value(0, 0)
+                    .map(|value| {
+                        value.parse::<u32>().map_err(|error| {
+                            Error::Source(format!(
+                                "invalid PostgreSQL replication slot catalog_xmin {value:?}: {error}"
+                            ))
+                        })
+                    })
+                    .transpose()
+            });
+            (connection, result)
+        })
+        .await
+        .map_err(|error| Error::Source(format!("PostgreSQL xmin query task failed: {error}")))?;
+        self.connection = Some(connection);
+        let xmin = result?;
+        self.last_xmin = xmin;
+        self.last_fetch = Some(Instant::now());
+        debug!(?xmin, "PostgreSQL replication slot catalog_xmin refreshed");
+        Ok(xmin)
+    }
 }
 
 async fn stop_stream_on_orderly_shutdown(
@@ -1590,6 +1672,7 @@ fn postgres_streaming_position(lsn: u64) -> SourcePosition {
         lsn,
         commit_lsn: Some(lsn),
         transaction_id: None,
+        xmin: None,
         event_serial: 0,
         snapshot: false,
     })
@@ -1655,6 +1738,7 @@ struct StreamingState {
     schemas: HashMap<(String, String), TableSchema>,
     schema_dirty: bool,
     transaction: Option<ActiveTransaction>,
+    xmin: Option<u32>,
     previous_lsn: Option<u64>,
     event_serial: u64,
     resume_position: Option<SourcePosition>,
@@ -1670,6 +1754,7 @@ impl StreamingState {
             schemas,
             schema_dirty,
             transaction: None,
+            xmin: None,
             previous_lsn: None,
             event_serial: 0,
             resume_position,
@@ -1681,7 +1766,9 @@ impl StreamingState {
         wal: WalEvent,
         connector_name: &str,
         config: &PostgresSourceConfig,
+        xmin: Option<u32>,
     ) -> Result<Option<SourceRecord>> {
+        self.xmin = xmin;
         let lsn = wal.lsn.value();
         match wal.event_type {
             EventType::Begin {
@@ -1873,6 +1960,7 @@ impl StreamingState {
                     lsn,
                     commit_lsn: None,
                     transaction_id: None,
+                    xmin: None,
                     event_serial,
                     snapshot: true,
                 });
@@ -1954,6 +2042,7 @@ impl StreamingState {
             lsn,
             commit_lsn: None,
             transaction_id,
+            xmin: self.xmin,
             event_serial,
             snapshot: false,
         });
@@ -2044,6 +2133,7 @@ impl StreamingState {
             lsn,
             commit_lsn: (!transactional).then_some(lsn),
             transaction_id,
+            xmin: self.xmin,
             event_serial,
             snapshot: false,
         });
@@ -2151,6 +2241,7 @@ impl StreamingState {
             lsn: end_lsn,
             commit_lsn: Some(commit_lsn.max(end_lsn)),
             transaction_id,
+            xmin: self.xmin,
             event_serial,
             snapshot: false,
         });
@@ -2328,6 +2419,7 @@ fn snapshot_table(
                 lsn: anchor_lsn,
                 commit_lsn: Some(anchor_lsn),
                 transaction_id: None,
+                xmin: None,
                 event_serial: *ordinal,
                 snapshot: true,
             });
@@ -3985,6 +4077,7 @@ sink:
                 lsn: 100,
                 commit_lsn: Some(100),
                 transaction_id: None,
+                xmin: None,
                 event_serial: 1,
                 snapshot: false,
             })
@@ -4047,6 +4140,7 @@ sink:
                 lsn: 102,
                 commit_lsn: None,
                 transaction_id: Some(42),
+                xmin: None,
                 event_serial: 1,
                 snapshot: false,
             })
@@ -4767,6 +4861,7 @@ sink:
             snapshot_locking_mode: PostgresSnapshotLockingMode::None,
             snapshot_lock_timeout: Duration::from_secs(10),
             snapshot_isolation_mode: PostgresSnapshotIsolationMode::Serializable,
+            xmin_fetch_interval: Duration::ZERO,
             tables: TableSelection::default(),
             ssl_mode: "disable".into(),
             ssl_root_cert: None,
@@ -4814,6 +4909,7 @@ sink:
             lsn: 128,
             commit_lsn: Some(128),
             transaction_id: None,
+            xmin: None,
             event_serial: 1,
             snapshot: false,
         });

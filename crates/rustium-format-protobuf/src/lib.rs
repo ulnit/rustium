@@ -563,6 +563,7 @@ fn push_source_schema(output: &mut String, event: &ChangeEvent, indent: usize) {
             "string sequence = 20;",
             "optional uint32 txId = 21;",
             "uint64 lsn = 22;",
+            "optional int64 xmin = 23;",
         ],
         SourcePosition::MySql(_) => &[
             "uint32 server_id = 20;",
@@ -1115,6 +1116,9 @@ fn build_source_message(
                 set_field(&mut source, "txId", ProtoValue::U32(transaction_id))?;
             }
             set_field(&mut source, "lsn", ProtoValue::U64(position.lsn))?;
+            if let Some(xmin) = position.xmin {
+                set_field(&mut source, "xmin", ProtoValue::I64(i64::from(xmin)))?;
+            }
         }
         SourcePosition::MySql(position) => {
             set_field(
@@ -1436,6 +1440,7 @@ mod tests {
             lsn: 64,
             commit_lsn: Some(64),
             transaction_id: None,
+            xmin: None,
             event_serial: 1,
             snapshot: false,
         });
@@ -1468,6 +1473,7 @@ mod tests {
             lsn: 42,
             commit_lsn: Some(44),
             transaction_id: Some(7),
+            xmin: Some(9),
             event_serial: 1,
             snapshot: false,
         });
@@ -1799,6 +1805,7 @@ mod tests {
             lsn: 42,
             commit_lsn: Some(44),
             transaction_id: Some(7),
+            xmin: Some(9),
             event_serial: 1,
             snapshot: false,
         });
@@ -1811,6 +1818,10 @@ mod tests {
         assert_eq!(
             source.get_field_by_name("lsn").unwrap().as_ref(),
             &ProtoValue::U64(42)
+        );
+        assert_eq!(
+            source.get_field_by_name("xmin").unwrap().as_ref(),
+            &ProtoValue::I64(9)
         );
 
         let mut sqlserver = postgres.clone();

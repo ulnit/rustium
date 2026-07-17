@@ -148,7 +148,7 @@
           "type": "string"
         },
         "source": {
-          "additionalProperties": true,
+          "additionalProperties": false,
           "properties": {
             "connector": {
               "type": "string"
@@ -156,8 +156,29 @@
             "db": {
               "type": "string"
             },
+            "file": {
+              "type": "string"
+            },
+            "gtid": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "name": {
               "type": "string"
+            },
+            "pos": {
+              "type": "integer"
+            },
+            "query": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "row": {
+              "type": "integer"
             },
             "schema": {
               "type": [
@@ -165,12 +186,21 @@
                 "null"
               ]
             },
+            "server_id": {
+              "type": "integer"
+            },
             "snapshot": {
               "type": "string"
             },
             "table": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "thread": {
+              "type": [
+                "integer",
                 "null"
               ]
             },
@@ -192,7 +222,14 @@
             "snapshot",
             "db",
             "schema",
-            "table"
+            "table",
+            "server_id",
+            "gtid",
+            "file",
+            "pos",
+            "row",
+            "thread",
+            "query"
           ],
           "type": "object"
         },

@@ -469,6 +469,7 @@ fn source_schema(event: &ChangeEvent, namespace: &str) -> serde_json::Value {
             serde_json::json!({"name": "sequence", "type": "string"}),
             serde_json::json!({"name": "txId", "type": ["null", "long"], "default": null}),
             serde_json::json!({"name": "lsn", "type": "long"}),
+            serde_json::json!({"name": "xmin", "type": ["null", "long"], "default": null}),
         ]),
         SourcePosition::MySql(_) => fields.extend([
             serde_json::json!({"name": "server_id", "type": "long"}),
@@ -789,6 +790,12 @@ fn source_value(event: &ChangeEvent) -> Result<Value> {
                         .map_or(Value::Null, |value| Value::Long(i64::from(value))),
                 ),
                 ("lsn".into(), Value::Long(u64_to_i64(position.lsn, "lsn")?)),
+                (
+                    "xmin".into(),
+                    position
+                        .xmin
+                        .map_or(Value::Null, |value| Value::Long(i64::from(value))),
+                ),
             ]);
         }
         SourcePosition::MySql(position) => {
@@ -1103,6 +1110,7 @@ mod tests {
             lsn: 64,
             commit_lsn: Some(64),
             transaction_id: None,
+            xmin: None,
             event_serial: 1,
             snapshot: false,
         });
@@ -1145,6 +1153,7 @@ mod tests {
             lsn: 42,
             commit_lsn: Some(44),
             transaction_id: Some(7),
+            xmin: Some(9),
             event_serial: 1,
             snapshot: false,
         });
@@ -1411,6 +1420,7 @@ mod tests {
             lsn: 42,
             commit_lsn: Some(44),
             transaction_id: Some(7),
+            xmin: Some(9),
             event_serial: 1,
             snapshot: false,
         });
@@ -1422,6 +1432,7 @@ mod tests {
         let source = field(&payload, "source");
         assert_eq!(field(source, "lsn"), &Value::Long(42));
         assert_eq!(union(field(source, "txId")), &Value::Long(7));
+        assert_eq!(union(field(source, "xmin")), &Value::Long(9));
 
         let mut sqlserver = postgres.clone();
         sqlserver.source.connector = "sqlserver".into();

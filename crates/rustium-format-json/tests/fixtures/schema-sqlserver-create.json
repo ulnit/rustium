@@ -148,13 +148,22 @@
           "type": "string"
         },
         "source": {
-          "additionalProperties": true,
+          "additionalProperties": false,
           "properties": {
+            "change_lsn": {
+              "type": "string"
+            },
+            "commit_lsn": {
+              "type": "string"
+            },
             "connector": {
               "type": "string"
             },
             "db": {
               "type": "string"
+            },
+            "event_serial_no": {
+              "type": "integer"
             },
             "name": {
               "type": "string"
@@ -192,7 +201,10 @@
             "snapshot",
             "db",
             "schema",
-            "table"
+            "table",
+            "change_lsn",
+            "commit_lsn",
+            "event_serial_no"
           ],
           "type": "object"
         },

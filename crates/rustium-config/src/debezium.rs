@@ -189,6 +189,11 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                     .get("snapshot.isolation.mode")
                     .map_or("serializable", String::as_str),
             )?,
+            xmin_fetch_interval: duration_ms(
+                &properties,
+                "xmin.fetch.interval.ms",
+                Duration::ZERO,
+            )?,
             tables: TableSelection { include, exclude },
             ssl_mode: properties
                 .get("database.sslmode")
@@ -2171,6 +2176,67 @@ lsn.flush.mode=automatic
         )
         .unwrap_err();
         assert!(invalid.to_string().contains("lsn.flush.mode"));
+    }
+
+    #[test]
+    fn maps_postgres_xmin_fetch_interval() {
+        let configured = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+xmin.fetch.interval.ms=25
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .xmin_fetch_interval,
+            Duration::from_millis(25)
+        );
+
+        let defaulted = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+"#,
+        )
+        .unwrap();
+        assert!(
+            defaulted
+                .source
+                .as_postgresql()
+                .unwrap()
+                .xmin_fetch_interval
+                .is_zero()
+        );
+
+        let invalid = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+xmin.fetch.interval.ms=-1
+"#,
+        )
+        .unwrap_err();
+        assert!(invalid.to_string().contains("xmin.fetch.interval.ms"));
     }
 
     #[test]

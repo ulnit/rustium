@@ -158,6 +158,14 @@
               {
                 "name": "lsn",
                 "type": "long"
+              },
+              {
+                "default": null,
+                "name": "xmin",
+                "type": [
+                  "null",
+                  "long"
+                ]
               }
             ],
             "name": "Source",

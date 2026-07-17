@@ -4,8 +4,12 @@ ARG RUST_VERSION=1.88.0
 
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 \
+        -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update \
+    && DEBIAN_FRONTEND=noninteractive apt-get \
+        -o Acquire::ForceIPv4=true -o Acquire::Retries=5 \
+        -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+        install -y --no-install-recommends \
         cmake \
         libcurl4-openssl-dev \
         libsasl2-dev \
@@ -38,8 +42,12 @@ LABEL org.opencontainers.image.title="Rustium" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.created="${CREATED}"
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 \
+        -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update \
+    && DEBIAN_FRONTEND=noninteractive apt-get \
+        -o Acquire::ForceIPv4=true -o Acquire::Retries=5 \
+        -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+        install -y --no-install-recommends \
         ca-certificates \
         libsasl2-2 \
         libssl3 \

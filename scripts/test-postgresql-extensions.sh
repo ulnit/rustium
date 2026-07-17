@@ -239,6 +239,15 @@ RUSTIUM_POSTGRES_TEST_USER=postgres \
 RUSTIUM_POSTGRES_TEST_PASSWORD="$password" \
 RUSTIUM_POSTGRES_TEST_DATABASE="$database" \
 cargo test -p rustium-postgresql --test postgresql_external --locked -- \
+    emits_debezium_slot_xmin_when_tracking_is_enabled \
+    --ignored --exact --nocapture
+
+RUSTIUM_POSTGRES_TEST_HOST=127.0.0.1 \
+RUSTIUM_POSTGRES_TEST_PORT="$port" \
+RUSTIUM_POSTGRES_TEST_USER=postgres \
+RUSTIUM_POSTGRES_TEST_PASSWORD="$password" \
+RUSTIUM_POSTGRES_TEST_DATABASE="$database" \
+cargo test -p rustium-postgresql --test postgresql_external --locked -- \
     reconciles_debezium_checkpoint_slot_mismatch_strategies \
     --ignored --exact --nocapture
 

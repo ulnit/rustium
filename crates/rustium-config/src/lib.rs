@@ -252,6 +252,15 @@ impl SourceConfig {
                             serde_json::json!(config.snapshot_isolation_mode),
                         );
                 }
+                if !config.xmin_fetch_interval.is_zero() {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "xmin_fetch_interval".into(),
+                            serde_json::json!(config.xmin_fetch_interval),
+                        );
+                }
                 if !config.slot_stream_params.is_empty() {
                     semantic
                         .as_object_mut()
@@ -489,6 +498,9 @@ pub struct PostgresSourceConfig {
     pub snapshot_lock_timeout: Duration,
     #[serde(default)]
     pub snapshot_isolation_mode: PostgresSnapshotIsolationMode,
+    #[serde(default)]
+    #[serde(with = "humantime_serde")]
+    pub xmin_fetch_interval: Duration,
     #[serde(default)]
     pub tables: TableSelection,
     #[serde(default = "default_ssl_mode")]
@@ -2268,6 +2280,7 @@ sink:
             postgres.snapshot_isolation_mode,
             PostgresSnapshotIsolationMode::Serializable
         );
+        assert!(postgres.xmin_fetch_interval.is_zero());
         assert!(postgres.ssl_root_cert.is_none());
         assert!(!postgres.include_unknown_datatypes);
         assert_eq!(
@@ -2704,6 +2717,32 @@ sink:
         ))
         .unwrap_err();
         assert!(invalid.to_string().contains("dirty_read"));
+    }
+
+    #[test]
+    fn parses_native_postgresql_xmin_fetch_interval_into_fingerprint() {
+        let baseline = Config::from_yaml(CONFIG).unwrap();
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  xmin_fetch_interval: 25ms\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .xmin_fetch_interval,
+            Duration::from_millis(25)
+        );
+        assert_ne!(baseline.fingerprint(), configured.fingerprint());
+
+        let explicit_default = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  xmin_fetch_interval: 0ms\n",
+        ))
+        .unwrap();
+        assert_eq!(baseline.fingerprint(), explicit_default.fingerprint());
     }
 
     #[test]
