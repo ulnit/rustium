@@ -419,6 +419,11 @@ pub struct PostgresSourceConfig {
     #[serde(default = "default_connect_timeout")]
     #[serde(with = "humantime_serde")]
     pub connect_timeout: Duration,
+    #[serde(default = "default_postgres_status_update_interval")]
+    #[serde(with = "humantime_serde")]
+    pub status_update_interval: Duration,
+    #[serde(default = "default_true")]
+    pub tcp_keepalive: bool,
     #[serde(default)]
     #[serde(with = "humantime_serde")]
     pub heartbeat_interval: Duration,
@@ -488,6 +493,11 @@ impl PostgresSourceConfig {
         if self.connect_timeout.is_zero() {
             return Err(Error::Configuration(
                 "source.connect_timeout must be greater than zero".into(),
+            ));
+        }
+        if self.status_update_interval.is_zero() {
+            return Err(Error::Configuration(
+                "source.status_update_interval must be greater than zero".into(),
             ));
         }
         for pattern in self.tables.include.iter().chain(self.tables.exclude.iter()) {
@@ -696,6 +706,7 @@ impl PostgresSourceConfig {
                 "connect_timeout",
                 &self.connect_timeout.as_secs().max(1).to_string(),
             );
+            query.append_pair("keepalives", if self.tcp_keepalive { "1" } else { "0" });
             if replication {
                 query.append_pair("replication", "database");
             }
@@ -1872,6 +1883,9 @@ fn default_ssl_mode() -> String {
 const fn default_connect_timeout() -> Duration {
     Duration::from_secs(30)
 }
+const fn default_postgres_status_update_interval() -> Duration {
+    Duration::from_secs(10)
+}
 const fn default_snapshot_fetch_size() -> usize {
     10_000
 }
@@ -2001,14 +2015,22 @@ sink:
         );
         assert_eq!(config.runtime.retry_policy(), RetryPolicy::default());
         assert!(config.format.tombstones_on_delete);
+        let postgres = config.source.as_postgresql().unwrap();
+        assert_eq!(
+            postgres.status_update_interval,
+            default_postgres_status_update_interval()
+        );
+        assert!(postgres.tcp_keepalive);
+        let connection_url = Url::parse(&postgres.connection_url(true).unwrap()).unwrap();
         assert!(
-            config
-                .source
-                .as_postgresql()
-                .unwrap()
-                .connection_url(true)
-                .unwrap()
-                .contains("replication=database")
+            connection_url
+                .query_pairs()
+                .any(|(key, value)| key == "replication" && value == "database")
+        );
+        assert!(
+            connection_url
+                .query_pairs()
+                .any(|(key, value)| key == "keepalives" && value == "1")
         );
         assert_eq!(
             config.source.as_postgresql().unwrap().hstore_handling_mode,
@@ -2370,6 +2392,31 @@ sink:
         ))
         .unwrap_err();
         assert!(error.to_string().contains("source.connect_timeout"));
+    }
+
+    #[test]
+    fn validates_postgresql_connection_tuning() {
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  database: app\n",
+            "  database: app\n  status_update_interval: 125ms\n  tcp_keepalive: false\n",
+        ))
+        .unwrap();
+        let source = configured.source.as_postgresql().unwrap();
+        assert_eq!(source.status_update_interval, Duration::from_millis(125));
+        assert!(!source.tcp_keepalive);
+        let connection_url = Url::parse(&source.connection_url(false).unwrap()).unwrap();
+        assert!(
+            connection_url
+                .query_pairs()
+                .any(|(key, value)| key == "keepalives" && value == "0")
+        );
+
+        let error = Config::from_yaml(&CONFIG.replace(
+            "  database: app\n",
+            "  database: app\n  status_update_interval: 0ms\n",
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("source.status_update_interval"));
     }
 
     #[test]

@@ -433,7 +433,7 @@ impl SourceConnector for PostgresSource {
             self.config.publication.clone(),
             2,
             StreamingMode::On,
-            Duration::from_secs(10),
+            self.config.status_update_interval,
             retry_config.max_duration,
             Duration::from_secs(30),
             retry_config,
@@ -519,6 +519,8 @@ impl SourceConnector for PostgresSource {
             max_retries = self.retry_policy.max_retries,
             initial_retry_delay_ms = self.retry_policy.initial_delay.as_millis(),
             max_retry_delay_ms = self.retry_policy.max_delay.as_millis(),
+            status_update_interval_ms = self.config.status_update_interval.as_millis(),
+            tcp_keepalive = self.config.tcp_keepalive,
             "PostgreSQL streaming started"
         );
 
@@ -3643,6 +3645,8 @@ sink:
             tables: TableSelection::default(),
             ssl_mode: "disable".into(),
             connect_timeout: Duration::from_secs(1),
+            status_update_interval: Duration::from_secs(10),
+            tcp_keepalive: true,
             heartbeat_interval: Duration::ZERO,
             heartbeat_action_query: None,
             heartbeat_topics_prefix: "__debezium-heartbeat".into(),

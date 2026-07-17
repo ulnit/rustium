@@ -27,6 +27,8 @@ source:
     include:
       - public\.(orders|customers)
   ssl_mode: prefer
+  status_update_interval: 10s
+  tcp_keepalive: true
   heartbeat_interval: 0s
   heartbeat_topics_prefix: __debezium-heartbeat
   signal_enabled_channels: [source]

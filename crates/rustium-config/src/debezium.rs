@@ -140,6 +140,12 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 "connection.validation.timeout.ms",
                 default_connect_timeout(),
             )?,
+            status_update_interval: duration_ms(
+                &properties,
+                "status.update.interval.ms",
+                default_postgres_status_update_interval(),
+            )?,
+            tcp_keepalive: bool_value(&properties, "database.tcpKeepAlive", true)?,
             heartbeat_interval: duration_ms(&properties, "heartbeat.interval.ms", Duration::ZERO)?,
             heartbeat_action_query: properties
                 .get("heartbeat.action.query")
@@ -613,6 +619,7 @@ fn assemble_config(
     let topic_prefix = required(properties, "topic.prefix")?.to_string();
     let sink = sink_config(properties, &topic_prefix)?;
     warnings.extend(unsupported_warnings(properties));
+    let postgres_source = matches!(&source, SourceConfig::Postgresql(_));
     let mysql_source = matches!(&source, SourceConfig::Mysql(_));
     let errors_max_retries = if properties.contains_key("errors.max.retries") {
         i32_value(
@@ -620,6 +627,8 @@ fn assemble_config(
             "errors.max.retries",
             default_errors_max_retries(),
         )?
+    } else if postgres_source && properties.contains_key("slot.max.retries") {
+        i32_value(properties, "slot.max.retries", default_errors_max_retries())?
     } else if mysql_source && properties.contains_key("rustium.source.reconnect.max.attempts") {
         i32_value(
             properties,
@@ -629,10 +638,20 @@ fn assemble_config(
     } else {
         default_errors_max_retries()
     };
+    let postgres_slot_retry_delay = postgres_source
+        && properties.contains_key("slot.retry.delay.ms")
+        && !properties.contains_key("errors.retry.delay.initial.ms")
+        && !properties.contains_key("errors.retry.delay.max.ms");
     let errors_retry_delay_initial = if properties.contains_key("errors.retry.delay.initial.ms") {
         duration_ms(
             properties,
             "errors.retry.delay.initial.ms",
+            default_errors_retry_delay_initial(),
+        )?
+    } else if postgres_slot_retry_delay {
+        duration_ms(
+            properties,
+            "slot.retry.delay.ms",
             default_errors_retry_delay_initial(),
         )?
     } else if mysql_source && properties.contains_key("connect.keep.alive.interval.ms") {
@@ -650,7 +669,9 @@ fn assemble_config(
             "errors.retry.delay.max.ms",
             default_errors_retry_delay_max(),
         )?
-    } else if mysql_source && properties.contains_key("connect.keep.alive.interval.ms") {
+    } else if postgres_slot_retry_delay
+        || mysql_source && properties.contains_key("connect.keep.alive.interval.ms")
+    {
         errors_retry_delay_initial
     } else {
         default_errors_retry_delay_max()
@@ -1252,6 +1273,10 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "max.batch.size",
         "poll.interval.ms",
         "connection.validation.timeout.ms",
+        "status.update.interval.ms",
+        "database.tcpKeepAlive",
+        "slot.max.retries",
+        "slot.retry.delay.ms",
         "unavailable.value.placeholder",
         "tombstones.on.delete",
         "key.converter",
@@ -1371,10 +1396,12 @@ database.port=5432
 database.user=rustium
 database.password=secret
 database.dbname=app
+database.tcpKeepAlive=false
 topic.prefix=app
 plugin.name=pgoutput
 slot.name=orders_slot
 slot.failover=true
+status.update.interval.ms=250
 publication.name=orders_pub
 publication.autocreate.mode=filtered
 replica.identity.autoset.values=public\\.orders:FULL,public\\.customers:INDEX customers_replica_key
@@ -1456,6 +1483,8 @@ max.batch.size=1000
         assert!(source.read_only);
         assert_eq!(source.hstore_handling_mode, "map");
         assert_eq!(source.interval_handling_mode, "string");
+        assert_eq!(source.status_update_interval, Duration::from_millis(250));
+        assert!(!source.tcp_keepalive);
         assert!(source.captures_logical_decoding_messages());
         assert!(source.includes_message_prefix("orders.created"));
         assert!(source.includes_message_prefix("audit"));
@@ -1685,6 +1714,63 @@ errors.retry.delay.max.ms=2000
                 .compatibility_warnings
                 .iter()
                 .all(|warning| !warning.contains("errors."))
+        );
+    }
+
+    #[test]
+    fn maps_postgres_slot_retry_settings_as_engine_fallbacks() {
+        let fallback = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+slot.max.retries=6
+slot.retry.delay.ms=750
+"#,
+        )
+        .unwrap();
+        assert_eq!(fallback.runtime.errors_max_retries, 6);
+        assert_eq!(
+            fallback.runtime.errors_retry_delay_initial,
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            fallback.runtime.errors_retry_delay_max,
+            Duration::from_millis(750)
+        );
+        assert!(fallback.compatibility_warnings.iter().all(|warning| {
+            !warning.contains("slot.max.retries") && !warning.contains("slot.retry.delay.ms")
+        }));
+
+        let shared = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+slot.max.retries=6
+slot.retry.delay.ms=750
+errors.max.retries=2
+errors.retry.delay.initial.ms=25
+errors.retry.delay.max.ms=200
+"#,
+        )
+        .unwrap();
+        assert_eq!(shared.runtime.errors_max_retries, 2);
+        assert_eq!(
+            shared.runtime.errors_retry_delay_initial,
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            shared.runtime.errors_retry_delay_max,
+            Duration::from_millis(200)
         );
     }
 

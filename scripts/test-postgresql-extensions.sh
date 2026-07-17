@@ -135,5 +135,14 @@ RUSTIUM_POSTGRES_TEST_USER=postgres \
 RUSTIUM_POSTGRES_TEST_PASSWORD="$password" \
 RUSTIUM_POSTGRES_TEST_DATABASE="$database" \
 cargo test -p rustium-postgresql --test postgresql_external --locked -- \
+    advances_confirmed_flush_lsn_on_the_configured_feedback_interval \
+    --ignored --exact --nocapture
+
+RUSTIUM_POSTGRES_TEST_HOST=127.0.0.1 \
+RUSTIUM_POSTGRES_TEST_PORT="$port" \
+RUSTIUM_POSTGRES_TEST_USER=postgres \
+RUSTIUM_POSTGRES_TEST_PASSWORD="$password" \
+RUSTIUM_POSTGRES_TEST_DATABASE="$database" \
+cargo test -p rustium-postgresql --test postgresql_external --locked -- \
     converts_debezium_interval_modes_across_postgresql_styles \
     --ignored --exact --nocapture

@@ -36,6 +36,13 @@ type TestResult<T = ()> = Result<T, Box<dyn StdError + Send + Sync>>;
 
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
 
+struct AcknowledgingSource {
+    output: mpsc::Receiver<rustium_core::Result<SourceRecord>>,
+    cancellation: CancellationToken,
+    task: JoinHandle<rustium_core::Result<()>>,
+    acknowledgement: watch::Sender<Option<SourcePosition>>,
+}
+
 struct TestSettings {
     host: String,
     port: u16,
@@ -80,6 +87,8 @@ impl TestSettings {
             },
             ssl_mode: "disable".into(),
             connect_timeout: Duration::from_secs(10),
+            status_update_interval: Duration::from_secs(10),
+            tcp_keepalive: true,
             heartbeat_interval: Duration::ZERO,
             heartbeat_action_query: None,
             heartbeat_topics_prefix: "__debezium-heartbeat".into(),
@@ -1773,6 +1782,102 @@ async fn captures_debezium_logical_decoding_messages() -> TestResult {
                 "logical message transaction did not end at the expected commit boundary",
             )?;
             Ok(())
+        }
+        .await;
+
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(result, stop_result)
+    }
+    .await;
+
+    let cleanup_result = cleanup(&client, &publication, &slot_name, &[&table_name]).await;
+    connection_task.abort();
+    let _ = connection_task.await;
+    capture_result?;
+    cleanup_result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires external PostgreSQL logical replication"]
+async fn advances_confirmed_flush_lsn_on_the_configured_feedback_interval() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_feedback_{}", &suffix[..12]);
+    let publication = format!("rustium_pg_feedback_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_pg_feedback_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-feedback-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let capture_result = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (id integer PRIMARY KEY, note text NOT NULL); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        config.status_update_interval = Duration::from_millis(25);
+        config.tcp_keepalive = false;
+        let mut source = PostgresSource::new(
+            connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 32,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let running = start_source_with_acknowledgement(source, None, 512);
+        let mut output = running.output;
+        let cancellation = running.cancellation;
+        let source_task = running.task;
+        let acknowledgement = running.acknowledgement;
+        let result: TestResult = async {
+            wait_for_active_slot(&client, &slot_name).await?;
+            client
+                .batch_execute(&format!(
+                    "INSERT INTO public.{table_name} VALUES (1, 'acknowledged');"
+                ))
+                .await?;
+
+            let commit = loop {
+                let record = receive(&mut output).await?;
+                if record.boundary == RecordBoundary::TransactionCommit {
+                    break record;
+                }
+                require(
+                    record
+                        .event
+                        .as_ref()
+                        .is_some_and(|event| event.operation == Operation::Create),
+                    "feedback fixture emitted an unexpected record before commit",
+                )?;
+            };
+            let acknowledged_lsn = match &commit.position {
+                SourcePosition::Postgres(position) => position.commit_lsn.unwrap_or(position.lsn),
+                SourcePosition::MySql(_) | SourcePosition::SqlServer(_) => {
+                    return Err(test_error(
+                        "feedback fixture emitted a non-PostgreSQL position",
+                    ));
+                }
+            };
+            acknowledgement
+                .send(Some(commit.position))
+                .map_err(|error| {
+                    test_error(&format!("failed to acknowledge PostgreSQL LSN: {error}"))
+                })?;
+
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            client
+                .batch_execute(&format!(
+                    "INSERT INTO public.{table_name} (id, note) \
+                     SELECT generated.id, 'feedback' \
+                     FROM generate_series(2, 170) AS generated(id);"
+                ))
+                .await?;
+            wait_for_confirmed_flush_lsn(&client, &slot_name, acknowledged_lsn).await
         }
         .await;
 
@@ -4309,7 +4414,7 @@ fn start_source(
 }
 
 fn start_source_with_output_capacity(
-    mut source: PostgresSource,
+    source: PostgresSource,
     initial_checkpoint: Option<Checkpoint>,
     output_capacity: usize,
 ) -> (
@@ -4317,16 +4422,26 @@ fn start_source_with_output_capacity(
     CancellationToken,
     JoinHandle<rustium_core::Result<()>>,
 ) {
+    let running = start_source_with_acknowledgement(source, initial_checkpoint, output_capacity);
+    (running.output, running.cancellation, running.task)
+}
+
+fn start_source_with_acknowledgement(
+    mut source: PostgresSource,
+    initial_checkpoint: Option<Checkpoint>,
+    output_capacity: usize,
+) -> AcknowledgingSource {
     let (output_tx, output_rx) = mpsc::channel(output_capacity);
     let (_signal_sender, signals) = rustium_core::signal_channel(64);
     let acknowledged_position = initial_checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.source_position.clone());
     let (ack_tx, ack_rx) = watch::channel(acknowledged_position);
+    let source_ack_tx = ack_tx.clone();
     let cancellation = CancellationToken::new();
     let source_cancel = cancellation.clone();
     let source_task = tokio::spawn(async move {
-        let _ack_tx = ack_tx;
+        let _ack_tx = source_ack_tx;
         source
             .run(SourceContext {
                 output: output_tx,
@@ -4337,7 +4452,12 @@ fn start_source_with_output_capacity(
             })
             .await
     });
-    (output_rx, cancellation, source_task)
+    AcknowledgingSource {
+        output: output_rx,
+        cancellation,
+        task: source_task,
+        acknowledgement: ack_tx,
+    }
 }
 
 fn start_source_with_signals(
@@ -4450,6 +4570,31 @@ async fn wait_for_active_slot(client: &Client, slot_name: &str) -> TestResult {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(test_error("replication slot did not become active"))
+}
+
+async fn wait_for_confirmed_flush_lsn(
+    client: &Client,
+    slot_name: &str,
+    expected_lsn: u64,
+) -> TestResult {
+    let expected_lsn = format!("{:X}/{:X}", expected_lsn >> 32, expected_lsn as u32);
+    for _ in 0..150 {
+        let reached = client
+            .query_opt(
+                "SELECT COALESCE(confirmed_flush_lsn >= ($2::text)::pg_lsn, false) \
+                 FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot_name, &expected_lsn],
+            )
+            .await?
+            .is_some_and(|row| row.get(0));
+        if reached {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err(test_error(
+        "replication slot confirmed_flush_lsn did not reach the acknowledged LSN within 3 seconds",
+    ))
 }
 
 async fn wait_for_inactive_slot(client: &Client, slot_name: &str) -> TestResult {
