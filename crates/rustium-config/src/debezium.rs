@@ -170,6 +170,16 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
             slot_ownership: SlotOwnership::Managed,
             offset_mismatch_strategy,
             lsn_flush_mode,
+            lsn_flush_timeout: duration_ms(
+                &properties,
+                "lsn.flush.timeout.ms",
+                default_postgres_lsn_flush_timeout(),
+            )?,
+            lsn_flush_timeout_action: postgres_lsn_flush_timeout_action(
+                properties
+                    .get("lsn.flush.timeout.action")
+                    .map_or("fail", String::as_str),
+            )?,
             slot_stream_params: postgres_slot_stream_params(properties.get("slot.stream.params"))?,
             database_initial_statements: postgres_initial_statements(
                 properties.get("database.initial.statements"),
@@ -1261,6 +1271,17 @@ fn postgres_lsn_flush_mode(mode: &str) -> Result<PostgresLsnFlushMode> {
     }
 }
 
+fn postgres_lsn_flush_timeout_action(action: &str) -> Result<PostgresLsnFlushTimeoutAction> {
+    match action.trim().to_ascii_lowercase().as_str() {
+        "fail" => Ok(PostgresLsnFlushTimeoutAction::Fail),
+        "warn" => Ok(PostgresLsnFlushTimeoutAction::Warn),
+        "ignore" => Ok(PostgresLsnFlushTimeoutAction::Ignore),
+        other => Err(Error::Configuration(format!(
+            "unsupported PostgreSQL lsn.flush.timeout.action {other:?}; expected fail, warn, or ignore"
+        ))),
+    }
+}
+
 fn postgres_slot_stream_params(value: Option<&String>) -> Result<BTreeMap<String, String>> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
@@ -2176,6 +2197,63 @@ lsn.flush.mode=automatic
         )
         .unwrap_err();
         assert!(invalid.to_string().contains("lsn.flush.mode"));
+    }
+
+    #[test]
+    fn maps_postgres_lsn_flush_timeout_and_action() {
+        let configured = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+lsn.flush.timeout.ms=125
+lsn.flush.timeout.action=WaRn
+"#,
+        )
+        .unwrap();
+        let source = configured.source.as_postgresql().unwrap();
+        assert_eq!(source.lsn_flush_timeout, Duration::from_millis(125));
+        assert_eq!(
+            source.lsn_flush_timeout_action,
+            PostgresLsnFlushTimeoutAction::Warn
+        );
+
+        let defaulted = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+"#,
+        )
+        .unwrap();
+        let source = defaulted.source.as_postgresql().unwrap();
+        assert_eq!(source.lsn_flush_timeout, Duration::from_secs(30));
+        assert_eq!(
+            source.lsn_flush_timeout_action,
+            PostgresLsnFlushTimeoutAction::Fail
+        );
+
+        for property in [
+            "lsn.flush.timeout.ms=0",
+            "lsn.flush.timeout.action=continue",
+        ] {
+            let invalid = parse(&format!(
+                "name=orders-cdc\nconnector.class=io.debezium.connector.postgresql.PostgresConnector\ndatabase.hostname=postgres\ndatabase.user=rustium\ndatabase.password=secret\ndatabase.dbname=app\ntopic.prefix=app\n{property}\n"
+            ))
+            .unwrap_err();
+            let message = invalid.to_string();
+            assert!(
+                message.contains("lsn") && message.contains("flush") && message.contains("timeout")
+            );
+        }
     }
 
     #[test]

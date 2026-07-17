@@ -22,6 +22,8 @@ PostgreSQL `snapshot.isolation.mode` maps to native `source.snapshot_isolation_m
 
 PostgreSQL `xmin.fetch.interval.ms` maps to native `source.xmin_fetch_interval` and defaults to zero (disabled). A non-zero interval is fingerprinted because it adds the periodically cached slot `catalog_xmin` to PostgreSQL source metadata.
 
+PostgreSQL `lsn.flush.timeout.ms` maps to the positive, 30-second native `source.lsn_flush_timeout`; `lsn.flush.timeout.action=fail|warn|ignore` maps to `source.lsn_flush_timeout_action`. They bound real acknowledgement feedback I/O and are excluded from fingerprints as operational controls.
+
 PostgreSQL `interval.handling.mode` accepts Debezium `numeric` and `string`; properties default to `numeric`. Native `source.interval_handling_mode` additionally accepts the backward-compatible `postgres` default, which is omitted from fingerprint material.
 
 PostgreSQL `money.fraction.digits` maps to native `source.money_fraction_digits` and defaults to `2`. Non-default signed 16-bit scales are fingerprinted because they change MONEY schemas and values.
@@ -53,6 +55,8 @@ PostgreSQL `snapshot.locking.mode=none|shared` 映射为原生 `source.snapshot_
 PostgreSQL `snapshot.isolation.mode` 映射为原生 `source.snapshot_isolation_mode`，接受 `serializable`、`repeatable_read`、`read_committed` 和 `read_uncommitted`。`serializable` 与 `repeatable_read` 都导入同一 exported snapshot，因此保持既有 fingerprint；较低模式会改变 snapshot 一致性和 slot handoff，因此进入 fingerprint。
 
 PostgreSQL `xmin.fetch.interval.ms` 映射为原生 `source.xmin_fetch_interval`，默认值为零（禁用）。非零周期会把定期缓存的 slot `catalog_xmin` 加入 PostgreSQL source metadata，因此进入 fingerprint。
+
+PostgreSQL `lsn.flush.timeout.ms` 映射为必须为正值且默认 30 秒的原生 `source.lsn_flush_timeout`；`lsn.flush.timeout.action=fail|warn|ignore` 映射为 `source.lsn_flush_timeout_action`。它们限制真实 acknowledgement feedback I/O，属于不进入 fingerprint 的运维控制项。
 
 PostgreSQL `interval.handling.mode` 接受 Debezium 的 `numeric` 和 `string`，properties 默认使用 `numeric`。原生 `source.interval_handling_mode` 还接受向后兼容的默认值 `postgres`，该默认值不会进入 fingerprint material。
 

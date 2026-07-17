@@ -487,6 +487,11 @@ pub struct PostgresSourceConfig {
     pub offset_mismatch_strategy: PostgresOffsetMismatchStrategy,
     #[serde(default)]
     pub lsn_flush_mode: PostgresLsnFlushMode,
+    #[serde(default = "default_postgres_lsn_flush_timeout")]
+    #[serde(with = "humantime_serde")]
+    pub lsn_flush_timeout: Duration,
+    #[serde(default)]
+    pub lsn_flush_timeout_action: PostgresLsnFlushTimeoutAction,
     #[serde(default)]
     pub slot_stream_params: BTreeMap<String, String>,
     #[serde(default)]
@@ -615,6 +620,11 @@ impl PostgresSourceConfig {
         if self.status_update_interval.is_zero() {
             return Err(Error::Configuration(
                 "source.status_update_interval must be greater than zero".into(),
+            ));
+        }
+        if self.lsn_flush_timeout.is_zero() {
+            return Err(Error::Configuration(
+                "source.lsn_flush_timeout must be greater than zero".into(),
             ));
         }
         if !matches!(
@@ -1420,6 +1430,15 @@ pub enum PostgresLsnFlushMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum PostgresLsnFlushTimeoutAction {
+    #[default]
+    Fail,
+    Warn,
+    Ignore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PostgresSchemaRefreshMode {
     #[default]
     ColumnsDiff,
@@ -2119,6 +2138,9 @@ const fn default_connect_timeout() -> Duration {
 const fn default_postgres_status_update_interval() -> Duration {
     Duration::from_secs(10)
 }
+const fn default_postgres_lsn_flush_timeout() -> Duration {
+    Duration::from_secs(30)
+}
 const fn default_postgres_snapshot_lock_timeout() -> Duration {
     Duration::from_secs(10)
 }
@@ -2266,6 +2288,14 @@ sink:
         );
         assert!(!postgres.drop_slot_on_stop);
         assert_eq!(postgres.lsn_flush_mode, PostgresLsnFlushMode::Connector);
+        assert_eq!(
+            postgres.lsn_flush_timeout,
+            default_postgres_lsn_flush_timeout()
+        );
+        assert_eq!(
+            postgres.lsn_flush_timeout_action,
+            PostgresLsnFlushTimeoutAction::Fail
+        );
         assert!(postgres.slot_stream_params.is_empty());
         assert!(postgres.database_initial_statements.is_empty());
         assert_eq!(
@@ -2578,6 +2608,30 @@ sink:
             Config::from_yaml(CONFIG).unwrap().fingerprint(),
             configured.fingerprint()
         );
+    }
+
+    #[test]
+    fn validates_native_postgresql_lsn_flush_timeout() {
+        let baseline = Config::from_yaml(CONFIG).unwrap();
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  lsn_flush_timeout: 125ms\n  lsn_flush_timeout_action: warn\n",
+        ))
+        .unwrap();
+        let source = configured.source.as_postgresql().unwrap();
+        assert_eq!(source.lsn_flush_timeout, Duration::from_millis(125));
+        assert_eq!(
+            source.lsn_flush_timeout_action,
+            PostgresLsnFlushTimeoutAction::Warn
+        );
+        assert_eq!(baseline.fingerprint(), configured.fingerprint());
+
+        let error = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  lsn_flush_timeout: 0ms\n",
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("source.lsn_flush_timeout"));
     }
 
     #[test]

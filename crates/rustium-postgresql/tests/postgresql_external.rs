@@ -15,10 +15,10 @@ use rdkafka::{
     util::Timeout,
 };
 use rustium_config::{
-    PostgresLsnFlushMode, PostgresOffsetMismatchStrategy, PostgresReplicaIdentity,
-    PostgresReplicaIdentityRule, PostgresSchemaRefreshMode, PostgresSnapshotIsolationMode,
-    PostgresSnapshotLockingMode, PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership,
-    SnapshotConfig, SnapshotMode, TableSelection,
+    PostgresLsnFlushMode, PostgresLsnFlushTimeoutAction, PostgresOffsetMismatchStrategy,
+    PostgresReplicaIdentity, PostgresReplicaIdentityRule, PostgresSchemaRefreshMode,
+    PostgresSnapshotIsolationMode, PostgresSnapshotLockingMode, PostgresSourceConfig,
+    PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode, TableSelection,
 };
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
@@ -86,6 +86,8 @@ impl TestSettings {
             slot_ownership: SlotOwnership::Managed,
             offset_mismatch_strategy: PostgresOffsetMismatchStrategy::NoValidation,
             lsn_flush_mode: PostgresLsnFlushMode::Connector,
+            lsn_flush_timeout: Duration::from_secs(30),
+            lsn_flush_timeout_action: PostgresLsnFlushTimeoutAction::Fail,
             slot_stream_params: BTreeMap::new(),
             database_initial_statements: Vec::new(),
             snapshot_locking_mode: PostgresSnapshotLockingMode::None,
@@ -2735,7 +2737,7 @@ async fn captures_debezium_logical_decoding_messages() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires external PostgreSQL logical replication"]
-async fn advances_confirmed_flush_lsn_on_the_configured_feedback_interval() -> TestResult {
+async fn flushes_acknowledged_lsn_immediately_with_timeout() -> TestResult {
     let settings = TestSettings::from_env()?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let table_name = format!("rustium_pg_feedback_{}", &suffix[..12]);
@@ -2753,7 +2755,9 @@ async fn advances_confirmed_flush_lsn_on_the_configured_feedback_interval() -> T
             .await?;
 
         let mut config = settings.source_config(&publication, &slot_name, &table_name);
-        config.status_update_interval = Duration::from_millis(25);
+        config.status_update_interval = Duration::from_secs(30);
+        config.lsn_flush_timeout = Duration::from_secs(2);
+        config.lsn_flush_timeout_action = PostgresLsnFlushTimeoutAction::Fail;
         config.tcp_keepalive = false;
         let mut source = PostgresSource::new(
             connector_name,
@@ -2805,14 +2809,6 @@ async fn advances_confirmed_flush_lsn_on_the_configured_feedback_interval() -> T
                     test_error(&format!("failed to acknowledge PostgreSQL LSN: {error}"))
                 })?;
 
-            tokio::time::sleep(Duration::from_millis(75)).await;
-            client
-                .batch_execute(&format!(
-                    "INSERT INTO public.{table_name} (id, note) \
-                     SELECT generated.id, 'feedback' \
-                     FROM generate_series(2, 170) AS generated(id);"
-                ))
-                .await?;
             wait_for_confirmed_flush_lsn(&client, &slot_name, acknowledged_lsn).await
         }
         .await;

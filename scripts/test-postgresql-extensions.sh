@@ -230,7 +230,7 @@ RUSTIUM_POSTGRES_TEST_USER=postgres \
 RUSTIUM_POSTGRES_TEST_PASSWORD="$password" \
 RUSTIUM_POSTGRES_TEST_DATABASE="$database" \
 cargo test -p rustium-postgresql --test postgresql_external --locked -- \
-    advances_confirmed_flush_lsn_on_the_configured_feedback_interval \
+    flushes_acknowledged_lsn_immediately_with_timeout \
     --ignored --exact --nocapture
 
 RUSTIUM_POSTGRES_TEST_HOST=127.0.0.1 \

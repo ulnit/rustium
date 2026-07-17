@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -15,9 +16,9 @@ use pg_walstream::{
 };
 use regex::Regex;
 use rustium_config::{
-    PostgresLsnFlushMode, PostgresOffsetMismatchStrategy, PostgresReplicaIdentity,
-    PostgresSnapshotIsolationMode, PostgresSnapshotLockingMode, PostgresSourceConfig,
-    PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode,
+    PostgresLsnFlushMode, PostgresLsnFlushTimeoutAction, PostgresOffsetMismatchStrategy,
+    PostgresReplicaIdentity, PostgresSnapshotIsolationMode, PostgresSnapshotLockingMode,
+    PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode,
 };
 use rustium_core::{
     ChangeEvent, DataValue, Error, EventId, EventSchema, FieldSchema, Operation, PostgresPosition,
@@ -827,6 +828,8 @@ impl SourceConnector for PostgresSource {
             tcp_keepalive = self.config.tcp_keepalive,
             drop_slot_on_stop = self.config.drop_slot_on_stop,
             lsn_flush_mode = ?self.config.lsn_flush_mode,
+            lsn_flush_timeout_ms = self.config.lsn_flush_timeout.as_millis(),
+            lsn_flush_timeout_action = ?self.config.lsn_flush_timeout_action,
             xmin_fetch_interval_ms = self.config.xmin_fetch_interval.as_millis(),
             schema_refresh_mode = ?self.config.schema_refresh_mode,
             "PostgreSQL streaming started"
@@ -841,10 +844,15 @@ impl SourceConnector for PostgresSource {
                     if changed.is_err() {
                         return Err(Error::Cancelled);
                     }
-                    if self.config.lsn_flush_mode == PostgresLsnFlushMode::Connector
-                        && let Some(SourcePosition::Postgres(position)) = context.acknowledged.borrow().clone()
+                    let acknowledged = context.acknowledged.borrow().clone();
+                    if self.config.lsn_flush_mode != PostgresLsnFlushMode::Manual
+                        && let Some(SourcePosition::Postgres(position)) = acknowledged
                     {
-                        feedback.update_applied_lsn(position.commit_lsn.unwrap_or(position.lsn));
+                        let lsn = position.commit_lsn.unwrap_or(position.lsn);
+                        if self.config.lsn_flush_mode == PostgresLsnFlushMode::Connector {
+                            feedback.update_applied_lsn(lsn);
+                        }
+                        flush_acknowledged_lsn(&mut stream, lsn, &self.config).await?;
                     }
                 }
                 () = next_heartbeat(&mut heartbeat) => {
@@ -1197,6 +1205,59 @@ async fn next_postgres_event(
         stream.next_event_with_retry(cancellation).await
     } else {
         stream.next_event(cancellation).await
+    }
+}
+
+async fn flush_acknowledged_lsn(
+    stream: &mut LogicalReplicationStream,
+    lsn: u64,
+    config: &PostgresSourceConfig,
+) -> Result<()> {
+    flush_lsn_with_timeout(
+        lsn,
+        config.lsn_flush_timeout,
+        config.lsn_flush_timeout_action,
+        stream.send_feedback(),
+    )
+    .await
+}
+
+async fn flush_lsn_with_timeout<F, E>(
+    lsn: u64,
+    timeout: Duration,
+    action: PostgresLsnFlushTimeoutAction,
+    flush: F,
+) -> Result<()>
+where
+    F: Future<Output = std::result::Result<(), E>>,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(timeout, flush).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(Error::Source(format!(
+            "PostgreSQL LSN flush operation for {} failed: {error}",
+            format_lsn(lsn)
+        ))),
+        Err(_) => {
+            let message = format!(
+                "PostgreSQL LSN flush operation for {} did not complete within {} ms",
+                format_lsn(lsn),
+                timeout.as_millis()
+            );
+            match action {
+                PostgresLsnFlushTimeoutAction::Fail => Err(Error::Source(format!(
+                    "{message}; lsn.flush.timeout.action is configured to fail"
+                ))),
+                PostgresLsnFlushTimeoutAction::Warn => {
+                    warn!("{message}; continuing because lsn.flush.timeout.action=warn");
+                    Ok(())
+                }
+                PostgresLsnFlushTimeoutAction::Ignore => {
+                    debug!("{message}; continuing because lsn.flush.timeout.action=ignore");
+                    Ok(())
+                }
+            }
+        }
     }
 }
 
@@ -4188,6 +4249,52 @@ sink:
         assert_eq!(unlimited.max_duration, EFFECTIVELY_UNBOUNDED_RETRY_DURATION);
     }
 
+    #[tokio::test]
+    async fn enforces_debezium_lsn_flush_timeout_actions() {
+        flush_lsn_with_timeout(
+            0x10,
+            Duration::from_millis(10),
+            PostgresLsnFlushTimeoutAction::Fail,
+            async { Ok::<(), &str>(()) },
+        )
+        .await
+        .unwrap();
+
+        let operation_error = flush_lsn_with_timeout(
+            0x20,
+            Duration::from_millis(10),
+            PostgresLsnFlushTimeoutAction::Ignore,
+            async { Err::<(), _>("connection closed") },
+        )
+        .await
+        .unwrap_err();
+        assert!(operation_error.to_string().contains("connection closed"));
+
+        let timeout_error = flush_lsn_with_timeout(
+            0x30,
+            Duration::from_millis(1),
+            PostgresLsnFlushTimeoutAction::Fail,
+            std::future::pending::<std::result::Result<(), &str>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(timeout_error.to_string().contains("configured to fail"));
+
+        for action in [
+            PostgresLsnFlushTimeoutAction::Warn,
+            PostgresLsnFlushTimeoutAction::Ignore,
+        ] {
+            flush_lsn_with_timeout(
+                0x40,
+                Duration::from_millis(1),
+                action,
+                std::future::pending::<std::result::Result<(), &str>>(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
     #[test]
     fn resolves_debezium_offset_mismatch_strategies() {
         use PostgresOffsetMismatchStrategy::{
@@ -4856,6 +4963,8 @@ sink:
             slot_ownership: SlotOwnership::Managed,
             offset_mismatch_strategy: PostgresOffsetMismatchStrategy::NoValidation,
             lsn_flush_mode: PostgresLsnFlushMode::Connector,
+            lsn_flush_timeout: Duration::from_secs(30),
+            lsn_flush_timeout_action: PostgresLsnFlushTimeoutAction::Fail,
             slot_stream_params: BTreeMap::new(),
             database_initial_statements: Vec::new(),
             snapshot_locking_mode: PostgresSnapshotLockingMode::None,
