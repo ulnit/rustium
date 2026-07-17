@@ -3723,7 +3723,7 @@ async fn applies_database_initial_statements_only_to_regular_connections() -> Te
         );
         source.validate().await?;
         let (mut output, cancellation, source_task) =
-            start_source_with_output_capacity(source, None, 1);
+            start_source_with_output_capacity(source, None, 64);
 
         let source_capture: TestResult = async {
             wait_for_application_session(&client, &settings.database, &application_name).await?;
