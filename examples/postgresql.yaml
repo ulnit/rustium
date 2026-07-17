@@ -27,6 +27,7 @@ source:
   lsn_flush_mode: connector
   # PostgreSQL 16+: set origin to any or none to filter replication-origin transactions.
   slot_stream_params: {}
+  database_initial_statements: []
   tables:
     include:
       - public\.(orders|customers)

@@ -96,10 +96,9 @@ impl PostgresSource {
     }
 
     async fn validate_source(&mut self) -> Result<()> {
-        let connection_url = self.config.connection_url(false)?;
         let config = self.config.clone();
         let schemas = tokio::task::spawn_blocking(move || {
-            let mut connection = connect(&connection_url)?;
+            let mut connection = connect_regular(&config)?;
             let version = scalar(&mut connection, "SHOW server_version_num")?
                 .parse::<u32>()
                 .map_err(|error| Error::Source(format!("invalid PostgreSQL version: {error}")))?;
@@ -161,11 +160,11 @@ impl PostgresSource {
                 "an initial snapshot requires slot_ownership=managed".into(),
             ));
         }
-        let connection_url = self.config.connection_url(false)?;
-        let slot_name = self.config.slot_name.clone();
+        let config = self.config.clone();
         tokio::task::spawn_blocking(move || {
-            let mut connection = connect(&connection_url)?;
-            let slot = quote_literal(&slot_name).map_err(pg_error)?;
+            let mut connection = connect_regular(&config)?;
+            let slot_name = &config.slot_name;
+            let slot = quote_literal(slot_name).map_err(pg_error)?;
             let result = connection
                 .exec(&format!(
                     "SELECT active::text FROM pg_replication_slots WHERE slot_name = {slot}"
@@ -196,10 +195,9 @@ impl PostgresSource {
         columns: Vec<RelationColumn>,
         previous: Option<TableSchema>,
     ) -> Result<TableSchema> {
-        let connection_url = self.config.connection_url(false)?;
         let config = self.config.clone();
         tokio::task::spawn_blocking(move || {
-            let mut connection = connect(&connection_url)?;
+            let mut connection = connect_regular(&config)?;
             let catalog = match query_table_schema(&mut connection, &config, &schema, &table) {
                 Ok(catalog) => catalog,
                 Err(error) => {
@@ -258,10 +256,9 @@ impl PostgresSource {
         schema: String,
         table: String,
     ) -> Result<TableSchema> {
-        let connection_url = self.config.connection_url(false)?;
         let config = self.config.clone();
         tokio::task::spawn_blocking(move || {
-            let mut connection = connect(&connection_url)?;
+            let mut connection = connect_regular(&config)?;
             discover_table_schema(&mut connection, &config, &schema, &table)
         })
         .await
@@ -273,13 +270,12 @@ impl PostgresSource {
         snapshot_name: String,
         output: mpsc::Sender<Result<SourceRecord>>,
     ) -> Result<SnapshotOutcome> {
-        let connection_url = self.config.connection_url(false)?;
         let config = self.config.clone();
         let connector_name = self.connector_name.clone();
         let snapshot_config = self.snapshot.clone();
         let fetch_size = snapshot_config.fetch_size;
         tokio::task::spawn_blocking(move || {
-            let mut connection = connect(&connection_url)?;
+            let mut connection = connect_regular(&config)?;
             connection
                 .exec("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 .map_err(pg_error)?;
@@ -1067,8 +1063,8 @@ async fn open_heartbeat_connection(
     if config.heartbeat_interval.is_zero() || config.heartbeat_action_query.is_none() {
         return Ok(None);
     }
-    let connection_url = config.connection_url(false)?;
-    let connection = tokio::task::spawn_blocking(move || connect(&connection_url))
+    let config = config.clone();
+    let connection = tokio::task::spawn_blocking(move || connect_regular(&config))
         .await
         .map_err(|error| {
             Error::Source(format!(
@@ -1079,11 +1075,11 @@ async fn open_heartbeat_connection(
 }
 
 async fn query_slot_safe_lsn(config: &PostgresSourceConfig) -> Result<u64> {
-    let connection_url = config.connection_url(false)?;
-    let slot_name = config.slot_name.clone();
+    let config = config.clone();
     tokio::task::spawn_blocking(move || {
-        let mut connection = connect(&connection_url)?;
-        let slot = quote_literal(&slot_name).map_err(pg_error)?;
+        let mut connection = connect_regular(&config)?;
+        let slot_name = &config.slot_name;
+        let slot = quote_literal(slot_name).map_err(pg_error)?;
         let lsn = scalar(
             &mut connection,
             &format!(
@@ -1106,9 +1102,9 @@ async fn resolve_slot_failover(config: &PostgresSourceConfig) -> Result<bool> {
             "source.slot_failover can be enabled only for a managed replication slot".into(),
         ));
     }
-    let connection_url = config.connection_url(false)?;
+    let config = config.clone();
     let (server_version, in_recovery) = tokio::task::spawn_blocking(move || {
-        let mut connection = connect(&connection_url)?;
+        let mut connection = connect_regular(&config)?;
         let server_version = scalar(&mut connection, "SHOW server_version_num")?
             .parse::<u32>()
             .map_err(|error| Error::Source(format!("invalid PostgreSQL version: {error}")))?;
@@ -1141,7 +1137,7 @@ async fn configure_slot_failover(replication_url: &str, slot_name: &str) -> Resu
     let replication_url = replication_url.to_string();
     let slot_name = slot_name.to_string();
     tokio::task::spawn_blocking(move || {
-        let mut connection = connect(&replication_url)?;
+        let mut connection = connect_url(&replication_url)?;
         connection
             .alter_replication_slot(&slot_name, None, Some(true))
             .map_err(pg_error)?;
@@ -1155,12 +1151,12 @@ async fn resolve_resume_slot(
     config: &PostgresSourceConfig,
     checkpoint: &PostgresPosition,
 ) -> Result<ResumeSlotResolution> {
-    let connection_url = config.connection_url(false)?;
+    let config = config.clone();
     let slot_name = config.slot_name.clone();
     let strategy = config.offset_mismatch_strategy;
     let checkpoint = checkpoint.clone();
     tokio::task::spawn_blocking(move || {
-        let mut connection = connect(&connection_url)?;
+        let mut connection = connect_regular(&config)?;
         let slot = quote_literal(&slot_name).map_err(pg_error)?;
         let result = connection
             .exec(&format!(
@@ -1267,10 +1263,9 @@ fn resume_slot_decision(
 async fn load_current_schemas(
     config: &PostgresSourceConfig,
 ) -> Result<HashMap<(String, String), TableSchema>> {
-    let connection_url = config.connection_url(false)?;
     let config = config.clone();
     tokio::task::spawn_blocking(move || {
-        let mut connection = connect(&connection_url)?;
+        let mut connection = connect_regular(&config)?;
         discover_tables(&mut connection, &config)
     })
     .await
@@ -3215,7 +3210,21 @@ fn source_metadata(
     }
 }
 
-fn connect(connection_url: &str) -> Result<PgReplicationConnection> {
+pub(crate) fn connect_regular(config: &PostgresSourceConfig) -> Result<PgReplicationConnection> {
+    let connection_url = config.connection_url(false)?;
+    let mut connection = connect_url(&connection_url)?;
+    for (index, statement) in config.database_initial_statements.iter().enumerate() {
+        connection.exec(statement).map_err(|error| {
+            Error::Source(format!(
+                "PostgreSQL database.initial.statements entry {} failed: {error}",
+                index + 1
+            ))
+        })?;
+    }
+    Ok(connection)
+}
+
+fn connect_url(connection_url: &str) -> Result<PgReplicationConnection> {
     PgReplicationConnection::connect(connection_url).map_err(pg_error)
 }
 
@@ -3876,6 +3885,7 @@ sink:
             offset_mismatch_strategy: PostgresOffsetMismatchStrategy::NoValidation,
             lsn_flush_mode: PostgresLsnFlushMode::Connector,
             slot_stream_params: BTreeMap::new(),
+            database_initial_statements: Vec::new(),
             tables: TableSelection::default(),
             ssl_mode: "disable".into(),
             connect_timeout: Duration::from_secs(1),

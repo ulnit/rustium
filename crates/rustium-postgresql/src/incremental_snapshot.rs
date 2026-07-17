@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use crate::{
     schema_history::{IncrementalSnapshotProgress, TableSchema},
-    source::{convert_text_with_modes, query_table_schema},
+    source::{connect_regular, convert_text_with_modes, query_table_schema},
 };
 
 const EXECUTE_SNAPSHOT: &str = "execute-snapshot";
@@ -468,7 +468,6 @@ impl IncrementalSnapshotController {
         }
         let chunk_id = format!("{}-{}", progress.signal_id, progress.chunk_sequence);
         let input = PrepareChunkInput {
-            connection_url: config.connection_url(false)?,
             catalog_config: config.clone(),
             signal_data_collection: config
                 .signal_data_collection
@@ -658,7 +657,6 @@ struct ControlSnapshotData {
 }
 
 struct PrepareChunkInput {
-    connection_url: String,
     catalog_config: PostgresSourceConfig,
     signal_data_collection: Option<String>,
     schema: TableSchema,
@@ -685,8 +683,7 @@ fn prepare_chunk(
 ) -> Result<(PgReplicationConnection, PreparedChunk)> {
     let mut connection = match connection {
         Some(connection) => connection,
-        None => PgReplicationConnection::connect(&input.connection_url)
-            .map_err(|error| Error::Source(error.to_string()))?,
+        None => connect_regular(&input.catalog_config)?,
     };
     let (signal_table, low_watermark) = if input.read_only {
         connection

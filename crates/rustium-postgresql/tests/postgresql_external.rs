@@ -85,6 +85,7 @@ impl TestSettings {
             offset_mismatch_strategy: PostgresOffsetMismatchStrategy::NoValidation,
             lsn_flush_mode: PostgresLsnFlushMode::Connector,
             slot_stream_params: BTreeMap::new(),
+            database_initial_statements: Vec::new(),
             tables: TableSelection {
                 include: vec![format!(r"public\.{table_name}")],
                 exclude: Vec::new(),
@@ -2400,6 +2401,104 @@ async fn applies_pgoutput_origin_slot_stream_parameter() -> TestResult {
     primary_cleanup?;
     origin_cleanup?;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires external PostgreSQL logical replication and pg_stat_activity visibility"]
+async fn applies_database_initial_statements_only_to_regular_connections() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_initial_{}", &suffix[..12]);
+    let publication = format!("rustium_pg_initial_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_pg_initial_slot_{}", &suffix[..12]);
+    let application_name = format!("rustium-initial-{}", &suffix[..12]);
+    let connector_name = format!("postgresql-initial-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let capture_result: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (id BIGINT PRIMARY KEY, note TEXT NOT NULL); \
+                 INSERT INTO public.{table_name} \
+                 SELECT id, 'snapshot' FROM generate_series(1, 128) AS generated(id); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        config.database_initial_statements = vec![
+            format!("SET application_name = '{application_name}'"),
+            "SET statement_timeout = '30s'".into(),
+        ];
+        config.heartbeat_interval = Duration::from_millis(25);
+        config.heartbeat_action_query = Some(format!(
+            "INSERT INTO public.{table_name} VALUES \
+             (1000, current_setting('application_name')) ON CONFLICT DO NOTHING"
+        ));
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 16,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) =
+            start_source_with_output_capacity(source, None, 1);
+
+        let source_capture: TestResult = async {
+            wait_for_application_session(&client, &settings.database, &application_name).await?;
+            loop {
+                if receive(&mut output).await?.boundary == RecordBoundary::SnapshotComplete {
+                    break;
+                }
+            }
+            wait_for_active_slot(&client, &slot_name).await?;
+            let replication_application_name = client
+                .query_one(
+                    "SELECT activity.application_name \
+                     FROM pg_replication_slots AS slot \
+                     JOIN pg_stat_activity AS activity ON activity.pid = slot.active_pid \
+                     WHERE slot.slot_name = $1",
+                    &[&slot_name],
+                )
+                .await?
+                .get::<_, String>(0);
+            require(
+                replication_application_name != application_name,
+                "database.initial.statements ran on the transaction-log replication connection",
+            )?;
+
+            loop {
+                let record = receive(&mut output).await?;
+                let Some(after) = record.event.as_ref().and_then(|event| event.after.as_ref())
+                else {
+                    continue;
+                };
+                if after.get("id") != Some(&DataValue::Int64(1000)) {
+                    continue;
+                }
+                require(
+                    after.get("note") == Some(&DataValue::String(application_name.clone())),
+                    "heartbeat connection did not apply database.initial.statements",
+                )?;
+                break;
+            }
+            Ok(())
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(source_capture, stop_result)
+    }
+    .await;
+
+    let primary_cleanup = cleanup(&client, &publication, &slot_name, &[&table_name]).await;
+    connection_task.abort();
+    let _ = connection_task.await;
+    capture_result?;
+    primary_cleanup
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5173,6 +5272,32 @@ async fn wait_for_active_slot(client: &Client, slot_name: &str) -> TestResult {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(test_error("replication slot did not become active"))
+}
+
+async fn wait_for_application_session(
+    client: &Client,
+    database: &str,
+    application_name: &str,
+) -> TestResult {
+    for _ in 0..100 {
+        let active = client
+            .query_one(
+                "SELECT EXISTS( \
+                    SELECT 1 FROM pg_stat_activity \
+                    WHERE datname = $1 AND application_name = $2 \
+                )",
+                &[&database, &application_name],
+            )
+            .await?
+            .get::<_, bool>(0);
+        if active {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(test_error(
+        "PostgreSQL regular connection did not apply database.initial.statements",
+    ))
 }
 
 async fn wait_for_confirmed_flush_lsn(

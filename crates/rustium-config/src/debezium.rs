@@ -164,6 +164,9 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
             offset_mismatch_strategy,
             lsn_flush_mode,
             slot_stream_params: postgres_slot_stream_params(properties.get("slot.stream.params"))?,
+            database_initial_statements: postgres_initial_statements(
+                properties.get("database.initial.statements"),
+            ),
             tables: TableSelection { include, exclude },
             ssl_mode: properties
                 .get("database.sslmode")
@@ -1204,6 +1207,36 @@ fn postgres_slot_stream_params(value: Option<&String>) -> Result<BTreeMap<String
         .collect()
 }
 
+fn postgres_initial_statements(value: Option<&String>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let mut statements = Vec::new();
+    let mut statement = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != ';' {
+            statement.push(character);
+            continue;
+        }
+        if chars.peek() == Some(&';') {
+            statement.push(';');
+            chars.next();
+            continue;
+        }
+        let trimmed = statement.trim();
+        if !trimmed.is_empty() {
+            statements.push(trimmed.to_string());
+        }
+        statement.clear();
+    }
+    let trimmed = statement.trim();
+    if !trimmed.is_empty() {
+        statements.push(trimmed.to_string());
+    }
+    statements
+}
+
 fn postgres_replica_identity_rules(
     value: Option<&String>,
 ) -> Result<Vec<PostgresReplicaIdentityRule>> {
@@ -1315,6 +1348,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "database.password",
         "database.dbname",
         "database.sslmode",
+        "database.initial.statements",
         "database.server.id",
         "database.server.id.offset",
         "database.ssl.mode",
@@ -2039,6 +2073,37 @@ slot.stream.params={params}
                 "unexpected validation error: {message}"
             );
         }
+    }
+
+    #[test]
+    fn maps_postgres_database_initial_statements_with_escaped_semicolons() {
+        let configured = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+database.initial.statements= SET application_name = 'rustium;;cdc'; ; SET statement_timeout = '5s';
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .database_initial_statements,
+            [
+                "SET application_name = 'rustium;cdc'",
+                "SET statement_timeout = '5s'"
+            ]
+        );
+        assert!(configured.compatibility_warnings.iter().all(|warning| {
+            !warning.contains("database.initial.statements is recognized but not implemented")
+        }));
     }
 
     #[test]

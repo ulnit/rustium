@@ -252,6 +252,15 @@ impl SourceConfig {
                             serde_json::json!(config.slot_stream_params),
                         );
                 }
+                if !config.database_initial_statements.is_empty() {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "database_initial_statements".into(),
+                            serde_json::json!(config.database_initial_statements),
+                        );
+                }
                 add_heartbeat_semantics(
                     &mut semantic,
                     config.heartbeat_interval,
@@ -446,6 +455,8 @@ pub struct PostgresSourceConfig {
     #[serde(default)]
     pub slot_stream_params: BTreeMap<String, String>,
     #[serde(default)]
+    pub database_initial_statements: Vec<String>,
+    #[serde(default)]
     pub tables: TableSelection,
     #[serde(default = "default_ssl_mode")]
     pub ssl_mode: String,
@@ -552,6 +563,15 @@ impl PostgresSourceConfig {
                     "source.slot_stream_params.origin must be any or none; found {value:?}"
                 )));
             }
+        }
+        if self
+            .database_initial_statements
+            .iter()
+            .any(|statement| statement.trim().is_empty())
+        {
+            return Err(Error::Configuration(
+                "source.database_initial_statements must not contain blank statements".into(),
+            ));
         }
         for pattern in self.tables.include.iter().chain(self.tables.exclude.iter()) {
             if Regex::new(pattern).is_err() {
@@ -2106,6 +2126,7 @@ sink:
         );
         assert_eq!(postgres.lsn_flush_mode, PostgresLsnFlushMode::Connector);
         assert!(postgres.slot_stream_params.is_empty());
+        assert!(postgres.database_initial_statements.is_empty());
         let connection_url = Url::parse(&postgres.connection_url(true).unwrap()).unwrap();
         assert!(
             connection_url
@@ -2171,6 +2192,10 @@ sink:
         assert!(
             config.source.semantic_config()["slot_stream_params"].is_null(),
             "empty slot stream parameters must preserve the old fingerprint shape"
+        );
+        assert!(
+            config.source.semantic_config()["database_initial_statements"].is_null(),
+            "empty database initial statements must preserve the old fingerprint shape"
         );
         assert!(
             config.source.semantic_config()["interval_handling_mode"].is_null(),
@@ -2388,6 +2413,41 @@ sink:
             .unwrap_err();
             assert!(invalid.to_string().contains("slot_stream_params"));
         }
+    }
+
+    #[test]
+    fn parses_native_postgresql_database_initial_statements() {
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  database_initial_statements:\n    - SET application_name = 'rustium-cdc'\n    - SET statement_timeout = '5s'\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .database_initial_statements,
+            [
+                "SET application_name = 'rustium-cdc'",
+                "SET statement_timeout = '5s'"
+            ]
+        );
+        assert_eq!(
+            configured.source.semantic_config()["database_initial_statements"][0],
+            "SET application_name = 'rustium-cdc'"
+        );
+        assert_ne!(
+            Config::from_yaml(CONFIG).unwrap().fingerprint(),
+            configured.fingerprint()
+        );
+
+        let blank = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  database_initial_statements: [' ']\n",
+        ))
+        .unwrap_err();
+        assert!(blank.to_string().contains("database_initial_statements"));
     }
 
     #[test]
