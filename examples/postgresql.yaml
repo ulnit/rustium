@@ -25,6 +25,8 @@ source:
   slot_ownership: managed
   offset_mismatch_strategy: no_validation
   lsn_flush_mode: connector
+  # PostgreSQL 16+: set origin to any or none to filter replication-origin transactions.
+  slot_stream_params: {}
   tables:
     include:
       - public\.(orders|customers)

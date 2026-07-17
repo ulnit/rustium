@@ -84,6 +84,7 @@ impl TestSettings {
             slot_ownership: SlotOwnership::Managed,
             offset_mismatch_strategy: PostgresOffsetMismatchStrategy::NoValidation,
             lsn_flush_mode: PostgresLsnFlushMode::Connector,
+            slot_stream_params: BTreeMap::new(),
             tables: TableSelection {
                 include: vec![format!(r"public\.{table_name}")],
                 exclude: Vec::new(),
@@ -2296,6 +2297,109 @@ async fn applies_debezium_lsn_flush_ownership_modes() -> TestResult {
     capture_result?;
     driver_slot_cleanup?;
     primary_cleanup
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires external PostgreSQL 16+ logical replication and replication-origin administration"]
+async fn applies_pgoutput_origin_slot_stream_parameter() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_origin_{}", &suffix[..12]);
+    let publication = format!("rustium_pg_origin_pub_{}", &suffix[..12]);
+    let none_slot = format!("rustium_pg_origin_none_{}", &suffix[..12]);
+    let any_slot = format!("rustium_pg_origin_any_{}", &suffix[..12]);
+    let origin_name = format!("rustium_pg_origin_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-origin-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let capture_result: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (id BIGINT PRIMARY KEY, note TEXT NOT NULL); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+        client
+            .query_one("SELECT pg_replication_origin_create($1)", &[&origin_name])
+            .await?;
+
+        let mut none_config = settings.source_config(&publication, &none_slot, &table_name);
+        none_config
+            .slot_stream_params
+            .insert("origin".into(), "none".into());
+        let mut source = PostgresSource::new(
+            &connector_name,
+            none_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 32,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let none_capture: TestResult = async {
+            wait_for_active_slot(&client, &none_slot).await?;
+            insert_with_replication_origin(&client, &table_name, &origin_name, 1).await?;
+            client
+                .batch_execute(&format!(
+                    "INSERT INTO public.{table_name} VALUES (2, 'local-none');"
+                ))
+                .await?;
+            require(
+                receive_postgres_create_id(&mut output).await? == 2,
+                "slot.stream.params=origin=none emitted a replicated-origin row",
+            )
+        }
+        .await;
+        let none_stop = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(none_capture, none_stop)?;
+        drop_replication_slot(&client, &none_slot).await?;
+
+        let mut any_config = settings.source_config(&publication, &any_slot, &table_name);
+        any_config
+            .slot_stream_params
+            .insert("origin".into(), "any".into());
+        let mut source = PostgresSource::new(
+            &connector_name,
+            any_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 32,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let any_capture: TestResult = async {
+            wait_for_active_slot(&client, &any_slot).await?;
+            insert_with_replication_origin(&client, &table_name, &origin_name, 3).await?;
+            require(
+                receive_postgres_create_id(&mut output).await? == 3,
+                "slot.stream.params=origin=any did not emit a replicated-origin row",
+            )
+        }
+        .await;
+        let any_stop = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(any_capture, any_stop)
+    }
+    .await;
+
+    let _ = client
+        .simple_query("SELECT pg_replication_origin_session_reset()")
+        .await;
+    let any_slot_cleanup = drop_replication_slot(&client, &any_slot).await;
+    let primary_cleanup = cleanup(&client, &publication, &none_slot, &[&table_name]).await;
+    let origin_cleanup = client
+        .query_one("SELECT pg_replication_origin_drop($1)", &[&origin_name])
+        .await;
+    connection_task.abort();
+    let _ = connection_task.await;
+    capture_result?;
+    any_slot_cleanup?;
+    primary_cleanup?;
+    origin_cleanup?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5005,6 +5109,32 @@ fn postgres_record_commit_lsn(record: &SourceRecord) -> TestResult<u64> {
             "LSN flush fixture emitted a non-PostgreSQL position",
         )),
     }
+}
+
+async fn insert_with_replication_origin(
+    client: &Client,
+    table_name: &str,
+    origin_name: &str,
+    id: i64,
+) -> TestResult {
+    client
+        .query_one(
+            "SELECT pg_replication_origin_session_setup($1)",
+            &[&origin_name],
+        )
+        .await?;
+    let insert_result = client
+        .batch_execute(&format!(
+            "SELECT pg_replication_origin_xact_setup('0/12345', now()); \
+             INSERT INTO public.{table_name} VALUES ({id}, 'replicated-origin');"
+        ))
+        .await;
+    let reset_result = client
+        .simple_query("SELECT pg_replication_origin_session_reset()")
+        .await;
+    insert_result?;
+    reset_result?;
+    Ok(())
 }
 
 async fn receive_postgres_create_id(

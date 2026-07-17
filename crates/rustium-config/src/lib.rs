@@ -243,6 +243,15 @@ impl SourceConfig {
                             serde_json::json!(config.lsn_flush_mode),
                         );
                 }
+                if !config.slot_stream_params.is_empty() {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "slot_stream_params".into(),
+                            serde_json::json!(config.slot_stream_params),
+                        );
+                }
                 add_heartbeat_semantics(
                     &mut semantic,
                     config.heartbeat_interval,
@@ -435,6 +444,8 @@ pub struct PostgresSourceConfig {
     #[serde(default)]
     pub lsn_flush_mode: PostgresLsnFlushMode,
     #[serde(default)]
+    pub slot_stream_params: BTreeMap<String, String>,
+    #[serde(default)]
     pub tables: TableSelection,
     #[serde(default = "default_ssl_mode")]
     pub ssl_mode: String,
@@ -529,6 +540,18 @@ impl PostgresSourceConfig {
             return Err(Error::Configuration(
                 "source.status_update_interval must be greater than zero".into(),
             ));
+        }
+        for (name, value) in &self.slot_stream_params {
+            if name != "origin" {
+                return Err(Error::Configuration(format!(
+                    "source.slot_stream_params currently supports only the pgoutput origin parameter; found {name:?}"
+                )));
+            }
+            if !matches!(value.as_str(), "any" | "none") {
+                return Err(Error::Configuration(format!(
+                    "source.slot_stream_params.origin must be any or none; found {value:?}"
+                )));
+            }
         }
         for pattern in self.tables.include.iter().chain(self.tables.exclude.iter()) {
             if Regex::new(pattern).is_err() {
@@ -2082,6 +2105,7 @@ sink:
             PostgresOffsetMismatchStrategy::NoValidation
         );
         assert_eq!(postgres.lsn_flush_mode, PostgresLsnFlushMode::Connector);
+        assert!(postgres.slot_stream_params.is_empty());
         let connection_url = Url::parse(&postgres.connection_url(true).unwrap()).unwrap();
         assert!(
             connection_url
@@ -2143,6 +2167,10 @@ sink:
         assert!(
             config.source.semantic_config()["lsn_flush_mode"].is_null(),
             "connector LSN flushing must preserve the old fingerprint shape"
+        );
+        assert!(
+            config.source.semantic_config()["slot_stream_params"].is_null(),
+            "empty slot stream parameters must preserve the old fingerprint shape"
         );
         assert!(
             config.source.semantic_config()["interval_handling_mode"].is_null(),
@@ -2324,6 +2352,42 @@ sink:
             Config::from_yaml(CONFIG).unwrap().fingerprint(),
             configured.fingerprint()
         );
+    }
+
+    #[test]
+    fn parses_native_postgresql_slot_stream_origin() {
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  slot_stream_params:\n    origin: none\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .slot_stream_params
+                .get("origin")
+                .map(String::as_str),
+            Some("none")
+        );
+        assert_eq!(
+            configured.source.semantic_config()["slot_stream_params"]["origin"],
+            "none"
+        );
+        assert_ne!(
+            Config::from_yaml(CONFIG).unwrap().fingerprint(),
+            configured.fingerprint()
+        );
+
+        for params in ["    origin: local\n", "    add-tables: public.orders\n"] {
+            let invalid = Config::from_yaml(&CONFIG.replace(
+                "  slot_name: rustium_orders\n",
+                &format!("  slot_name: rustium_orders\n  slot_stream_params:\n{params}"),
+            ))
+            .unwrap_err();
+            assert!(invalid.to_string().contains("slot_stream_params"));
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pg_walstream::{
-    ChangeEvent as WalEvent, ColumnValue, EventType, LogicalReplicationStream,
+    ChangeEvent as WalEvent, ColumnValue, EventType, LogicalReplicationStream, OriginFilter,
     PgReplicationConnection, RelationColumn, ReplicationSlotOptions, ReplicationStreamConfig,
     RetryConfig, RowData, StreamingMode, format_lsn, parse_lsn,
     sql_builder::{quote_ident, quote_literal},
@@ -108,6 +108,7 @@ impl PostgresSource {
                     "PostgreSQL 14 or newer is required; server_version_num={version}"
                 )));
             }
+            validate_slot_stream_server_version(&config.slot_stream_params, version)?;
             let wal_level = scalar(&mut connection, "SHOW wal_level")?;
             if wal_level != "logical" {
                 return Err(Error::Configuration(format!(
@@ -481,6 +482,7 @@ impl SourceConnector for PostgresSource {
             Duration::from_secs(30),
             retry_config,
         )
+        .with_origin(postgres_slot_stream_origin(&self.config)?)
         .with_messages(self.config.captures_logical_decoding_messages())
         .with_slot_options(slot_options);
 
@@ -3217,6 +3219,29 @@ fn connect(connection_url: &str) -> Result<PgReplicationConnection> {
     PgReplicationConnection::connect(connection_url).map_err(pg_error)
 }
 
+fn postgres_slot_stream_origin(config: &PostgresSourceConfig) -> Result<Option<OriginFilter>> {
+    match config.slot_stream_params.get("origin").map(String::as_str) {
+        None => Ok(None),
+        Some("any") => Ok(Some(OriginFilter::Any)),
+        Some("none") => Ok(Some(OriginFilter::None)),
+        Some(value) => Err(Error::Configuration(format!(
+            "source.slot_stream_params.origin must be any or none; found {value:?}"
+        ))),
+    }
+}
+
+fn validate_slot_stream_server_version(
+    params: &BTreeMap<String, String>,
+    version: u32,
+) -> Result<()> {
+    if !params.is_empty() && version < 160_000 {
+        return Err(Error::Configuration(format!(
+            "source.slot_stream_params requires PostgreSQL 16 or newer; server_version_num={version}"
+        )));
+    }
+    Ok(())
+}
+
 fn scalar(connection: &mut PgReplicationConnection, query: &str) -> Result<String> {
     let result = connection.exec(query).map_err(pg_error)?;
     required_value(&result, 0, 0, "query result")
@@ -3824,6 +3849,15 @@ sink:
         );
     }
 
+    #[test]
+    fn requires_postgresql_16_for_pgoutput_origin_filtering() {
+        let params = BTreeMap::from([("origin".into(), "any".into())]);
+        let error = validate_slot_stream_server_version(&params, 150_000).unwrap_err();
+        assert!(error.to_string().contains("PostgreSQL 16"));
+        validate_slot_stream_server_version(&params, 160_000).unwrap();
+        validate_slot_stream_server_version(&BTreeMap::new(), 140_000).unwrap();
+    }
+
     #[tokio::test]
     async fn rejects_legacy_postgres_checkpoint_without_schema_history() {
         let config = PostgresSourceConfig {
@@ -3841,6 +3875,7 @@ sink:
             slot_ownership: SlotOwnership::Managed,
             offset_mismatch_strategy: PostgresOffsetMismatchStrategy::NoValidation,
             lsn_flush_mode: PostgresLsnFlushMode::Connector,
+            slot_stream_params: BTreeMap::new(),
             tables: TableSelection::default(),
             ssl_mode: "disable".into(),
             connect_timeout: Duration::from_secs(1),

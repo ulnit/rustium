@@ -163,6 +163,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
             slot_ownership: SlotOwnership::Managed,
             offset_mismatch_strategy,
             lsn_flush_mode,
+            slot_stream_params: postgres_slot_stream_params(properties.get("slot.stream.params"))?,
             tables: TableSelection { include, exclude },
             ssl_mode: properties
                 .get("database.sslmode")
@@ -1173,6 +1174,36 @@ fn postgres_lsn_flush_mode(mode: &str) -> Result<PostgresLsnFlushMode> {
     }
 }
 
+fn postgres_slot_stream_params(value: Option<&String>) -> Result<BTreeMap<String, String>> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    value
+        .split(';')
+        .filter(|entry| !entry.trim().is_empty())
+        .map(|entry| {
+            let entry = entry.trim();
+            let (name, value) = entry.split_once('=').ok_or_else(|| {
+                Error::Configuration(format!(
+                    "slot.stream.params entry {entry:?} must use <name>=<value>"
+                ))
+            })?;
+            let name = name.trim();
+            let value = value.trim();
+            if name.is_empty() || value.is_empty() || value.contains('=') {
+                return Err(Error::Configuration(format!(
+                    "slot.stream.params entry {entry:?} must contain one non-empty name and value"
+                )));
+            }
+            Ok((name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 fn postgres_replica_identity_rules(
     value: Option<&String>,
 ) -> Result<Vec<PostgresReplicaIdentityRule>> {
@@ -1333,6 +1364,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "database.tcpKeepAlive",
         "slot.max.retries",
         "slot.retry.delay.ms",
+        "slot.stream.params",
         "offset.mismatch.strategy",
         "slot.seek.to.known.offset.on.start",
         "lsn.flush.mode",
@@ -1956,6 +1988,57 @@ lsn.flush.mode=automatic
         )
         .unwrap_err();
         assert!(invalid.to_string().contains("lsn.flush.mode"));
+    }
+
+    #[test]
+    fn maps_postgres_slot_stream_origin() {
+        let configured = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+slot.stream.params=origin=any;
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .slot_stream_params
+                .get("origin")
+                .map(String::as_str),
+            Some("any")
+        );
+        assert!(configured.compatibility_warnings.iter().all(|warning| {
+            !warning.contains("slot.stream.params is recognized but not implemented")
+        }));
+
+        for params in ["origin=local", "add-tables=public.orders", "origin"] {
+            let invalid = parse(&format!(
+                r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+slot.stream.params={params}
+"#
+            ))
+            .unwrap_err();
+            let message = invalid.to_string();
+            assert!(
+                message.contains("slot.stream.params") || message.contains("slot_stream_params"),
+                "unexpected validation error: {message}"
+            );
+        }
     }
 
     #[test]
