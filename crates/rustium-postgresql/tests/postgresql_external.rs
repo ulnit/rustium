@@ -91,6 +91,10 @@ impl TestSettings {
                 exclude: Vec::new(),
             },
             ssl_mode: "disable".into(),
+            ssl_root_cert: None,
+            ssl_cert: None,
+            ssl_key: None,
+            ssl_key_password: None,
             connect_timeout: Duration::from_secs(10),
             status_update_interval: Duration::from_secs(10),
             tcp_keepalive: true,
@@ -2487,6 +2491,137 @@ async fn applies_database_initial_statements_only_to_regular_connections() -> Te
                 break;
             }
             Ok(())
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(source_capture, stop_result)
+    }
+    .await;
+
+    let primary_cleanup = cleanup(&client, &publication, &slot_name, &[&table_name]).await;
+    connection_task.abort();
+    let _ = connection_task.await;
+    capture_result?;
+    primary_cleanup
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires external PostgreSQL with TLS and certificate fixtures"]
+async fn validates_postgresql_tls_for_regular_and_replication_connections() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let tls_hostname = required_env("RUSTIUM_POSTGRES_TEST_TLS_HOSTNAME")?;
+    let root_cert = required_env("RUSTIUM_POSTGRES_TEST_SSL_ROOT_CERT")?;
+    let wrong_root_cert = required_env("RUSTIUM_POSTGRES_TEST_WRONG_SSL_ROOT_CERT")?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_tls_{}", &suffix[..12]);
+    let publication = format!("rustium_pg_tls_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_pg_tls_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-tls-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let capture_result: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (id BIGINT PRIMARY KEY, note TEXT NOT NULL); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+
+        let mut wrong_ca = settings.source_config(&publication, &slot_name, &table_name);
+        wrong_ca.hostname = tls_hostname.clone();
+        wrong_ca.ssl_mode = "verify-ca".into();
+        wrong_ca.ssl_root_cert = Some(wrong_root_cert);
+        let wrong_ca_error = PostgresSource::new(
+            &connector_name,
+            wrong_ca,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 32,
+                include_collections: Vec::new(),
+            },
+        )
+        .validate()
+        .await
+        .unwrap_err();
+        require(
+            wrong_ca_error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("certificate")
+                || wrong_ca_error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("tls"),
+            "verify-ca with the wrong root certificate did not fail as a TLS error",
+        )?;
+
+        let mut wrong_host = settings.source_config(&publication, &slot_name, &table_name);
+        wrong_host.ssl_mode = "verify-full".into();
+        wrong_host.ssl_root_cert = Some(root_cert.clone());
+        let wrong_host_error = PostgresSource::new(
+            &connector_name,
+            wrong_host,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 32,
+                include_collections: Vec::new(),
+            },
+        )
+        .validate()
+        .await
+        .unwrap_err();
+        require(
+            wrong_host_error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("certificate")
+                || wrong_host_error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("name"),
+            "verify-full with a mismatched hostname did not fail certificate validation",
+        )?;
+
+        let mut tls_config = settings.source_config(&publication, &slot_name, &table_name);
+        tls_config.hostname = tls_hostname;
+        tls_config.ssl_mode = "verify-full".into();
+        tls_config.ssl_root_cert = Some(root_cert);
+        let mut source = PostgresSource::new(
+            &connector_name,
+            tls_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 32,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let source_capture: TestResult = async {
+            wait_for_active_slot(&client, &slot_name).await?;
+            let replication_tls = client
+                .query_one(
+                    "SELECT ssl.ssl \
+                     FROM pg_replication_slots AS slot \
+                     JOIN pg_stat_ssl AS ssl ON ssl.pid = slot.active_pid \
+                     WHERE slot.slot_name = $1",
+                    &[&slot_name],
+                )
+                .await?
+                .get::<_, bool>(0);
+            require(
+                replication_tls,
+                "PostgreSQL replication connection did not negotiate TLS",
+            )?;
+            client
+                .batch_execute(&format!(
+                    "INSERT INTO public.{table_name} VALUES (1, 'tls');"
+                ))
+                .await?;
+            require(
+                receive_postgres_create_id(&mut output).await? == 1,
+                "TLS replication stream did not emit the inserted row",
+            )
         }
         .await;
         let stop_result = stop_source(cancellation, source_task).await;

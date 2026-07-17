@@ -8,9 +8,11 @@ container="rustium-pg-extensions-${postgres_version}-$$"
 database=cdc_demo
 password=rustium-extension-test
 dockerfile="$root/crates/rustium-postgresql/tests/postgresql-extensions.Dockerfile"
+tls_dir=$(mktemp -d "${TMPDIR:-/tmp}/rustium-postgres-tls.XXXXXX")
 
 cleanup() {
     docker rm -f "$container" >/dev/null 2>&1 || true
+    rm -rf "$tls_dir"
 }
 trap cleanup EXIT INT TERM
 
@@ -30,6 +32,9 @@ docker run --detach \
         -c wal_level=logical \
         -c max_replication_slots=20 \
         -c max_wal_senders=20 \
+        -c ssl=on \
+        -c ssl_cert_file=/etc/postgresql/rustium-tls/server.crt \
+        -c ssl_key_file=/etc/postgresql/rustium-tls/server.key \
     >/dev/null
 
 ready=false
@@ -53,6 +58,8 @@ docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres -d "$database" \
 
 mapping=$(docker port "$container" 5432/tcp)
 port=${mapping##*:}
+docker cp "$container:/etc/postgresql/rustium-tls/ca.crt" "$tls_dir/ca.crt"
+docker cp "$container:/etc/postgresql/rustium-tls/wrong-ca.crt" "$tls_dir/wrong-ca.crt"
 
 cd "$root"
 RUSTIUM_POSTGRES_TEST_HOST=127.0.0.1 \
@@ -163,6 +170,18 @@ RUSTIUM_POSTGRES_TEST_PASSWORD="$password" \
 RUSTIUM_POSTGRES_TEST_DATABASE="$database" \
 cargo test -p rustium-postgresql --test postgresql_external --locked -- \
     applies_database_initial_statements_only_to_regular_connections \
+    --ignored --exact --nocapture
+
+RUSTIUM_POSTGRES_TEST_HOST=127.0.0.1 \
+RUSTIUM_POSTGRES_TEST_PORT="$port" \
+RUSTIUM_POSTGRES_TEST_USER=postgres \
+RUSTIUM_POSTGRES_TEST_PASSWORD="$password" \
+RUSTIUM_POSTGRES_TEST_DATABASE="$database" \
+RUSTIUM_POSTGRES_TEST_TLS_HOSTNAME=localhost \
+RUSTIUM_POSTGRES_TEST_SSL_ROOT_CERT="$tls_dir/ca.crt" \
+RUSTIUM_POSTGRES_TEST_WRONG_SSL_ROOT_CERT="$tls_dir/wrong-ca.crt" \
+cargo test -p rustium-postgresql --test postgresql_external --locked -- \
+    validates_postgresql_tls_for_regular_and_replication_connections \
     --ignored --exact --nocapture
 
 docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres -d "$database" \

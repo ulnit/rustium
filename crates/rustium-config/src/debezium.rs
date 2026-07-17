@@ -22,6 +22,12 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
             "plugin.name={plugin:?} is not supported; Rustium uses pgoutput"
         )));
     }
+    if properties.contains_key("database.sslfactory") {
+        return Err(Error::Configuration(
+            "database.sslfactory is a JVM-specific PostgreSQL SSLSocketFactory extension and is not supported by Rustium"
+                .into(),
+        ));
+    }
 
     let table_include = csv_property(properties.get("table.include.list"));
     let table_exclude = csv_property(properties.get("table.exclude.list"));
@@ -172,6 +178,10 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 .get("database.sslmode")
                 .cloned()
                 .unwrap_or_else(default_ssl_mode),
+            ssl_root_cert: properties.get("database.sslrootcert").cloned(),
+            ssl_cert: properties.get("database.sslcert").cloned(),
+            ssl_key: properties.get("database.sslkey").cloned(),
+            ssl_key_password: properties.get("database.sslpassword").cloned(),
             connect_timeout: duration_ms(
                 &properties,
                 "connection.validation.timeout.ms",
@@ -1348,6 +1358,10 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "database.password",
         "database.dbname",
         "database.sslmode",
+        "database.sslrootcert",
+        "database.sslcert",
+        "database.sslkey",
+        "database.sslpassword",
         "database.initial.statements",
         "database.server.id",
         "database.server.id.offset",
@@ -2104,6 +2118,70 @@ database.initial.statements= SET application_name = 'rustium;;cdc'; ; SET statem
         assert!(configured.compatibility_warnings.iter().all(|warning| {
             !warning.contains("database.initial.statements is recognized but not implemented")
         }));
+    }
+
+    #[test]
+    fn maps_postgres_server_tls_and_rejects_client_certificates() {
+        let configured = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+database.sslmode=verify-full
+database.sslrootcert=/run/secrets/postgres-ca.pem
+"#,
+        )
+        .unwrap();
+        let source = configured.source.as_postgresql().unwrap();
+        assert_eq!(source.ssl_mode, "verify-full");
+        assert_eq!(
+            source.ssl_root_cert.as_deref(),
+            Some("/run/secrets/postgres-ca.pem")
+        );
+        assert!(configured.compatibility_warnings.iter().all(|warning| {
+            !warning.contains("database.sslrootcert is recognized but not implemented")
+        }));
+
+        let client_certificate = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+database.sslmode=require
+database.sslcert=/run/secrets/client.pem
+database.sslkey=/run/secrets/client.key
+database.sslpassword=secret
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            client_certificate
+                .to_string()
+                .contains("pg_walstream rustls transport")
+        );
+
+        let ssl_factory = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+database.sslfactory=com.example.CustomFactory
+"#,
+        )
+        .unwrap_err();
+        assert!(ssl_factory.to_string().contains("JVM-specific"));
     }
 
     #[test]

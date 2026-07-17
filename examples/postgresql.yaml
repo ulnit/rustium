@@ -32,6 +32,7 @@ source:
     include:
       - public\.(orders|customers)
   ssl_mode: prefer
+  # ssl_root_cert: /run/secrets/postgresql-ca.pem
   status_update_interval: 10s
   tcp_keepalive: true
   heartbeat_interval: 0s

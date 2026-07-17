@@ -460,6 +460,14 @@ pub struct PostgresSourceConfig {
     pub tables: TableSelection,
     #[serde(default = "default_ssl_mode")]
     pub ssl_mode: String,
+    #[serde(default)]
+    pub ssl_root_cert: Option<String>,
+    #[serde(default)]
+    pub ssl_cert: Option<String>,
+    #[serde(default)]
+    pub ssl_key: Option<String>,
+    #[serde(default)]
+    pub ssl_key_password: Option<String>,
     #[serde(default = "default_connect_timeout")]
     #[serde(with = "humantime_serde")]
     pub connect_timeout: Duration,
@@ -550,6 +558,33 @@ impl PostgresSourceConfig {
         if self.status_update_interval.is_zero() {
             return Err(Error::Configuration(
                 "source.status_update_interval must be greater than zero".into(),
+            ));
+        }
+        if !matches!(
+            self.ssl_mode.as_str(),
+            "disable" | "allow" | "prefer" | "require" | "verify-ca" | "verify-full"
+        ) {
+            return Err(Error::Configuration(
+                "source.ssl_mode must be disable, allow, prefer, require, verify-ca, or verify-full"
+                    .into(),
+            ));
+        }
+        for (value, field) in [
+            (self.ssl_root_cert.as_deref(), "source.ssl_root_cert"),
+            (self.ssl_cert.as_deref(), "source.ssl_cert"),
+            (self.ssl_key.as_deref(), "source.ssl_key"),
+            (self.ssl_key_password.as_deref(), "source.ssl_key_password"),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                return Err(Error::Configuration(format!(
+                    "{field} must not be blank when configured"
+                )));
+            }
+        }
+        if self.ssl_cert.is_some() || self.ssl_key.is_some() || self.ssl_key_password.is_some() {
+            return Err(Error::Configuration(
+                "source.ssl_cert, source.ssl_key, and source.ssl_key_password are not supported by the current pg_walstream rustls transport; use server certificate verification with source.ssl_root_cert or omit client-certificate authentication"
+                    .into(),
             ));
         }
         for (name, value) in &self.slot_stream_params {
@@ -775,6 +810,9 @@ impl PostgresSourceConfig {
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("sslmode", &self.ssl_mode);
+            if let Some(root_cert) = &self.ssl_root_cert {
+                query.append_pair("sslrootcert", root_cert);
+            }
             query.append_pair(
                 "connect_timeout",
                 &self.connect_timeout.as_secs().max(1).to_string(),
@@ -2127,6 +2165,7 @@ sink:
         assert_eq!(postgres.lsn_flush_mode, PostgresLsnFlushMode::Connector);
         assert!(postgres.slot_stream_params.is_empty());
         assert!(postgres.database_initial_statements.is_empty());
+        assert!(postgres.ssl_root_cert.is_none());
         let connection_url = Url::parse(&postgres.connection_url(true).unwrap()).unwrap();
         assert!(
             connection_url
@@ -2448,6 +2487,48 @@ sink:
         ))
         .unwrap_err();
         assert!(blank.to_string().contains("database_initial_statements"));
+    }
+
+    #[test]
+    fn validates_native_postgresql_tls_material() {
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  ssl_mode: verify-full\n  ssl_root_cert: /run/secrets/postgres-ca.pem\n",
+        ))
+        .unwrap();
+        let source = configured.source.as_postgresql().unwrap();
+        assert_eq!(source.ssl_mode, "verify-full");
+        assert_eq!(
+            source.ssl_root_cert.as_deref(),
+            Some("/run/secrets/postgres-ca.pem")
+        );
+        let connection_url = Url::parse(&source.connection_url(true).unwrap()).unwrap();
+        assert!(connection_url.query_pairs().any(|(key, value)| {
+            key == "sslrootcert" && value == "/run/secrets/postgres-ca.pem"
+        }));
+        assert_eq!(
+            Config::from_yaml(CONFIG).unwrap().fingerprint(),
+            configured.fingerprint(),
+            "PostgreSQL TLS transport settings must not change event semantics"
+        );
+
+        let invalid_mode = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  ssl_mode: verify_identity\n",
+        ))
+        .unwrap_err();
+        assert!(invalid_mode.to_string().contains("source.ssl_mode"));
+
+        let client_key = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  ssl_mode: require\n  ssl_cert: /run/secrets/client.pem\n  ssl_key: /run/secrets/client.key\n",
+        ))
+        .unwrap_err();
+        assert!(
+            client_key
+                .to_string()
+                .contains("pg_walstream rustls transport")
+        );
     }
 
     #[test]
