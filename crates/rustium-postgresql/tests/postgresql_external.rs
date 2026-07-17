@@ -16,8 +16,9 @@ use rdkafka::{
 };
 use rustium_config::{
     PostgresLsnFlushMode, PostgresOffsetMismatchStrategy, PostgresReplicaIdentity,
-    PostgresReplicaIdentityRule, PostgresSchemaRefreshMode, PostgresSourceConfig,
-    PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode, TableSelection,
+    PostgresReplicaIdentityRule, PostgresSchemaRefreshMode, PostgresSnapshotIsolationMode,
+    PostgresSnapshotLockingMode, PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership,
+    SnapshotConfig, SnapshotMode, TableSelection,
 };
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
@@ -30,7 +31,7 @@ use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
 };
-use tokio_postgres::{Client, Config, NoTls};
+use tokio_postgres::{Client, Config, NoTls, error::SqlState};
 use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn StdError + Send + Sync>>;
@@ -87,6 +88,9 @@ impl TestSettings {
             lsn_flush_mode: PostgresLsnFlushMode::Connector,
             slot_stream_params: BTreeMap::new(),
             database_initial_statements: Vec::new(),
+            snapshot_locking_mode: PostgresSnapshotLockingMode::None,
+            snapshot_lock_timeout: Duration::from_secs(10),
+            snapshot_isolation_mode: PostgresSnapshotIsolationMode::Serializable,
             tables: TableSelection {
                 include: vec![format!(r"public\.{table_name}")],
                 exclude: Vec::new(),
@@ -1311,6 +1315,379 @@ async fn applies_debezium_slot_drop_on_orderly_stop() -> TestResult {
         (Ok(()), Ok(()), Ok(())) => Ok(()),
         (Err(error), _, _) | (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn applies_debezium_snapshot_locking_and_timeout() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let first_table = format!("rustium_pg_lock_a_{}", &suffix[..12]);
+    let second_table = format!("rustium_pg_lock_z_{}", &suffix[..12]);
+    let signal_table = format!("rustium_pg_lock_signal_{}", &suffix[..12]);
+    let publication = format!("rustium_pg_lock_pub_{}", &suffix[..12]);
+    let shared_slot = format!("rustium_pg_lock_slot_{}", &suffix[..12]);
+    let timeout_slot = format!("rustium_pg_timeout_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-snapshot-lock-{}", &suffix[..12]);
+    let advisory_class = 0x5255_5354_i32;
+    let advisory_key = i32::from_str_radix(&suffix[..7], 16)?;
+    let (client, connection_task) = connect(&settings).await?;
+    let (blocker, blocker_task) = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{first_table} (id BIGINT PRIMARY KEY, value TEXT NOT NULL); \
+                 CREATE TABLE public.{second_table} (id BIGINT PRIMARY KEY, value TEXT NOT NULL); \
+                 CREATE TABLE public.{signal_table} (\
+                    id VARCHAR(64), type VARCHAR(32), data VARCHAR(2048)\
+                 ); \
+                 INSERT INTO public.{first_table} VALUES (1, 'one'), (2, 'two'), (3, 'three'); \
+                 INSERT INTO public.{second_table} VALUES (10, 'ten'); \
+                 CREATE PUBLICATION {publication} FOR TABLE \
+                    public.{first_table}, public.{second_table}, public.{signal_table};"
+            ))
+            .await?;
+
+        let mut shared_config = settings.source_config(&publication, &shared_slot, &first_table);
+        shared_config.tables.include = vec![format!(r"public\.({first_table}|{second_table})")];
+        shared_config.snapshot_locking_mode = PostgresSnapshotLockingMode::Shared;
+        shared_config.snapshot_lock_timeout = Duration::from_millis(500);
+        shared_config.signal_data_collection = Some(format!("public.{signal_table}"));
+        let mut shared_source = PostgresSource::new(
+            &connector_name,
+            shared_config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        shared_source.validate().await?;
+        let (mut output, cancellation, source_task) =
+            start_source_with_output_capacity(shared_source, None, 1);
+        let capture_result: TestResult = async {
+            wait_for_output_backpressure(&output).await?;
+            let second_locked = client
+                .query_one(
+                    "SELECT EXISTS (\
+                        SELECT 1 FROM pg_catalog.pg_locks \
+                        WHERE relation = ($1::text)::regclass \
+                          AND mode = 'AccessShareLock' AND granted\
+                    )",
+                    &[&format!("public.{second_table}")],
+                )
+                .await?
+                .get::<_, bool>(0);
+            require(
+                second_locked,
+                "snapshot.locking.mode=shared did not lock the later table before scanning it",
+            )?;
+            let signal_locked = client
+                .query_one(
+                    "SELECT EXISTS (\
+                        SELECT 1 FROM pg_catalog.pg_locks \
+                        WHERE relation = ($1::text)::regclass \
+                          AND mode = 'AccessShareLock' AND granted\
+                    )",
+                    &[&format!("public.{signal_table}")],
+                )
+                .await?
+                .get::<_, bool>(0);
+            require(
+                signal_locked,
+                "snapshot.locking.mode=shared did not lock the configured signal table",
+            )?;
+
+            client.batch_execute("SET lock_timeout = '200ms'").await?;
+            let ddl_result = client
+                .batch_execute(&format!(
+                    "ALTER TABLE public.{second_table} ADD COLUMN blocked_by_snapshot INTEGER"
+                ))
+                .await;
+            client.batch_execute("RESET lock_timeout").await?;
+            let ddl_error = match ddl_result {
+                Ok(()) => {
+                    return Err(test_error(
+                        "concurrent PostgreSQL DDL unexpectedly bypassed the snapshot lock",
+                    ));
+                }
+                Err(error) => error,
+            };
+            require(
+                ddl_error.code() == Some(&SqlState::LOCK_NOT_AVAILABLE),
+                "concurrent PostgreSQL DDL failed for a reason other than snapshot lock timeout",
+            )?;
+
+            let mut snapshot_rows = 0;
+            let mut saw_second_table = false;
+            loop {
+                let record = receive(&mut output).await?;
+                if record.boundary == RecordBoundary::SnapshotComplete {
+                    break;
+                }
+                let event = record
+                    .event
+                    .ok_or_else(|| test_error("snapshot lock test row has no event"))?;
+                require(
+                    event.operation == Operation::Read && event.source.snapshot,
+                    "snapshot lock test emitted a non-snapshot row",
+                )?;
+                saw_second_table |= event.source.table.as_deref() == Some(&second_table);
+                snapshot_rows += 1;
+            }
+            require(snapshot_rows == 4, "snapshot lock test lost snapshot rows")?;
+            require(
+                saw_second_table,
+                "snapshot lock test did not scan the second table",
+            )?;
+            wait_for_active_slot(&client, &shared_slot).await
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)?;
+
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE public.{second_table} ADD COLUMN blocked_by_snapshot INTEGER"
+            ))
+            .await?;
+
+        let mut timeout_config = shared_config;
+        timeout_config.slot_name.clone_from(&timeout_slot);
+        timeout_config.snapshot_lock_timeout = Duration::from_millis(200);
+        timeout_config.database_initial_statements = vec![format!(
+            "SELECT pg_advisory_lock({advisory_class}, {advisory_key}) \
+             WHERE EXISTS (SELECT 1 FROM pg_replication_slots \
+                           WHERE slot_name = '{timeout_slot}')"
+        )];
+        let mut timeout_source = PostgresSource::new(
+            format!("{connector_name}-timeout"),
+            timeout_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        timeout_source.validate().await?;
+
+        blocker
+            .query_one(
+                "SELECT pg_advisory_lock($1, $2)",
+                &[&advisory_class, &advisory_key],
+            )
+            .await?;
+        let (mut timeout_output, timeout_cancellation, mut timeout_task) =
+            start_source(timeout_source, None);
+        let mut source_waiting = false;
+        for _ in 0..50 {
+            source_waiting = client
+                .query_one(
+                    "SELECT EXISTS (\
+                        SELECT 1 FROM pg_catalog.pg_locks \
+                        WHERE locktype = 'advisory' \
+                          AND classid = ($1::int)::oid \
+                          AND objid = ($2::int)::oid \
+                          AND NOT granted\
+                    )",
+                    &[&advisory_class, &advisory_key],
+                )
+                .await?
+                .get::<_, bool>(0);
+            if source_waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        require(
+            source_waiting,
+            "snapshot connection did not reach the advisory synchronization barrier",
+        )?;
+        blocker
+            .batch_execute(&format!(
+                "BEGIN; \
+                 LOCK TABLE public.{second_table} IN ACCESS EXCLUSIVE MODE; \
+                 SELECT pg_advisory_unlock({advisory_class}, {advisory_key})"
+            ))
+            .await?;
+        let timeout_result: TestResult = async {
+            match tokio::time::timeout(Duration::from_secs(5), &mut timeout_task).await {
+                Ok(task_result) => {
+                    let source_error = task_result?
+                        .expect_err("snapshot lock acquisition unexpectedly ignored lock_timeout");
+                    require(
+                        source_error
+                            .to_string()
+                            .contains("snapshot lock acquisition failed")
+                            && source_error.to_string().contains("200ms"),
+                        "snapshot lock timeout did not return contextual source error",
+                    )?;
+                    require(
+                        timeout_output.try_recv().is_err(),
+                        "snapshot emitted a row before all shared locks were acquired",
+                    )
+                }
+                Err(_) => {
+                    stop_source(timeout_cancellation, timeout_task).await?;
+                    Err(test_error(
+                        "snapshot lock acquisition did not honor the configured timeout",
+                    ))
+                }
+            }
+        }
+        .await;
+        timeout_result?;
+        wait_for_inactive_slot(&client, &timeout_slot).await
+    }
+    .await;
+
+    let blocker_cleanup = blocker
+        .batch_execute("ROLLBACK; SELECT pg_advisory_unlock_all()")
+        .await;
+    let cleanup_result = cleanup(
+        &client,
+        &publication,
+        &shared_slot,
+        &[&first_table, &second_table, &signal_table],
+    )
+    .await;
+    let timeout_cleanup = drop_replication_slot(&client, &timeout_slot).await;
+    blocker_task.abort();
+    connection_task.abort();
+    outcome?;
+    blocker_cleanup?;
+    cleanup_result?;
+    timeout_cleanup
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn applies_debezium_snapshot_isolation_modes() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_isolation_{}", &suffix[..12]);
+    let publication = format!("rustium_pg_isolation_pub_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-snapshot-isolation-{}", &suffix[..12]);
+    let modes = [
+        PostgresSnapshotIsolationMode::Serializable,
+        PostgresSnapshotIsolationMode::RepeatableRead,
+        PostgresSnapshotIsolationMode::ReadCommitted,
+        PostgresSnapshotIsolationMode::ReadUncommitted,
+    ];
+    let (client, connection_task) = connect(&settings).await?;
+    let mut slots = Vec::new();
+
+    let outcome: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (id BIGINT PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT INTO public.{table_name} VALUES (1, 'one'), (2, 'two'); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+
+        for (index, mode) in modes.into_iter().enumerate() {
+            let slot_name = format!("rustium_pg_isolation_slot_{}_{index}", &suffix[..8]);
+            slots.push(slot_name.clone());
+            let mut config = settings.source_config(&publication, &slot_name, &table_name);
+            config.snapshot_isolation_mode = mode;
+            let mut source = PostgresSource::new(
+                format!("{connector_name}-{index}"),
+                config,
+                SnapshotConfig {
+                    mode: SnapshotMode::Initial,
+                    fetch_size: 1,
+                    include_collections: Vec::new(),
+                },
+            );
+            source.validate().await?;
+            let (mut output, cancellation, source_task) =
+                start_source_with_output_capacity(source, None, 1);
+            let capture_result: TestResult = async {
+                wait_for_output_backpressure(&output).await?;
+                let inserted_id = 100 + index as i64;
+                client
+                    .execute(
+                        &format!("INSERT INTO public.{table_name} (id, value) VALUES ($1, $2)"),
+                        &[&inserted_id, &format!("mode-{index}")],
+                    )
+                    .await?;
+
+                let mut snapshot_rows = 0;
+                loop {
+                    let record = receive_with_context(
+                        &mut output,
+                        "waiting for PostgreSQL snapshot isolation rows",
+                    )
+                    .await?;
+                    if record.boundary == RecordBoundary::SnapshotComplete {
+                        break;
+                    }
+                    let event = record
+                        .event
+                        .ok_or_else(|| test_error("snapshot isolation row has no event"))?;
+                    require(
+                        event.operation == Operation::Read && event.source.snapshot,
+                        "snapshot isolation emitted a non-snapshot row",
+                    )?;
+                    snapshot_rows += 1;
+                }
+                let expected_before_concurrent_insert = 2 + index;
+                require(
+                    snapshot_rows == expected_before_concurrent_insert
+                        || (!mode.imports_snapshot()
+                            && snapshot_rows == expected_before_concurrent_insert + 1),
+                    "snapshot isolation mode emitted an unexpected row count",
+                )?;
+
+                loop {
+                    let record = receive_with_context(
+                        &mut output,
+                        "waiting for PostgreSQL post-snapshot event",
+                    )
+                    .await?;
+                    let Some(event) = record.event else {
+                        continue;
+                    };
+                    if event.source.table.as_deref() != Some(table_name.as_str()) {
+                        continue;
+                    }
+                    require(
+                        event.operation == Operation::Create && !event.source.snapshot,
+                        "snapshot isolation changed streaming event semantics",
+                    )?;
+                    require(
+                        event.after.as_ref().and_then(|row| row.get("id"))
+                            == Some(&DataValue::Int64(inserted_id)),
+                        "snapshot isolation lost the first post-snapshot row",
+                    )?;
+                    break;
+                }
+                Ok(())
+            }
+            .await;
+            let stop_result = stop_source(cancellation, source_task).await;
+            combine_capture_and_stop(capture_result, stop_result)?;
+            drop_replication_slot(&client, &slot_name).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    let cleanup_result = cleanup(
+        &client,
+        &publication,
+        slots.first().map_or("", String::as_str),
+        &[&table_name],
+    )
+    .await;
+    for slot_name in &slots {
+        let _ = drop_replication_slot(&client, slot_name).await;
+    }
+    connection_task.abort();
+    outcome?;
+    cleanup_result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

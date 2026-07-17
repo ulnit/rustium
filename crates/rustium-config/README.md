@@ -16,6 +16,10 @@ PostgreSQL `slot.failover` maps to native `source.slot_failover`. It defaults to
 
 PostgreSQL `slot.drop.on.stop` maps to native `source.drop_slot_on_stop`. It defaults to false, is valid only for managed slots, and is excluded from fingerprints because it affects orderly lifecycle cleanup rather than event selection.
 
+PostgreSQL `snapshot.locking.mode=none|shared` maps to native `source.snapshot_locking_mode`; `snapshot.lock.timeout.ms` maps to the 10-second native `source.snapshot_lock_timeout`. Both are operational and excluded from fingerprints. Java SPI mode `custom` and timeouts above PostgreSQL's signed 32-bit millisecond limit fail validation.
+
+PostgreSQL `snapshot.isolation.mode` maps to native `source.snapshot_isolation_mode` and accepts `serializable`, `repeatable_read`, `read_committed`, and `read_uncommitted`. Serializable and `repeatable_read` preserve existing fingerprints because both import the same exported snapshot; the lower modes are fingerprinted because they alter snapshot consistency and slot handoff.
+
 PostgreSQL `interval.handling.mode` accepts Debezium `numeric` and `string`; properties default to `numeric`. Native `source.interval_handling_mode` additionally accepts the backward-compatible `postgres` default, which is omitted from fingerprint material.
 
 PostgreSQL `money.fraction.digits` maps to native `source.money_fraction_digits` and defaults to `2`. Non-default signed 16-bit scales are fingerprinted because they change MONEY schemas and values.
@@ -41,6 +45,10 @@ PostgreSQL `publish.via.partition.root` 映射为原生 `source.publish_via_part
 PostgreSQL `slot.failover` 映射为原生 `source.slot_failover`。默认值为 false，只有启用时才进入 fingerprint；failover 配置只适用于 managed slot。
 
 PostgreSQL `slot.drop.on.stop` 映射为原生 `source.drop_slot_on_stop`。默认值为 false，只适用于 managed slot；它影响有序生命周期清理而不是事件选择，因此不进入 fingerprint。
+
+PostgreSQL `snapshot.locking.mode=none|shared` 映射为原生 `source.snapshot_locking_mode`；`snapshot.lock.timeout.ms` 映射为默认 10 秒的原生 `source.snapshot_lock_timeout`。两者都是运维参数，不进入 fingerprint。Java SPI 模式 `custom` 以及超过 PostgreSQL 有符号 32 位毫秒上限的 timeout 会校验失败。
+
+PostgreSQL `snapshot.isolation.mode` 映射为原生 `source.snapshot_isolation_mode`，接受 `serializable`、`repeatable_read`、`read_committed` 和 `read_uncommitted`。`serializable` 与 `repeatable_read` 都导入同一 exported snapshot，因此保持既有 fingerprint；较低模式会改变 snapshot 一致性和 slot handoff，因此进入 fingerprint。
 
 PostgreSQL `interval.handling.mode` 接受 Debezium 的 `numeric` 和 `string`，properties 默认使用 `numeric`。原生 `source.interval_handling_mode` 还接受向后兼容的默认值 `postgres`，该默认值不会进入 fingerprint material。
 

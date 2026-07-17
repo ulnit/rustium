@@ -174,6 +174,21 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
             database_initial_statements: postgres_initial_statements(
                 properties.get("database.initial.statements"),
             ),
+            snapshot_locking_mode: postgres_snapshot_locking_mode(
+                properties
+                    .get("snapshot.locking.mode")
+                    .map_or("none", String::as_str),
+            )?,
+            snapshot_lock_timeout: duration_ms(
+                &properties,
+                "snapshot.lock.timeout.ms",
+                default_postgres_snapshot_lock_timeout(),
+            )?,
+            snapshot_isolation_mode: postgres_snapshot_isolation_mode(
+                properties
+                    .get("snapshot.isolation.mode")
+                    .map_or("serializable", String::as_str),
+            )?,
             tables: TableSelection { include, exclude },
             ssl_mode: properties
                 .get("database.sslmode")
@@ -1192,6 +1207,32 @@ fn postgres_schema_refresh_mode(mode: &str) -> Result<PostgresSchemaRefreshMode>
     }
 }
 
+fn postgres_snapshot_locking_mode(mode: &str) -> Result<PostgresSnapshotLockingMode> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(PostgresSnapshotLockingMode::None),
+        "shared" => Ok(PostgresSnapshotLockingMode::Shared),
+        "custom" => Err(Error::Configuration(
+            "snapshot.locking.mode=custom requires Debezium's Java SnapshotLock SPI and is not supported by Rustium"
+                .into(),
+        )),
+        _ => Err(Error::Configuration(format!(
+            "snapshot.locking.mode={mode:?} must be none or shared"
+        ))),
+    }
+}
+
+fn postgres_snapshot_isolation_mode(mode: &str) -> Result<PostgresSnapshotIsolationMode> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "serializable" => Ok(PostgresSnapshotIsolationMode::Serializable),
+        "repeatable_read" => Ok(PostgresSnapshotIsolationMode::RepeatableRead),
+        "read_committed" => Ok(PostgresSnapshotIsolationMode::ReadCommitted),
+        "read_uncommitted" => Ok(PostgresSnapshotIsolationMode::ReadUncommitted),
+        _ => Err(Error::Configuration(format!(
+            "snapshot.isolation.mode={mode:?} must be serializable, repeatable_read, read_committed, or read_uncommitted"
+        ))),
+    }
+}
+
 fn postgres_offset_mismatch_strategy(strategy: &str) -> Result<PostgresOffsetMismatchStrategy> {
     match strategy.trim().to_ascii_lowercase().as_str() {
         "no_validation" => Ok(PostgresOffsetMismatchStrategy::NoValidation),
@@ -1427,6 +1468,8 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "replica.identity.autoset.values",
         "publish.via.partition.root",
         "snapshot.mode",
+        "snapshot.locking.mode",
+        "snapshot.lock.timeout.ms",
         "snapshot.fetch.size",
         "snapshot.include.collection.list",
         "table.include.list",
@@ -1575,6 +1618,9 @@ slot.name=orders_slot
 slot.drop.on.stop=true
 slot.failover=true
 status.update.interval.ms=250
+snapshot.isolation.mode=read_committed
+snapshot.locking.mode=shared
+snapshot.lock.timeout.ms=750
 publication.name=orders_pub
 publication.autocreate.mode=filtered
 replica.identity.autoset.values=public\\.orders:FULL,public\\.customers:INDEX customers_replica_key
@@ -1672,6 +1718,15 @@ max.batch.size=1000
         assert!(source.drop_slot_on_stop);
         assert!(source.slot_failover);
         assert_eq!(
+            source.snapshot_locking_mode,
+            PostgresSnapshotLockingMode::Shared
+        );
+        assert_eq!(source.snapshot_lock_timeout, Duration::from_millis(750));
+        assert_eq!(
+            source.snapshot_isolation_mode,
+            PostgresSnapshotIsolationMode::ReadCommitted
+        );
+        assert_eq!(
             source.replica_identity_autoset_values[0].table,
             r"public\.orders"
         );
@@ -1697,6 +1752,46 @@ max.batch.size=1000
                 .iter()
                 .all(|warning| !warning.contains("slot.drop.on.stop"))
         );
+        assert!(
+            config
+                .compatibility_warnings
+                .iter()
+                .all(|warning| !warning.contains("snapshot.lock"))
+        );
+    }
+
+    #[test]
+    fn rejects_custom_postgres_snapshot_locking_spi() {
+        let error = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+snapshot.locking.mode=custom
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("SnapshotLock SPI"));
+    }
+
+    #[test]
+    fn rejects_invalid_postgres_snapshot_isolation_mode() {
+        let error = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+snapshot.isolation.mode=dirty_read
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("snapshot.isolation.mode"));
     }
 
     #[test]

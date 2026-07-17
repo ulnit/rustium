@@ -16,7 +16,8 @@ use pg_walstream::{
 use regex::Regex;
 use rustium_config::{
     PostgresLsnFlushMode, PostgresOffsetMismatchStrategy, PostgresReplicaIdentity,
-    PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode,
+    PostgresSnapshotIsolationMode, PostgresSnapshotLockingMode, PostgresSourceConfig,
+    PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode,
 };
 use rustium_core::{
     ChangeEvent, DataValue, Error, EventId, EventSchema, FieldSchema, Operation, PostgresPosition,
@@ -275,7 +276,7 @@ impl PostgresSource {
 
     async fn run_snapshot(
         &self,
-        snapshot_name: String,
+        snapshot_name: Option<String>,
         output: mpsc::Sender<Result<SourceRecord>>,
     ) -> Result<SnapshotOutcome> {
         let config = self.config.clone();
@@ -285,19 +286,25 @@ impl PostgresSource {
         tokio::task::spawn_blocking(move || {
             let mut connection = connect_regular(&config)?;
             connection
-                .exec("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .exec(snapshot_transaction_statement(
+                    config.snapshot_isolation_mode,
+                    snapshot_name.is_some(),
+                ))
                 .map_err(pg_error)?;
-            let snapshot = quote_literal(&snapshot_name).map_err(pg_error)?;
-            connection
-                .exec(&format!("SET TRANSACTION SNAPSHOT {snapshot}"))
-                .map_err(pg_error)?;
+            if let Some(snapshot_name) = snapshot_name {
+                let snapshot = quote_literal(&snapshot_name).map_err(pg_error)?;
+                connection
+                    .exec(&format!("SET TRANSACTION SNAPSHOT {snapshot}"))
+                    .map_err(pg_error)?;
+            }
 
+            lock_snapshot_tables(&mut connection, &config, &snapshot_config)?;
             let schemas = discover_tables(&mut connection, &config)?;
             let slot = quote_literal(&config.slot_name).map_err(pg_error)?;
             let anchor_text = scalar(
                 &mut connection,
                 &format!(
-                    "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = {slot}"
+                    "SELECT COALESCE(confirmed_flush_lsn, restart_lsn)::text FROM pg_replication_slots WHERE slot_name = {slot}"
                 ),
             )?;
             let anchor_lsn = parse_lsn(&anchor_text).map_err(pg_error)?;
@@ -680,7 +687,14 @@ impl SourceConnector for PostgresSource {
         let slot_failover = resolve_slot_failover(&self.config).await?;
         let replication_url = self.config.connection_url(true)?;
         let slot_options = ReplicationSlotOptions {
-            snapshot: Some(if snapshot_needed { "export" } else { "nothing" }.into()),
+            snapshot: Some(
+                if snapshot_needed && self.config.snapshot_isolation_mode.imports_snapshot() {
+                    "export"
+                } else {
+                    "nothing"
+                }
+                .into(),
+            ),
             ..ReplicationSlotOptions::default()
         };
         let retry_config = postgres_retry_config(self.retry_policy, self.config.connect_timeout);
@@ -730,15 +744,21 @@ impl SourceConnector for PostgresSource {
         }
 
         if snapshot_needed {
-            let snapshot_name = stream
-                .exported_snapshot_name()
-                .ok_or_else(|| {
-                    Error::Source(
-                        "PostgreSQL did not export a snapshot for the managed replication slot"
-                            .into(),
-                    )
-                })?
-                .to_string();
+            let snapshot_name = if self.config.snapshot_isolation_mode.imports_snapshot() {
+                Some(
+                    stream
+                        .exported_snapshot_name()
+                        .ok_or_else(|| {
+                            Error::Source(
+                                "PostgreSQL did not export a snapshot for the managed replication slot"
+                                    .into(),
+                            )
+                        })?
+                        .to_string(),
+                )
+            } else {
+                None
+            };
             let outcome = self
                 .run_snapshot(snapshot_name, context.output.clone())
                 .await?;
@@ -2363,6 +2383,94 @@ fn snapshot_table(
         }
     }
     info!(table = %format!("{}.{}", schema.schema, schema.table), rows = offset, "snapshot table completed");
+    Ok(())
+}
+
+fn snapshot_transaction_statement(
+    mode: PostgresSnapshotIsolationMode,
+    imports_exported_snapshot: bool,
+) -> &'static str {
+    if imports_exported_snapshot {
+        // PostgreSQL only permits SET TRANSACTION SNAPSHOT in REPEATABLE READ or
+        // SERIALIZABLE transactions. Debezium uses REPEATABLE READ for its
+        // exported-snapshot path, including the serializable default.
+        return "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY";
+    }
+    match mode {
+        PostgresSnapshotIsolationMode::Serializable => {
+            "BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE"
+        }
+        PostgresSnapshotIsolationMode::RepeatableRead => {
+            "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+        }
+        PostgresSnapshotIsolationMode::ReadCommitted => {
+            "BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY"
+        }
+        PostgresSnapshotIsolationMode::ReadUncommitted => {
+            "BEGIN TRANSACTION ISOLATION LEVEL READ UNCOMMITTED READ ONLY"
+        }
+    }
+}
+
+fn lock_snapshot_tables(
+    connection: &mut PgReplicationConnection,
+    config: &PostgresSourceConfig,
+    snapshot: &SnapshotConfig,
+) -> Result<()> {
+    if config.snapshot_locking_mode == PostgresSnapshotLockingMode::None {
+        return Ok(());
+    }
+
+    let timeout_ms = config.snapshot_lock_timeout.as_millis();
+    connection
+        .exec(&format!("SET LOCAL lock_timeout = {timeout_ms}"))
+        .map_err(pg_error)?;
+    let publication = quote_literal(&config.publication).map_err(pg_error)?;
+    let tables = connection
+        .exec(&format!(
+            "SELECT schemaname, tablename FROM pg_catalog.pg_publication_tables \
+             WHERE pubname = {publication} ORDER BY schemaname, tablename"
+        ))
+        .map_err(|error| {
+            Error::Source(format!(
+                "PostgreSQL snapshot lock acquisition failed while discovering captured tables with snapshot_lock_timeout={timeout_ms}ms: {error}"
+            ))
+        })?;
+    let mut captured = Vec::new();
+    for row in 0..tables.ntuples() {
+        let schema = required_value(&tables, row, 0, "snapshot lock table schema")?;
+        let table = required_value(&tables, row, 1, "snapshot lock table name")?;
+        let qualified = format!("{schema}.{table}");
+        let signal_table = config.signal_data_collection.as_deref() == Some(qualified.as_str());
+        if signal_table
+            || (config.tables.includes(&schema, &table)
+                && snapshot_includes(snapshot, &schema, &table))
+        {
+            captured.push((schema, table));
+        }
+    }
+    if captured.is_empty() {
+        return Ok(());
+    }
+
+    for (schema, table) in &captured {
+        let qualified = format!(
+            "{}.{}",
+            quote_ident(schema).map_err(pg_error)?,
+            quote_ident(table).map_err(pg_error)?
+        );
+        connection
+            .exec(&format!("LOCK TABLE {qualified} IN ACCESS SHARE MODE"))
+            .map_err(|error| {
+                Error::Source(format!(
+                    "PostgreSQL snapshot lock acquisition failed for {schema}.{table} with snapshot_lock_timeout={timeout_ms}ms: {error}"
+                ))
+            })?;
+    }
+    info!(
+        tables = captured.len(),
+        timeout_ms, "PostgreSQL snapshot ACCESS SHARE locks acquired"
+    );
     Ok(())
 }
 
@@ -4612,6 +4720,30 @@ sink:
         validate_slot_stream_server_version(&BTreeMap::new(), 140_000).unwrap();
     }
 
+    #[test]
+    fn builds_debezium_snapshot_isolation_transactions() {
+        assert_eq!(
+            snapshot_transaction_statement(PostgresSnapshotIsolationMode::Serializable, true),
+            "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+        );
+        assert_eq!(
+            snapshot_transaction_statement(PostgresSnapshotIsolationMode::RepeatableRead, true),
+            "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+        );
+        assert_eq!(
+            snapshot_transaction_statement(PostgresSnapshotIsolationMode::Serializable, false),
+            "BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE"
+        );
+        assert_eq!(
+            snapshot_transaction_statement(PostgresSnapshotIsolationMode::ReadCommitted, false),
+            "BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY"
+        );
+        assert_eq!(
+            snapshot_transaction_statement(PostgresSnapshotIsolationMode::ReadUncommitted, false),
+            "BEGIN TRANSACTION ISOLATION LEVEL READ UNCOMMITTED READ ONLY"
+        );
+    }
+
     #[tokio::test]
     async fn rejects_legacy_postgres_checkpoint_without_schema_history() {
         let config = PostgresSourceConfig {
@@ -4632,6 +4764,9 @@ sink:
             lsn_flush_mode: PostgresLsnFlushMode::Connector,
             slot_stream_params: BTreeMap::new(),
             database_initial_statements: Vec::new(),
+            snapshot_locking_mode: PostgresSnapshotLockingMode::None,
+            snapshot_lock_timeout: Duration::from_secs(10),
+            snapshot_isolation_mode: PostgresSnapshotIsolationMode::Serializable,
             tables: TableSelection::default(),
             ssl_mode: "disable".into(),
             ssl_root_cert: None,

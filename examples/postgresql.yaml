@@ -29,6 +29,9 @@ source:
   # PostgreSQL 16+: set origin to any or none to filter replication-origin transactions.
   slot_stream_params: {}
   database_initial_statements: []
+  snapshot_isolation_mode: serializable
+  snapshot_locking_mode: none
+  snapshot_lock_timeout: 10s
   tables:
     include:
       - public\.(orders|customers)

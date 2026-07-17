@@ -243,6 +243,15 @@ impl SourceConfig {
                             serde_json::json!(config.lsn_flush_mode),
                         );
                 }
+                if !config.snapshot_isolation_mode.imports_snapshot() {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "snapshot_isolation_mode".into(),
+                            serde_json::json!(config.snapshot_isolation_mode),
+                        );
+                }
                 if !config.slot_stream_params.is_empty() {
                     semantic
                         .as_object_mut()
@@ -474,6 +483,13 @@ pub struct PostgresSourceConfig {
     #[serde(default)]
     pub database_initial_statements: Vec<String>,
     #[serde(default)]
+    pub snapshot_locking_mode: PostgresSnapshotLockingMode,
+    #[serde(default = "default_postgres_snapshot_lock_timeout")]
+    #[serde(with = "humantime_serde")]
+    pub snapshot_lock_timeout: Duration,
+    #[serde(default)]
+    pub snapshot_isolation_mode: PostgresSnapshotIsolationMode,
+    #[serde(default)]
     pub tables: TableSelection,
     #[serde(default = "default_ssl_mode")]
     pub ssl_mode: String,
@@ -636,6 +652,12 @@ impl PostgresSourceConfig {
             return Err(Error::Configuration(
                 "source.database_initial_statements must not contain blank statements".into(),
             ));
+        }
+        if self.snapshot_lock_timeout.as_millis() > i32::MAX as u128 {
+            return Err(Error::Configuration(format!(
+                "source.snapshot_lock_timeout must not exceed {}ms",
+                i32::MAX
+            )));
         }
         for pattern in self.tables.include.iter().chain(self.tables.exclude.iter()) {
             if Regex::new(pattern).is_err() {
@@ -1392,6 +1414,31 @@ pub enum PostgresSchemaRefreshMode {
     ColumnsDiffExcludeUnchangedToast,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostgresSnapshotLockingMode {
+    #[default]
+    None,
+    Shared,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostgresSnapshotIsolationMode {
+    #[default]
+    Serializable,
+    RepeatableRead,
+    ReadCommitted,
+    ReadUncommitted,
+}
+
+impl PostgresSnapshotIsolationMode {
+    #[must_use]
+    pub const fn imports_snapshot(self) -> bool {
+        matches!(self, Self::Serializable | Self::RepeatableRead)
+    }
+}
+
 impl PostgresOffsetMismatchStrategy {
     #[must_use]
     pub const fn advances_slot(self) -> bool {
@@ -2060,6 +2107,9 @@ const fn default_connect_timeout() -> Duration {
 const fn default_postgres_status_update_interval() -> Duration {
     Duration::from_secs(10)
 }
+const fn default_postgres_snapshot_lock_timeout() -> Duration {
+    Duration::from_secs(10)
+}
 const fn default_snapshot_fetch_size() -> usize {
     10_000
 }
@@ -2206,6 +2256,18 @@ sink:
         assert_eq!(postgres.lsn_flush_mode, PostgresLsnFlushMode::Connector);
         assert!(postgres.slot_stream_params.is_empty());
         assert!(postgres.database_initial_statements.is_empty());
+        assert_eq!(
+            postgres.snapshot_locking_mode,
+            PostgresSnapshotLockingMode::None
+        );
+        assert_eq!(
+            postgres.snapshot_lock_timeout,
+            default_postgres_snapshot_lock_timeout()
+        );
+        assert_eq!(
+            postgres.snapshot_isolation_mode,
+            PostgresSnapshotIsolationMode::Serializable
+        );
         assert!(postgres.ssl_root_cert.is_none());
         assert!(!postgres.include_unknown_datatypes);
         assert_eq!(
@@ -2277,6 +2339,10 @@ sink:
         assert!(
             config.source.semantic_config()["lsn_flush_mode"].is_null(),
             "connector LSN flushing must preserve the old fingerprint shape"
+        );
+        assert!(
+            config.source.semantic_config()["snapshot_isolation_mode"].is_null(),
+            "the default PostgreSQL snapshot isolation mode must preserve the old fingerprint shape"
         );
         assert!(
             config.source.semantic_config()["slot_stream_params"].is_null(),
@@ -2570,6 +2636,74 @@ sink:
         ))
         .unwrap_err();
         assert!(blank.to_string().contains("database_initial_statements"));
+    }
+
+    #[test]
+    fn parses_native_postgresql_snapshot_locking_without_changing_fingerprint() {
+        let baseline = Config::from_yaml(CONFIG).unwrap();
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  snapshot_locking_mode: shared\n  snapshot_lock_timeout: 250ms\n",
+        ))
+        .unwrap();
+        let source = configured.source.as_postgresql().unwrap();
+        assert_eq!(
+            source.snapshot_locking_mode,
+            PostgresSnapshotLockingMode::Shared
+        );
+        assert_eq!(source.snapshot_lock_timeout, Duration::from_millis(250));
+        assert_eq!(baseline.fingerprint(), configured.fingerprint());
+
+        let too_large = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  snapshot_lock_timeout: 2147483648ms\n",
+        ))
+        .unwrap_err();
+        assert!(too_large.to_string().contains("must not exceed"));
+    }
+
+    #[test]
+    fn parses_native_postgresql_snapshot_isolation_modes_into_fingerprint() {
+        let baseline = Config::from_yaml(CONFIG).unwrap();
+        for mode in [
+            "serializable",
+            "repeatable_read",
+            "read_committed",
+            "read_uncommitted",
+        ] {
+            let configured = Config::from_yaml(&CONFIG.replace(
+                "  slot_name: rustium_orders\n",
+                &format!("  slot_name: rustium_orders\n  snapshot_isolation_mode: {mode}\n"),
+            ))
+            .unwrap();
+            let expected = match mode {
+                "serializable" => PostgresSnapshotIsolationMode::Serializable,
+                "repeatable_read" => PostgresSnapshotIsolationMode::RepeatableRead,
+                "read_committed" => PostgresSnapshotIsolationMode::ReadCommitted,
+                "read_uncommitted" => PostgresSnapshotIsolationMode::ReadUncommitted,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                configured
+                    .source
+                    .as_postgresql()
+                    .unwrap()
+                    .snapshot_isolation_mode,
+                expected
+            );
+            if matches!(mode, "serializable" | "repeatable_read") {
+                assert_eq!(baseline.fingerprint(), configured.fingerprint());
+            } else {
+                assert_ne!(baseline.fingerprint(), configured.fingerprint());
+            }
+        }
+
+        let invalid = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  snapshot_isolation_mode: dirty_read\n",
+        ))
+        .unwrap_err();
+        assert!(invalid.to_string().contains("dirty_read"));
     }
 
     #[test]
