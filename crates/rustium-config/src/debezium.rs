@@ -112,6 +112,20 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
             "slot.seek.to.known.offset.on.start is deprecated; use offset.mismatch.strategy".into(),
         );
     }
+    let lsn_flush_mode = if let Some(mode) = properties.get("lsn.flush.mode") {
+        postgres_lsn_flush_mode(mode)?
+    } else if properties.contains_key("flush.lsn.source") {
+        if bool_value(&properties, "flush.lsn.source", true)? {
+            PostgresLsnFlushMode::Connector
+        } else {
+            PostgresLsnFlushMode::Manual
+        }
+    } else {
+        PostgresLsnFlushMode::default()
+    };
+    if properties.contains_key("flush.lsn.source") {
+        warnings.push("flush.lsn.source is deprecated; use lsn.flush.mode".into());
+    }
 
     assemble_config(
         &properties,
@@ -148,6 +162,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
             slot_failover: bool_value(&properties, "slot.failover", false)?,
             slot_ownership: SlotOwnership::Managed,
             offset_mismatch_strategy,
+            lsn_flush_mode,
             tables: TableSelection { include, exclude },
             ssl_mode: properties
                 .get("database.sslmode")
@@ -1147,6 +1162,17 @@ fn postgres_offset_mismatch_strategy(strategy: &str) -> Result<PostgresOffsetMis
     }
 }
 
+fn postgres_lsn_flush_mode(mode: &str) -> Result<PostgresLsnFlushMode> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "connector" => Ok(PostgresLsnFlushMode::Connector),
+        "manual" => Ok(PostgresLsnFlushMode::Manual),
+        "connector_and_driver" => Ok(PostgresLsnFlushMode::ConnectorAndDriver),
+        _ => Err(Error::Configuration(format!(
+            "lsn.flush.mode={mode:?} must be connector, manual, or connector_and_driver"
+        ))),
+    }
+}
+
 fn postgres_replica_identity_rules(
     value: Option<&String>,
 ) -> Result<Vec<PostgresReplicaIdentityRule>> {
@@ -1309,6 +1335,8 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "slot.retry.delay.ms",
         "offset.mismatch.strategy",
         "slot.seek.to.known.offset.on.start",
+        "lsn.flush.mode",
+        "flush.lsn.source",
         "unavailable.value.placeholder",
         "tombstones.on.delete",
         "key.converter",
@@ -1870,6 +1898,64 @@ offset.mismatch.strategy=guess
         )
         .unwrap_err();
         assert!(invalid.to_string().contains("offset.mismatch.strategy"));
+    }
+
+    #[test]
+    fn maps_postgres_lsn_flush_modes_and_deprecated_alias() {
+        let configured = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+lsn.flush.mode=connector_and_driver
+flush.lsn.source=false
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured.source.as_postgresql().unwrap().lsn_flush_mode,
+            PostgresLsnFlushMode::ConnectorAndDriver
+        );
+        assert!(configured.compatibility_warnings.iter().any(|warning| {
+            warning.contains("flush.lsn.source") && warning.contains("deprecated")
+        }));
+
+        let alias = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+flush.lsn.source=false
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            alias.source.as_postgresql().unwrap().lsn_flush_mode,
+            PostgresLsnFlushMode::Manual
+        );
+
+        let invalid = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+lsn.flush.mode=automatic
+"#,
+        )
+        .unwrap_err();
+        assert!(invalid.to_string().contains("lsn.flush.mode"));
     }
 
     #[test]

@@ -15,9 +15,9 @@ use rdkafka::{
     util::Timeout,
 };
 use rustium_config::{
-    PostgresOffsetMismatchStrategy, PostgresReplicaIdentity, PostgresReplicaIdentityRule,
-    PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode,
-    TableSelection,
+    PostgresLsnFlushMode, PostgresOffsetMismatchStrategy, PostgresReplicaIdentity,
+    PostgresReplicaIdentityRule, PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership,
+    SnapshotConfig, SnapshotMode, TableSelection,
 };
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
@@ -83,6 +83,7 @@ impl TestSettings {
             slot_failover: false,
             slot_ownership: SlotOwnership::Managed,
             offset_mismatch_strategy: PostgresOffsetMismatchStrategy::NoValidation,
+            lsn_flush_mode: PostgresLsnFlushMode::Connector,
             tables: TableSelection {
                 include: vec![format!(r"public\.{table_name}")],
                 exclude: Vec::new(),
@@ -2158,6 +2159,142 @@ async fn reconciles_debezium_checkpoint_slot_mismatch_strategies() -> TestResult
     let _ = connection_task.await;
     capture_result?;
     greater_slot_cleanup?;
+    primary_cleanup
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires external PostgreSQL logical replication"]
+async fn applies_debezium_lsn_flush_ownership_modes() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_flush_{}", &suffix[..12]);
+    let unmonitored_table = format!("rustium_pg_flush_other_{}", &suffix[..12]);
+    let publication = format!("rustium_pg_flush_pub_{}", &suffix[..12]);
+    let manual_slot = format!("rustium_pg_manual_slot_{}", &suffix[..12]);
+    let driver_slot = format!("rustium_pg_driver_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-flush-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let capture_result: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (id BIGINT PRIMARY KEY, note TEXT NOT NULL); \
+                 CREATE TABLE public.{unmonitored_table} (id BIGINT PRIMARY KEY); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+
+        let mut manual_config = settings.source_config(&publication, &manual_slot, &table_name);
+        manual_config.status_update_interval = Duration::from_millis(25);
+        manual_config.lsn_flush_mode = PostgresLsnFlushMode::Manual;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            manual_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 32,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let running = start_source_with_acknowledgement(source, None, 512);
+        let mut output = running.output;
+        let cancellation = running.cancellation;
+        let source_task = running.task;
+        let acknowledgement = running.acknowledgement;
+        wait_for_active_slot(&client, &manual_slot).await?;
+
+        client
+            .batch_execute(&format!(
+                "INSERT INTO public.{table_name} VALUES (1, 'manual-ack');"
+            ))
+            .await?;
+        let manual_commit = receive_postgres_transaction_commit(&mut output).await?;
+        let manual_ack_lsn = postgres_record_commit_lsn(&manual_commit)?;
+        acknowledgement
+            .send(Some(manual_commit.position))
+            .map_err(|error| test_error(&format!("failed to send manual LSN ack: {error}")))?;
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        client
+            .batch_execute(&format!(
+                "INSERT INTO public.{table_name} (id, note) \
+                 SELECT generated.id, 'manual-drive' \
+                 FROM generate_series(2, 170) AS generated(id);"
+            ))
+            .await?;
+        receive_postgres_transaction_commit(&mut output).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        require(
+            replication_slot_confirmed_lsn(&client, &manual_slot).await? < manual_ack_lsn,
+            "lsn.flush.mode=manual reported a runtime acknowledgement to PostgreSQL",
+        )?;
+        stop_source(cancellation, source_task).await?;
+
+        let mut driver_config = settings.source_config(&publication, &driver_slot, &table_name);
+        driver_config.status_update_interval = Duration::from_millis(25);
+        driver_config.lsn_flush_mode = PostgresLsnFlushMode::ConnectorAndDriver;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            driver_config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 32,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) =
+            start_source_with_output_capacity(source, None, 512);
+        wait_for_active_slot(&client, &driver_slot).await?;
+
+        client
+            .batch_execute(&format!(
+                "INSERT INTO public.{table_name} VALUES (1000, 'driver-unacknowledged');"
+            ))
+            .await?;
+        let driver_commit = receive_postgres_transaction_commit(&mut output).await?;
+        let driver_target_lsn = postgres_record_commit_lsn(&driver_commit)?;
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        client
+            .batch_execute(&format!(
+                "INSERT INTO public.{table_name} (id, note) \
+                 SELECT generated.id, 'driver-drive' \
+                 FROM generate_series(1001, 1170) AS generated(id);"
+            ))
+            .await?;
+        receive_postgres_transaction_commit(&mut output).await?;
+        wait_for_confirmed_flush_lsn(&client, &driver_slot, driver_target_lsn).await?;
+
+        if optional_env_bool("RUSTIUM_POSTGRES_REQUIRE_FAST_KEEPALIVE")? {
+            let before = replication_slot_confirmed_lsn(&client, &driver_slot).await?;
+            client
+                .batch_execute(&format!(
+                    "INSERT INTO public.{unmonitored_table} VALUES (1);"
+                ))
+                .await?;
+            let unmonitored_target = current_wal_lsn(&client).await?;
+            require(
+                unmonitored_target > before,
+                "unmonitored WAL fixture did not advance the server LSN",
+            )?;
+            wait_for_confirmed_flush_lsn(&client, &driver_slot, unmonitored_target).await?;
+        }
+        stop_source(cancellation, source_task).await
+    }
+    .await;
+
+    let driver_slot_cleanup = drop_replication_slot(&client, &driver_slot).await;
+    let primary_cleanup = cleanup(
+        &client,
+        &publication,
+        &manual_slot,
+        &[&table_name, &unmonitored_table],
+    )
+    .await;
+    connection_task.abort();
+    let _ = connection_task.await;
+    capture_result?;
+    driver_slot_cleanup?;
     primary_cleanup
 }
 
@@ -4843,6 +4980,33 @@ async fn receive_postgres_create(
     }
 }
 
+async fn receive_postgres_transaction_commit(
+    output: &mut mpsc::Receiver<rustium_core::Result<SourceRecord>>,
+) -> TestResult<SourceRecord> {
+    loop {
+        let record = receive(output).await?;
+        if record.boundary == RecordBoundary::TransactionCommit {
+            return Ok(record);
+        }
+        require(
+            record
+                .event
+                .as_ref()
+                .is_some_and(|event| event.operation == Operation::Create),
+            "LSN flush fixture emitted an unexpected record before commit",
+        )?;
+    }
+}
+
+fn postgres_record_commit_lsn(record: &SourceRecord) -> TestResult<u64> {
+    match &record.position {
+        SourcePosition::Postgres(position) => Ok(position.commit_lsn.unwrap_or(position.lsn)),
+        SourcePosition::MySql(_) | SourcePosition::SqlServer(_) => Err(test_error(
+            "LSN flush fixture emitted a non-PostgreSQL position",
+        )),
+    }
+}
+
 async fn receive_postgres_create_id(
     output: &mut mpsc::Receiver<rustium_core::Result<SourceRecord>>,
 ) -> TestResult<i64> {
@@ -5211,6 +5375,20 @@ fn committed_kafka_offset(consumer: &StreamConsumer, topic: &str) -> TestResult<
 fn required_env(name: &str) -> TestResult<String> {
     std::env::var(name)
         .map_err(|_| test_error(&format!("required environment variable {name} is not set")))
+}
+
+fn optional_env_bool(name: &str) -> TestResult<bool> {
+    match std::env::var(name) {
+        Ok(value) if value.eq_ignore_ascii_case("true") || value == "1" => Ok(true),
+        Ok(value) if value.eq_ignore_ascii_case("false") || value == "0" => Ok(false),
+        Ok(value) => Err(test_error(&format!(
+            "environment variable {name} must be true, false, 1, or 0; found {value:?}"
+        ))),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(error) => Err(test_error(&format!(
+            "environment variable {name} is invalid: {error}"
+        ))),
+    }
 }
 
 fn require(condition: bool, message: &str) -> TestResult {

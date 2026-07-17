@@ -24,6 +24,7 @@ source:
   slot_failover: false
   slot_ownership: managed
   offset_mismatch_strategy: no_validation
+  lsn_flush_mode: connector
   tables:
     include:
       - public\.(orders|customers)

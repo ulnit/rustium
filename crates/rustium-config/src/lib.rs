@@ -234,6 +234,15 @@ impl SourceConfig {
                             serde_json::json!(config.offset_mismatch_strategy),
                         );
                 }
+                if config.lsn_flush_mode != PostgresLsnFlushMode::Connector {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "lsn_flush_mode".into(),
+                            serde_json::json!(config.lsn_flush_mode),
+                        );
+                }
                 add_heartbeat_semantics(
                     &mut semantic,
                     config.heartbeat_interval,
@@ -423,6 +432,8 @@ pub struct PostgresSourceConfig {
     pub slot_ownership: SlotOwnership,
     #[serde(default)]
     pub offset_mismatch_strategy: PostgresOffsetMismatchStrategy,
+    #[serde(default)]
+    pub lsn_flush_mode: PostgresLsnFlushMode,
     #[serde(default)]
     pub tables: TableSelection,
     #[serde(default = "default_ssl_mode")]
@@ -1254,6 +1265,15 @@ pub enum PostgresOffsetMismatchStrategy {
     TrustGreaterLsn,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostgresLsnFlushMode {
+    #[default]
+    Connector,
+    Manual,
+    ConnectorAndDriver,
+}
+
 impl PostgresOffsetMismatchStrategy {
     #[must_use]
     pub const fn advances_slot(self) -> bool {
@@ -2061,6 +2081,7 @@ sink:
             postgres.offset_mismatch_strategy,
             PostgresOffsetMismatchStrategy::NoValidation
         );
+        assert_eq!(postgres.lsn_flush_mode, PostgresLsnFlushMode::Connector);
         let connection_url = Url::parse(&postgres.connection_url(true).unwrap()).unwrap();
         assert!(
             connection_url
@@ -2118,6 +2139,10 @@ sink:
         assert!(
             config.source.semantic_config()["offset_mismatch_strategy"].is_null(),
             "no_validation must preserve the old fingerprint shape"
+        );
+        assert!(
+            config.source.semantic_config()["lsn_flush_mode"].is_null(),
+            "connector LSN flushing must preserve the old fingerprint shape"
         );
         assert!(
             config.source.semantic_config()["interval_handling_mode"].is_null(),
@@ -2277,6 +2302,27 @@ sink:
             external
                 .to_string()
                 .contains("requires slot_ownership=managed")
+        );
+    }
+
+    #[test]
+    fn parses_native_postgresql_lsn_flush_mode() {
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  lsn_flush_mode: connector_and_driver\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            configured.source.as_postgresql().unwrap().lsn_flush_mode,
+            PostgresLsnFlushMode::ConnectorAndDriver
+        );
+        assert_eq!(
+            configured.source.semantic_config()["lsn_flush_mode"],
+            "connector_and_driver"
+        );
+        assert_ne!(
+            Config::from_yaml(CONFIG).unwrap().fingerprint(),
+            configured.fingerprint()
         );
     }
 

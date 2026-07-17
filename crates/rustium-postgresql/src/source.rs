@@ -14,8 +14,8 @@ use pg_walstream::{
 };
 use regex::Regex;
 use rustium_config::{
-    PostgresOffsetMismatchStrategy, PostgresReplicaIdentity, PostgresSourceConfig,
-    PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode,
+    PostgresLsnFlushMode, PostgresOffsetMismatchStrategy, PostgresReplicaIdentity,
+    PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode,
 };
 use rustium_core::{
     ChangeEvent, DataValue, Error, EventId, EventSchema, FieldSchema, Operation, PostgresPosition,
@@ -35,6 +35,8 @@ use crate::{
 };
 
 const CONNECTOR_VERSION: &str = env!("CARGO_PKG_VERSION");
+// pg_walstream caps feedback to its last received LSN, so MAX delegates every keepalive to it.
+const DRIVER_MANAGED_LSN_FEEDBACK: u64 = u64::MAX;
 
 #[derive(Debug, Clone)]
 struct ActiveTransaction {
@@ -536,8 +538,18 @@ impl SourceConnector for PostgresSource {
             start_lsn = Some(query_slot_safe_lsn(&self.config).await?);
         }
         let feedback = Arc::clone(&stream.shared_lsn_feedback);
-        if let Some(SourcePosition::Postgres(position)) = context.acknowledged.borrow().clone() {
-            feedback.update_applied_lsn(position.commit_lsn.unwrap_or(position.lsn));
+        match self.config.lsn_flush_mode {
+            PostgresLsnFlushMode::Connector => {
+                if let Some(SourcePosition::Postgres(position)) =
+                    context.acknowledged.borrow().clone()
+                {
+                    feedback.update_applied_lsn(position.commit_lsn.unwrap_or(position.lsn));
+                }
+            }
+            PostgresLsnFlushMode::Manual => {}
+            PostgresLsnFlushMode::ConnectorAndDriver => {
+                feedback.update_applied_lsn(DRIVER_MANAGED_LSN_FEEDBACK);
+            }
         }
 
         let mut last_safe_position = resume_position
@@ -569,6 +581,7 @@ impl SourceConnector for PostgresSource {
             max_retry_delay_ms = self.retry_policy.max_delay.as_millis(),
             status_update_interval_ms = self.config.status_update_interval.as_millis(),
             tcp_keepalive = self.config.tcp_keepalive,
+            lsn_flush_mode = ?self.config.lsn_flush_mode,
             "PostgreSQL streaming started"
         );
 
@@ -582,7 +595,9 @@ impl SourceConnector for PostgresSource {
                     if changed.is_err() {
                         return Err(Error::Cancelled);
                     }
-                    if let Some(SourcePosition::Postgres(position)) = context.acknowledged.borrow().clone() {
+                    if self.config.lsn_flush_mode == PostgresLsnFlushMode::Connector
+                        && let Some(SourcePosition::Postgres(position)) = context.acknowledged.borrow().clone()
+                    {
                         feedback.update_applied_lsn(position.commit_lsn.unwrap_or(position.lsn));
                     }
                 }
@@ -3825,6 +3840,7 @@ sink:
             slot_failover: false,
             slot_ownership: SlotOwnership::Managed,
             offset_mismatch_strategy: PostgresOffsetMismatchStrategy::NoValidation,
+            lsn_flush_mode: PostgresLsnFlushMode::Connector,
             tables: TableSelection::default(),
             ssl_mode: "disable".into(),
             connect_timeout: Duration::from_secs(1),
