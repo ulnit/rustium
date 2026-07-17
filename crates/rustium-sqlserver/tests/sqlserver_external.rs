@@ -14,7 +14,9 @@ use rdkafka::{
     topic_partition_list::{Offset, TopicPartitionList},
     util::Timeout,
 };
-use rustium_config::{SnapshotConfig, SnapshotMode, SqlServerSourceConfig, TableSelection};
+use rustium_config::{
+    ColumnTransformRule, SnapshotConfig, SnapshotMode, SqlServerSourceConfig, TableSelection,
+};
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
     RecordBoundary, RetryPolicy, SignalRecord, SignalSender, SourceConnector, SourceContext,
@@ -86,6 +88,7 @@ impl TestSettings {
             signal_kafka_group_id: "kafka-signal".into(),
             signal_kafka_poll_timeout: Duration::from_millis(100),
             signal_kafka_consumer_properties: std::collections::BTreeMap::new(),
+            column_transformations: Vec::new(),
         }
     }
 }
@@ -826,7 +829,14 @@ async fn keeps_snapshot_and_cdc_type_conversion_identical() -> TestResult {
         .await?;
         wait_for_capture_instance(&mut client, &capture_instance).await?;
 
-        let config = settings.source_config(&table_name);
+        let mut config = settings.source_config(&table_name);
+        config.column_transformations = vec![ColumnTransformRule::Truncate {
+            length: 7,
+            columns: vec![format!(
+                r"{}\.dbo\.{table_name}\.text_value",
+                settings.database
+            )],
+        }];
         let mut source = SqlServerSource::new(
             &connector_name,
             config,
@@ -910,6 +920,37 @@ async fn keeps_snapshot_and_cdc_type_conversion_identical() -> TestResult {
                         "<root><value>Rustium</value></root>".into(),
                     )),
                 "SQL Server XML did not retain its canonical text",
+            )?;
+            require(
+                snapshot_values.get("text_value")
+                    == Some(&DataValue::String("Rustium".into())),
+                "SQL Server four-part column selector did not truncate snapshot/CDC text",
+            )?;
+            execute_batch(
+                &mut client,
+                &format!(
+                    "UPDATE dbo.{table_name} SET text_value = N'Changed type matrix' WHERE id = 2"
+                ),
+            )
+            .await?;
+            let update = loop {
+                let record = receive(&mut output).await?;
+                let Some(event) = record.event else {
+                    continue;
+                };
+                if event.operation == Operation::Update {
+                    break event;
+                }
+            };
+            require(
+                update.before.as_ref().and_then(|row| row.get("text_value"))
+                    == Some(&DataValue::String("Rustium".into())),
+                "SQL Server column transformation did not apply to the CDC before image",
+            )?;
+            require(
+                update.after.as_ref().and_then(|row| row.get("text_value"))
+                    == Some(&DataValue::String("Changed".into())),
+                "SQL Server column transformation did not apply to the CDC after image",
             )
         }
         .await;
@@ -1477,6 +1518,10 @@ async fn runs_incremental_snapshot_from_source_signal_table() -> TestResult {
         ));
         config.signal_enabled_channels = vec!["source".into()];
         config.incremental_snapshot_chunk_size = 1;
+        config.column_transformations = vec![ColumnTransformRule::Mask {
+            length: 4,
+            columns: vec![format!(r"dbo\.{table_name}\.value")],
+        }];
         let mut source = SqlServerSource::new(
             &connector_name,
             config,
@@ -1539,6 +1584,11 @@ async fn runs_incremental_snapshot_from_source_signal_table() -> TestResult {
                             test_error("SQL Server source-signaled snapshot row has no id")
                         })?,
                 );
+                require(
+                    event.after.as_ref().and_then(|row| row.get("value"))
+                        == Some(&DataValue::String("****".into())),
+                    "SQL Server three-part column selector did not mask incremental text",
+                )?;
             }
             require(
                 ids == [2],

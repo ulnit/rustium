@@ -474,6 +474,17 @@ impl SourceConfig {
                             "kafka_group_id": config.signal_kafka_group_id,
                         }),
                     );
+                if !config.column_transformations.is_empty() {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "column_transformations".into(),
+                            serde_json::Value::Array(column_transformation_semantics(
+                                &config.column_transformations,
+                            )),
+                        );
+                }
                 semantic
             }
         }
@@ -1297,6 +1308,8 @@ pub struct SqlServerSourceConfig {
     pub signal_kafka_poll_timeout: Duration,
     #[serde(default)]
     pub signal_kafka_consumer_properties: BTreeMap<String, String>,
+    #[serde(default)]
+    pub column_transformations: Vec<ColumnTransformRule>,
 }
 
 impl SqlServerSourceConfig {
@@ -1397,6 +1410,9 @@ impl SqlServerSourceConfig {
                     )));
                 }
             }
+        }
+        for rule in &self.column_transformations {
+            rule.validate()?;
         }
         if !matches!(
             self.snapshot_isolation_mode.as_str(),
@@ -3500,6 +3516,36 @@ sink:
         assert_ne!(baseline.fingerprint(), configured.fingerprint());
         let semantic = configured.source.semantic_config().to_string();
         assert!(!semantic.contains("mysql-private-salt"));
+    }
+
+    #[test]
+    fn parses_native_sqlserver_column_transformations_into_fingerprint() {
+        let raw = r#"
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: inventory-sqlserver
+source:
+  type: sqlserver
+  username: rustium
+  password: secret
+  databases: [inventory]
+sink:
+  type: stdout
+  topic_prefix: inventory
+"#;
+        let baseline = Config::from_yaml(raw).unwrap();
+        let configured = Config::from_yaml(&raw.replace(
+            "sink:\n",
+            "  column_transformations:\n    - kind: truncate\n      length: 7\n      columns: ['inventory\\.dbo\\.customers\\.summary']\n    - kind: hash\n      algorithm: sha256\n      salt: sqlserver-private-salt\n      version: v2\n      columns: ['dbo\\.customers\\.email']\nsink:\n",
+        ))
+        .unwrap();
+        let source = configured.source.as_sqlserver().unwrap();
+        assert_eq!(source.column_transformations.len(), 2);
+        assert_ne!(baseline.fingerprint(), configured.fingerprint());
+        let semantic = configured.source.semantic_config().to_string();
+        assert!(!semantic.contains("sqlserver-private-salt"));
+        assert!(semantic.contains(&hex_digest(b"sqlserver-private-salt")));
     }
 
     #[test]

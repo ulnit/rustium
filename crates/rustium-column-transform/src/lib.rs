@@ -79,11 +79,34 @@ impl ColumnTransformer {
         table: &str,
         declared_lengths: &HashMap<String, usize>,
     ) {
+        self.transform_event_with_qualified_tables(
+            event,
+            &[format!("{namespace}.{table}")],
+            declared_lengths,
+        );
+    }
+
+    pub fn transform_event_with_qualified_tables(
+        &self,
+        event: &mut ChangeEvent,
+        qualified_tables: &[String],
+        declared_lengths: &HashMap<String, usize>,
+    ) {
         if let Some(before) = &mut event.before {
-            self.transform_row(before, namespace, table, &event.schema, declared_lengths);
+            self.transform_row_with_qualified_tables(
+                before,
+                qualified_tables,
+                &event.schema,
+                declared_lengths,
+            );
         }
         if let Some(after) = &mut event.after {
-            self.transform_row(after, namespace, table, &event.schema, declared_lengths);
+            self.transform_row_with_qualified_tables(
+                after,
+                qualified_tables,
+                &event.schema,
+                declared_lengths,
+            );
         }
     }
 
@@ -95,13 +118,27 @@ impl ColumnTransformer {
         schema: &EventSchema,
         declared_lengths: &HashMap<String, usize>,
     ) {
+        self.transform_row_with_qualified_tables(
+            row,
+            &[format!("{namespace}.{table}")],
+            schema,
+            declared_lengths,
+        );
+    }
+
+    pub fn transform_row_with_qualified_tables(
+        &self,
+        row: &mut Row,
+        qualified_tables: &[String],
+        schema: &EventSchema,
+        declared_lengths: &HashMap<String, usize>,
+    ) {
         for field in &schema.fields {
             let Some(value) = row.get_mut(&field.name) else {
                 continue;
             };
-            *value = self.transform_value(
-                namespace,
-                table,
+            *value = self.transform_value_with_qualified_tables(
+                qualified_tables,
                 schema,
                 &field.name,
                 value.clone(),
@@ -119,14 +156,33 @@ impl ColumnTransformer {
         value: DataValue,
         declared_length: Option<usize>,
     ) -> DataValue {
+        self.transform_value_with_qualified_tables(
+            &[format!("{namespace}.{table}")],
+            schema,
+            column,
+            value,
+            declared_length,
+        )
+    }
+
+    pub fn transform_value_with_qualified_tables(
+        &self,
+        qualified_tables: &[String],
+        schema: &EventSchema,
+        column: &str,
+        value: DataValue,
+        declared_length: Option<usize>,
+    ) -> DataValue {
         let Some(field) = schema.fields.iter().find(|field| field.name == column) else {
             return value;
         };
-        let qualified_name = format!("{namespace}.{table}.{column}");
         let Some(rule) = self.rules.iter().find(|rule| {
-            rule.selectors
-                .iter()
-                .any(|selector| selector.is_match(&qualified_name))
+            qualified_tables.iter().any(|qualified_table| {
+                let qualified_name = format!("{qualified_table}.{column}");
+                rule.selectors
+                    .iter()
+                    .any(|selector| selector.is_match(&qualified_name))
+            })
         }) else {
             return value;
         };
@@ -204,7 +260,10 @@ fn is_character_type(type_name: &str) -> bool {
             | "bpchar"
             | "varchar"
             | "character varying"
+            | "nchar"
+            | "nvarchar"
             | "text"
+            | "ntext"
             | "tinytext"
             | "mediumtext"
             | "longtext"
@@ -416,5 +475,41 @@ mod tests {
             ),
             DataValue::Bytes(vec![1, 2])
         );
+    }
+
+    #[test]
+    fn matches_any_qualified_table_candidate() {
+        let transformer = transformer(ColumnTransformRule::Mask {
+            length: 4,
+            columns: vec![r"dbo\.customers\.secret".into()],
+        });
+        assert_eq!(
+            transformer.transform_value_with_qualified_tables(
+                &["inventory.dbo.customers".into(), "dbo.customers".into()],
+                &schema("nvarchar(max)"),
+                "secret",
+                DataValue::String("classified".into()),
+                None,
+            ),
+            DataValue::String("****".into())
+        );
+    }
+
+    #[test]
+    fn bounds_hashes_to_declared_nvarchar_length() {
+        let transformer = transformer(ColumnTransformRule::Hash {
+            algorithm: ColumnHashAlgorithm::Sha256,
+            salt: "sqlserver-salt".into(),
+            version: ColumnHashVersion::V2,
+            columns: vec![r"inventory\.dbo\.customers\.secret".into()],
+        });
+        let transformed = transformer.transform_value_with_qualified_tables(
+            &["inventory.dbo.customers".into(), "dbo.customers".into()],
+            &schema("nvarchar(12)"),
+            "secret",
+            DataValue::String("classified".into()),
+            None,
+        );
+        assert!(matches!(transformed, DataValue::String(value) if value.len() == 12));
     }
 }

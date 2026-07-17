@@ -1,12 +1,15 @@
 use std::{
     collections::BTreeMap,
-    process::{Command, Stdio},
+    net::TcpListener,
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
 use futures::FutureExt;
-use rustium_config::{SnapshotConfig, SnapshotMode, SqlServerSourceConfig, TableSelection};
+use rustium_config::{
+    ColumnTransformRule, SnapshotConfig, SnapshotMode, SqlServerSourceConfig, TableSelection,
+};
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, DataValue, Operation, RecordBoundary, RetryPolicy, Row,
     SourceConnector, SourceContext, SourcePosition,
@@ -48,6 +51,15 @@ impl Drop for DockerContainer {
                 }
             }
         }
+    }
+}
+
+struct SshTunnel(Child);
+
+impl Drop for SshTunnel {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -157,6 +169,53 @@ fn mapped_port(container: &str) -> u16 {
         .expect("SQL Server Docker port is numeric")
 }
 
+async fn forwarded_port(remote_port: u16) -> (u16, Option<SshTunnel>) {
+    let Ok(ssh_host) = std::env::var("RUSTIUM_SQLSERVER_DOCKER_SSH_HOST") else {
+        return (remote_port, None);
+    };
+    let local_port = std::env::var("RUSTIUM_SQLSERVER_DOCKER_SSH_LOCAL_PORT")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u16>()
+                .expect("RUSTIUM_SQLSERVER_DOCKER_SSH_LOCAL_PORT is numeric")
+        })
+        .unwrap_or_else(|| {
+            TcpListener::bind(("127.0.0.1", 0))
+                .expect("reserve a local SQL Server SSH tunnel port")
+                .local_addr()
+                .expect("read the local SQL Server SSH tunnel port")
+                .port()
+        });
+    let mut child = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-N",
+            "-L",
+            &format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"),
+            &ssh_host,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start SQL Server Docker SSH tunnel");
+    for _ in 0..50 {
+        if TcpStream::connect(("127.0.0.1", local_port)).await.is_ok() {
+            return (local_port, Some(SshTunnel(child)));
+        }
+        if let Some(status) = child.try_wait().expect("inspect SQL Server SSH tunnel") {
+            panic!("SQL Server Docker SSH tunnel exited with {status}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("SQL Server Docker SSH tunnel did not become ready");
+}
+
 fn require_extended_values(row: &Row) {
     assert!(
         matches!(row.get("geometry_value"), Some(DataValue::Bytes(value)) if !value.is_empty())
@@ -208,7 +267,8 @@ async fn snapshots_and_streams_cdc_changes() {
         String::from_utf8_lossy(&output.stderr)
     );
     let _container = DockerContainer(name);
-    let port = mapped_port(&_container.0);
+    let remote_port = mapped_port(&_container.0);
+    let (port, _tunnel) = forwarded_port(remote_port).await;
 
     let mut admin = None;
     for _ in 0..180 {
@@ -336,6 +396,10 @@ async fn snapshots_and_streams_cdc_changes() {
         signal_kafka_group_id: "kafka-signal".into(),
         signal_kafka_poll_timeout: Duration::from_millis(100),
         signal_kafka_consumer_properties: std::collections::BTreeMap::new(),
+        column_transformations: vec![ColumnTransformRule::Truncate {
+            length: 3,
+            columns: vec![r"inventory\.dbo\.orders\.customer".into()],
+        }],
     };
     let mut source = SqlServerSource::new(
         "inventory-sqlserver",
@@ -391,6 +455,10 @@ async fn snapshots_and_streams_cdc_changes() {
         assert_eq!(snapshot_rows, 2);
         let snapshot_extended = snapshot_extended.expect("SQL Server snapshot row exists");
         require_extended_values(&snapshot_extended);
+        assert_eq!(
+            snapshot_extended.get("customer"),
+            Some(&DataValue::String("Ali".into()))
+        );
 
         cancellation.cancel();
         (&mut source_task).await.unwrap().unwrap();
@@ -538,6 +606,10 @@ async fn snapshots_and_streams_cdc_changes() {
         );
         let create_extended = create_extended.expect("SQL Server CDC create row exists");
         require_extended_values(&create_extended);
+        assert_eq!(
+            create_extended.get("customer"),
+            Some(&DataValue::String("Car".into()))
+        );
         for field in [
             "xml_value",
             "hierarchy_value",

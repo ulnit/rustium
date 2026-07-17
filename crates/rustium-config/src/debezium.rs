@@ -679,6 +679,7 @@ fn parse_sqlserver(properties: &BTreeMap<String, String>) -> Result<Config> {
                         .map(|key| (key.to_string(), value.clone()))
                 })
                 .collect(),
+            column_transformations: column_transformations(properties)?,
         }),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -3144,6 +3145,59 @@ incremental.snapshot.watermarking.strategy=insert_insert
                 .any(|warning| warning.contains("signal.enabled.channels=jmx"))
         );
         assert!(config.format.tombstones_on_delete);
+    }
+
+    #[test]
+    fn maps_sqlserver_column_transformations_with_debezium_priority() {
+        let config = parse(
+            r#"
+name=inventory-sqlserver
+connector.class=io.debezium.connector.sqlserver.SqlServerConnector
+database.hostname=sqlserver
+database.user=rustium
+database.password=secret
+database.names=inventory
+topic.prefix=inventory
+column.mask.hash.v2.SHA-256.with.salt.sqlserver-salt=inventory\\.dbo\\.customers\\.email
+column.mask.hash.SHA-1.with.salt.legacy-salt=dbo\\.customers\\.legacy_email
+column.mask.with.4.chars=dbo\\.customers\\.secret
+column.truncate.to.7.chars=inventory\\.dbo\\.customers\\.summary
+"#,
+        )
+        .unwrap();
+        let source = config.source.as_sqlserver().unwrap();
+        assert_eq!(source.column_transformations.len(), 4);
+        assert!(matches!(
+            &source.column_transformations[0],
+            ColumnTransformRule::Truncate { length: 7, columns }
+                if columns == &[r"inventory\.dbo\.customers\.summary"]
+        ));
+        assert!(matches!(
+            &source.column_transformations[1],
+            ColumnTransformRule::Mask { length: 4, columns }
+                if columns == &[r"dbo\.customers\.secret"]
+        ));
+        assert!(matches!(
+            &source.column_transformations[2],
+            ColumnTransformRule::Hash {
+                algorithm: ColumnHashAlgorithm::Sha1,
+                salt,
+                version: ColumnHashVersion::V1,
+                ..
+            } if salt == "legacy-salt"
+        ));
+        assert!(matches!(
+            &source.column_transformations[3],
+            ColumnTransformRule::Hash {
+                algorithm: ColumnHashAlgorithm::Sha256,
+                salt,
+                version: ColumnHashVersion::V2,
+                ..
+            } if salt == "sqlserver-salt"
+        ));
+        assert!(config.compatibility_warnings.iter().all(|warning| {
+            !warning.contains("column.mask") && !warning.contains("column.truncate")
+        }));
     }
 
     #[test]

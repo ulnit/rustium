@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use futures::TryStreamExt;
+use rustium_column_transform::ColumnTransformer;
 use rustium_config::{SnapshotConfig, SnapshotMode, SqlServerSourceConfig};
 use rustium_core::{
     ChangeEvent, DataValue, Error, EventId, EventSchema, FieldSchema, Operation, RecordBoundary,
@@ -593,6 +594,7 @@ pub struct SqlServerSource {
     snapshot: SnapshotConfig,
     captures: Vec<CaptureTable>,
     retry_policy: RetryPolicy,
+    column_transformer: Option<ColumnTransformer>,
 }
 
 impl SqlServerSource {
@@ -608,6 +610,7 @@ impl SqlServerSource {
             snapshot,
             captures: Vec::new(),
             retry_policy: RetryPolicy::default(),
+            column_transformer: None,
         }
     }
 
@@ -622,6 +625,8 @@ impl SqlServerSource {
     }
 
     async fn validate_source(&mut self) -> Result<()> {
+        self.column_transformer =
+            Some(ColumnTransformer::new(&self.config.column_transformations)?);
         let mut client = connect(&self.config, self.database()).await?;
         let row = client
             .simple_query(
@@ -720,6 +725,9 @@ impl SqlServerSource {
                 &anchor,
                 &mut ordinal,
                 output,
+                self.column_transformer
+                    .as_ref()
+                    .expect("validated transformer"),
             )
             .await?;
         }
@@ -962,7 +970,7 @@ impl SqlServerSource {
         let rows = rows
             .iter()
             .map(|row| {
-                let converted = convert_tds_row(row, &capture.event_schema)?;
+                let mut converted = convert_tds_row(row, &capture.event_schema)?;
                 let key = key_indices
                     .iter()
                     .map(|index| {
@@ -978,6 +986,14 @@ impl SqlServerSource {
                             .and_then(sqlserver_key_from_data_value)
                     })
                     .collect::<Result<Vec<_>>>()?;
+                transform_row(
+                    self.column_transformer
+                        .as_ref()
+                        .expect("validated transformer"),
+                    &mut converted,
+                    self.database(),
+                    capture,
+                );
                 Ok((converted, key))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1000,6 +1016,11 @@ impl SourceConnector for SqlServerSource {
     }
 
     async fn run(&mut self, mut context: SourceContext) -> Result<()> {
+        let column_transformer = self.column_transformer.clone().map_or_else(
+            || ColumnTransformer::new(&self.config.column_transformations),
+            Ok,
+        )?;
+        self.column_transformer = Some(column_transformer);
         let checkpoint = context.initial_checkpoint.clone();
         let snapshot_needed = match self.snapshot.mode {
             SnapshotMode::Never => false,
@@ -1367,6 +1388,11 @@ async fn poll_change_batch_once(
         state,
         &max_lsn,
         source.config.streaming_fetch_size,
+        source
+            .column_transformer
+            .as_ref()
+            .expect("validated transformer"),
+        signal_table_key(&source.config).as_ref(),
     )
     .await
     .map(Some)
@@ -1407,6 +1433,40 @@ fn signal_table_key(config: &SqlServerSourceConfig) -> Option<(String, String)> 
         [schema, table] | [_, schema, table] => Some(((*schema).into(), (*table).into())),
         _ => None,
     }
+}
+
+fn transform_event(
+    transformer: &ColumnTransformer,
+    event: &mut ChangeEvent,
+    database: &str,
+    capture: &CaptureTable,
+) {
+    transformer.transform_event_with_qualified_tables(
+        event,
+        &qualified_table_candidates(database, capture),
+        &HashMap::new(),
+    );
+}
+
+fn transform_row(
+    transformer: &ColumnTransformer,
+    row: &mut Row,
+    database: &str,
+    capture: &CaptureTable,
+) {
+    transformer.transform_row_with_qualified_tables(
+        row,
+        &qualified_table_candidates(database, capture),
+        &capture.event_schema,
+        &HashMap::new(),
+    );
+}
+
+fn qualified_table_candidates(database: &str, capture: &CaptureTable) -> [String; 2] {
+    [
+        format!("{database}.{}.{}", capture.schema, capture.table),
+        format!("{}.{}", capture.schema, capture.table),
+    ]
 }
 
 fn snapshot_includes(snapshot: &SnapshotConfig, database: &str, schema: &str, table: &str) -> bool {
@@ -2001,6 +2061,8 @@ async fn read_change_batch(
     state: &mut StreamingState,
     max_lsn: &[u8],
     fetch_size: usize,
+    column_transformer: &ColumnTransformer,
+    signal_table: Option<&(String, String)>,
 ) -> Result<Vec<SourceRecord>> {
     let query = change_query(captures, fetch_size.saturating_add(1));
     let rows = client
@@ -2115,7 +2177,7 @@ async fn read_change_batch(
             .as_ref()
             .and_then(|transaction| transaction.source_time)
             .or(change.source_time);
-        let event = ChangeEvent {
+        let mut event = ChangeEvent {
             id: EventId::deterministic(
                 connector_name,
                 database,
@@ -2133,6 +2195,9 @@ async fn read_change_batch(
             source_time,
             observed_time: Utc::now(),
         };
+        if signal_table != Some(&table.key()) {
+            transform_event(column_transformer, &mut event, database, table);
+        }
         let record = SourceRecord::data(event);
         if !state.should_skip(&record.position) {
             records.push(record);
@@ -2336,6 +2401,7 @@ async fn snapshot_table(
     anchor: &[u8],
     ordinal: &mut u64,
     output: &tokio::sync::mpsc::Sender<Result<SourceRecord>>,
+    column_transformer: &ColumnTransformer,
 ) -> Result<()> {
     let values = capture
         .event_schema
@@ -2372,7 +2438,7 @@ async fn snapshot_table(
         *ordinal += 1;
         count += 1;
         let position = sqlserver_position(database, anchor, &zero_lsn_bytes(), *ordinal, true);
-        let event = ChangeEvent {
+        let mut event = ChangeEvent {
             id: EventId::deterministic(
                 connector_name,
                 database,
@@ -2390,6 +2456,7 @@ async fn snapshot_table(
             source_time: None,
             observed_time: Utc::now(),
         };
+        transform_event(column_transformer, &mut event, database, capture);
         output
             .send(Ok(SourceRecord::data(event)))
             .await
