@@ -38,6 +38,8 @@ use crate::{
 const CONNECTOR_VERSION: &str = env!("CARGO_PKG_VERSION");
 // pg_walstream caps feedback to its last received LSN, so MAX delegates every keepalive to it.
 const DRIVER_MANAGED_LSN_FEEDBACK: u64 = u64::MAX;
+const DROP_SLOT_RETRY_ATTEMPTS: usize = 30;
+const DROP_SLOT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 struct ActiveTransaction {
@@ -667,6 +669,14 @@ impl SourceConnector for PostgresSource {
             }
         }
 
+        if self.config.drop_slot_on_stop {
+            warn!(
+                connector = %self.connector_name,
+                slot = %self.config.slot_name,
+                "PostgreSQL slot.drop.on.stop is enabled; an orderly stop removes the replication slot and a later restart cannot recover changes produced while the connector is offline"
+            );
+        }
+
         let slot_failover = resolve_slot_failover(&self.config).await?;
         let replication_url = self.config.connection_url(true)?;
         let slot_options = ReplicationSlotOptions {
@@ -785,6 +795,7 @@ impl SourceConnector for PostgresSource {
             max_retry_delay_ms = self.retry_policy.max_delay.as_millis(),
             status_update_interval_ms = self.config.status_update_interval.as_millis(),
             tcp_keepalive = self.config.tcp_keepalive,
+            drop_slot_on_stop = self.config.drop_slot_on_stop,
             lsn_flush_mode = ?self.config.lsn_flush_mode,
             schema_refresh_mode = ?self.config.schema_refresh_mode,
             "PostgreSQL streaming started"
@@ -793,8 +804,7 @@ impl SourceConnector for PostgresSource {
         loop {
             tokio::select! {
                 _ = context.cancellation.cancelled() => {
-                    stream.stop().await.map_err(pg_error)?;
-                    return Ok(());
+                    return stop_stream_on_orderly_shutdown(stream, &self.config).await;
                 }
                 changed = context.acknowledged.changed() => {
                     if changed.is_err() {
@@ -903,8 +913,7 @@ impl SourceConnector for PostgresSource {
                         Err(pg_walstream::ReplicationError::Cancelled(_))
                             if context.cancellation.is_cancelled() =>
                         {
-                            stream.stop().await.map_err(pg_error)?;
-                            return Ok(());
+                            return stop_stream_on_orderly_shutdown(stream, &self.config).await;
                         }
                         Err(error) => return Err(pg_error(error)),
                     };
@@ -1279,6 +1288,69 @@ async fn open_heartbeat_connection(
             ))
         })??;
     Ok(Some(connection))
+}
+
+async fn stop_stream_on_orderly_shutdown(
+    mut stream: LogicalReplicationStream,
+    config: &PostgresSourceConfig,
+) -> Result<()> {
+    stream.stop().await.map_err(pg_error)?;
+    drop(stream);
+    if config.drop_slot_on_stop {
+        drop_managed_slot_on_stop(config).await?;
+    }
+    Ok(())
+}
+
+async fn drop_managed_slot_on_stop(config: &PostgresSourceConfig) -> Result<()> {
+    if config.slot_ownership != SlotOwnership::Managed {
+        return Err(Error::Configuration(
+            "source.drop_slot_on_stop can be enabled only for a managed replication slot".into(),
+        ));
+    }
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut connection = connect_regular(&config)?;
+        let slot_name = config.slot_name.clone();
+        let slot = quote_literal(&slot_name).map_err(pg_error)?;
+        let drop_statement = format!("SELECT pg_drop_replication_slot({slot})");
+        let state_query = format!(
+            "SELECT active::text FROM pg_replication_slots WHERE slot_name = {slot}"
+        );
+
+        for attempt in 1..=DROP_SLOT_RETRY_ATTEMPTS {
+            match connection.exec(&drop_statement) {
+                Ok(_) => {
+                    info!(slot = %slot_name, "PostgreSQL replication slot dropped on orderly stop");
+                    return Ok(());
+                }
+                Err(drop_error) => {
+                    let state = connection.exec(&state_query).map_err(|state_error| {
+                        Error::Source(format!(
+                            "failed to inspect PostgreSQL replication slot {slot_name:?} after its orderly-stop deletion failed: {state_error}; deletion error: {drop_error}"
+                        ))
+                    })?;
+                    if state.ntuples() == 0 {
+                        info!(slot = %slot_name, "PostgreSQL replication slot was already absent on orderly stop");
+                        return Ok(());
+                    }
+                    let active = required_value(&state, 0, 0, "slot active state")?;
+                    if matches!(active.as_str(), "t" | "true")
+                        && attempt < DROP_SLOT_RETRY_ATTEMPTS
+                    {
+                        std::thread::sleep(DROP_SLOT_RETRY_DELAY);
+                        continue;
+                    }
+                    return Err(Error::Source(format!(
+                        "failed to drop PostgreSQL replication slot {slot_name:?} on orderly stop after {attempt} attempt(s): {drop_error}"
+                    )));
+                }
+            }
+        }
+        unreachable!("the PostgreSQL slot deletion retry loop always returns")
+    })
+    .await
+    .map_err(|error| Error::Source(format!("slot deletion task failed: {error}")))?
 }
 
 async fn query_slot_safe_lsn(config: &PostgresSourceConfig) -> Result<u64> {
@@ -4553,6 +4625,7 @@ sink:
             replica_identity_autoset_values: Vec::new(),
             publish_via_partition_root: false,
             slot_name: "orders_slot".into(),
+            drop_slot_on_stop: false,
             slot_failover: false,
             slot_ownership: SlotOwnership::Managed,
             offset_mismatch_strategy: PostgresOffsetMismatchStrategy::NoValidation,

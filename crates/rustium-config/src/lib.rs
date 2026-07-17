@@ -460,6 +460,8 @@ pub struct PostgresSourceConfig {
     #[serde(default = "default_slot_name")]
     pub slot_name: String,
     #[serde(default)]
+    pub drop_slot_on_stop: bool,
+    #[serde(default)]
     pub slot_failover: bool,
     #[serde(default)]
     pub slot_ownership: SlotOwnership,
@@ -558,6 +560,12 @@ impl PostgresSourceConfig {
         }
         validate_name(&self.slot_name, "source.slot_name")?;
         validate_name(&self.publication, "source.publication")?;
+        if self.drop_slot_on_stop && self.slot_ownership == SlotOwnership::External {
+            return Err(Error::Configuration(
+                "source.drop_slot_on_stop can be enabled only for a managed replication slot"
+                    .into(),
+            ));
+        }
         if self.slot_failover && self.slot_ownership == SlotOwnership::External {
             return Err(Error::Configuration(
                 "source.slot_failover can be enabled only for a managed replication slot".into(),
@@ -2194,6 +2202,7 @@ sink:
             postgres.offset_mismatch_strategy,
             PostgresOffsetMismatchStrategy::NoValidation
         );
+        assert!(!postgres.drop_slot_on_stop);
         assert_eq!(postgres.lsn_flush_mode, PostgresLsnFlushMode::Connector);
         assert!(postgres.slot_stream_params.is_empty());
         assert!(postgres.database_initial_statements.is_empty());
@@ -2409,6 +2418,27 @@ sink:
         let external = Config::from_yaml(&CONFIG.replace(
             "  slot_name: rustium_orders\n",
             "  slot_name: rustium_orders\n  slot_failover: true\n  slot_ownership: external\n",
+        ))
+        .unwrap_err();
+        assert!(external.to_string().contains("only for a managed"));
+    }
+
+    #[test]
+    fn parses_native_postgresql_drop_slot_on_stop_without_changing_fingerprint() {
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  drop_slot_on_stop: true\n",
+        ))
+        .unwrap();
+        assert!(configured.source.as_postgresql().unwrap().drop_slot_on_stop);
+        assert_eq!(
+            Config::from_yaml(CONFIG).unwrap().fingerprint(),
+            configured.fingerprint()
+        );
+
+        let external = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  drop_slot_on_stop: true\n  slot_ownership: external\n",
         ))
         .unwrap_err();
         assert!(external.to_string().contains("only for a managed"));

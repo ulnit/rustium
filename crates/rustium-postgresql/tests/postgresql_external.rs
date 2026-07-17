@@ -80,6 +80,7 @@ impl TestSettings {
             replica_identity_autoset_values: Vec::new(),
             publish_via_partition_root: false,
             slot_name: slot_name.into(),
+            drop_slot_on_stop: false,
             slot_failover: false,
             slot_ownership: SlotOwnership::Managed,
             offset_mismatch_strategy: PostgresOffsetMismatchStrategy::NoValidation,
@@ -1220,6 +1221,95 @@ async fn creates_postgresql_17_failover_slot() -> TestResult {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), _) => Err(error),
         (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn applies_debezium_slot_drop_on_orderly_stop() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_drop_slot_{}", &suffix[..12]);
+    let publication = format!("rustium_pg_drop_slot_pub_{}", &suffix[..12]);
+    let retained_slot = format!("rustium_pg_retained_slot_{}", &suffix[..12]);
+    let dropped_slot = format!("rustium_pg_dropped_slot_{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (\
+                    id BIGINT PRIMARY KEY, value TEXT NOT NULL\
+                 ); \
+                 INSERT INTO public.{table_name} VALUES (1, 'slot-lifecycle'); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+
+        for (slot_name, drop_slot_on_stop) in [(&retained_slot, false), (&dropped_slot, true)] {
+            let mut config = settings.source_config(&publication, slot_name, &table_name);
+            config.drop_slot_on_stop = drop_slot_on_stop;
+            let mut source = PostgresSource::new(
+                format!("postgresql-slot-lifecycle-{}", &slot_name[..12]),
+                config,
+                SnapshotConfig {
+                    mode: SnapshotMode::Initial,
+                    fetch_size: 1,
+                    include_collections: Vec::new(),
+                },
+            );
+            source.validate().await?;
+            let (mut output, cancellation, source_task) = start_source(source, None);
+            let capture_result: TestResult = async {
+                let snapshot = receive(&mut output).await?;
+                require(
+                    snapshot.event.as_ref().is_some_and(|event| {
+                        event.operation == Operation::Read
+                            && event.after.as_ref().and_then(|row| row.get("value"))
+                                == Some(&DataValue::String("slot-lifecycle".into()))
+                    }),
+                    "slot lifecycle snapshot row is incorrect",
+                )?;
+                let completion = receive(&mut output).await?;
+                require(
+                    completion.boundary == RecordBoundary::SnapshotComplete,
+                    "slot lifecycle snapshot did not complete",
+                )?;
+                wait_for_active_slot(&client, slot_name).await
+            }
+            .await;
+            let stop_result = stop_source(cancellation, source_task).await;
+            combine_capture_and_stop(capture_result, stop_result)?;
+
+            let slot_state = client
+                .query_opt(
+                    "SELECT active FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+                    &[slot_name],
+                )
+                .await?
+                .map(|row| row.get::<_, bool>(0));
+            if drop_slot_on_stop {
+                require(
+                    slot_state.is_none(),
+                    "slot.drop.on.stop=true did not remove the managed replication slot",
+                )?;
+            } else {
+                require(
+                    slot_state == Some(false),
+                    "slot.drop.on.stop=false did not retain an inactive replication slot",
+                )?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    let cleanup_result = cleanup(&client, &publication, &retained_slot, &[&table_name]).await;
+    let dropped_cleanup = drop_replication_slot(&client, &dropped_slot).await;
+    connection_task.abort();
+    match (outcome, cleanup_result, dropped_cleanup) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), _, _) | (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
     }
 }
 

@@ -21,6 +21,7 @@ source:
   #     identity: index
   #     index: customers_replica_key
   slot_name: rustium_inventory
+  drop_slot_on_stop: false
   slot_failover: false
   slot_ownership: managed
   offset_mismatch_strategy: no_validation

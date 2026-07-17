@@ -165,6 +165,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                 .get("slot.name")
                 .cloned()
                 .unwrap_or_else(|| "debezium".into()),
+            drop_slot_on_stop: bool_value(&properties, "slot.drop.on.stop", false)?,
             slot_failover: bool_value(&properties, "slot.failover", false)?,
             slot_ownership: SlotOwnership::Managed,
             offset_mismatch_strategy,
@@ -1419,6 +1420,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "topic.prefix",
         "plugin.name",
         "slot.name",
+        "slot.drop.on.stop",
         "slot.failover",
         "publication.name",
         "publication.autocreate.mode",
@@ -1570,6 +1572,7 @@ database.tcpKeepAlive=false
 topic.prefix=app
 plugin.name=pgoutput
 slot.name=orders_slot
+slot.drop.on.stop=true
 slot.failover=true
 status.update.interval.ms=250
 publication.name=orders_pub
@@ -1666,6 +1669,7 @@ max.batch.size=1000
         );
         assert_eq!(source.replica_identity_autoset_values.len(), 2);
         assert!(source.publish_via_partition_root);
+        assert!(source.drop_slot_on_stop);
         assert!(source.slot_failover);
         assert_eq!(
             source.replica_identity_autoset_values[0].table,
@@ -1686,6 +1690,12 @@ max.batch.size=1000
                 .compatibility_warnings
                 .iter()
                 .all(|warning| !warning.contains("tombstone"))
+        );
+        assert!(
+            config
+                .compatibility_warnings
+                .iter()
+                .all(|warning| !warning.contains("slot.drop.on.stop"))
         );
     }
 
