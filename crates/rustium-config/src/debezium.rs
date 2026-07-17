@@ -201,6 +201,13 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                     .get("interval.handling.mode")
                     .map_or("numeric", String::as_str),
             )?,
+            logical_decoding_messages: true,
+            message_prefix_include_list: csv_property(
+                properties.get("message.prefix.include.list"),
+            ),
+            message_prefix_exclude_list: csv_property(
+                properties.get("message.prefix.exclude.list"),
+            ),
         })),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -1294,6 +1301,8 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "read.only",
         "hstore.handling.mode",
         "interval.handling.mode",
+        "message.prefix.include.list",
+        "message.prefix.exclude.list",
         "offset.storage.file.filename",
         "bootstrap.servers",
         "rustium.sink.type",
@@ -1394,6 +1403,7 @@ incremental.snapshot.watermarking.strategy=insert_insert
 read.only=true
 hstore.handling.mode=map
 interval.handling.mode=string
+message.prefix.include.list=orders\\..*,audit
 max.queue.size=4096
 max.batch.size=1000
 "#,
@@ -1446,6 +1456,11 @@ max.batch.size=1000
         assert!(source.read_only);
         assert_eq!(source.hstore_handling_mode, "map");
         assert_eq!(source.interval_handling_mode, "string");
+        assert!(source.captures_logical_decoding_messages());
+        assert!(source.includes_message_prefix("orders.created"));
+        assert!(source.includes_message_prefix("audit"));
+        assert!(!source.includes_message_prefix("pre-orders.created"));
+        assert!(!source.includes_message_prefix("orders"));
         assert_eq!(
             source.publication_autocreate_mode,
             PublicationAutoCreateMode::Filtered
@@ -1473,6 +1488,43 @@ max.batch.size=1000
                 .iter()
                 .all(|warning| !warning.contains("tombstone"))
         );
+    }
+
+    #[test]
+    fn validates_postgres_logical_decoding_message_filters() {
+        let default = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+plugin.name=pgoutput
+"#,
+        )
+        .unwrap();
+        let source = default.source.as_postgresql().unwrap();
+        assert!(source.captures_logical_decoding_messages());
+        assert!(source.includes_message_prefix("any-prefix"));
+
+        let invalid = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+plugin.name=pgoutput
+message.prefix.include.list=orders\\..*
+message.prefix.exclude.list=audit
+"#,
+        )
+        .unwrap_err();
+        assert!(invalid.to_string().contains("mutually exclusive"));
     }
 
     #[test]

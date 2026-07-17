@@ -10,6 +10,7 @@ authors.workspace = true
 readme = "README.md"
 
 [dependencies]
+base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 rustium-core.workspace = true

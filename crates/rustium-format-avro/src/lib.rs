@@ -81,6 +81,7 @@ impl DebeziumAvroEncoder {
     fn encode_one(&self, event: &ChangeEvent) -> Result<EncodedEvent> {
         let destination = destination(event, &self.config)?;
         let heartbeat = is_heartbeat(event);
+        let logical_message = is_logical_decoding_message(event);
         let fields = adjusted_fields(event)?;
 
         let (key, key_schema) = if heartbeat {
@@ -119,6 +120,8 @@ impl DebeziumAvroEncoder {
                 "ts_ms".into(),
                 Value::Long(event.observed_time.timestamp_millis()),
             )])
+        } else if logical_message {
+            logical_message_value(event, &fields, &self.config.unavailable_value)?
         } else {
             envelope_value(event, &fields, &self.config.unavailable_value)?
         };
@@ -132,6 +135,11 @@ impl DebeziumAvroEncoder {
         );
         if heartbeat {
             headers.insert("rustium.record.type".into(), "heartbeat".into());
+        } else if logical_message {
+            headers.insert(
+                "rustium.record.type".into(),
+                "logical-decoding-message".into(),
+            );
         }
         Ok(EncodedEvent {
             id: event.id.clone(),
@@ -220,6 +228,9 @@ fn destination(event: &ChangeEvent, config: &AvroEncoderConfig) -> Result<String
             format!("{}.{}", config.heartbeat_topics_prefix, config.topic_prefix)
         }));
     }
+    if is_logical_decoding_message(event) {
+        return Ok(format!("{}.message", config.topic_prefix));
+    }
     let table = event
         .source
         .table
@@ -248,6 +259,14 @@ fn is_heartbeat(event: &ChangeEvent) -> bool {
         .source
         .attributes
         .get("rustium.heartbeat")
+        .is_some_and(|value| value == &serde_json::Value::Bool(true))
+}
+
+fn is_logical_decoding_message(event: &ChangeEvent) -> bool {
+    event
+        .source
+        .attributes
+        .get("rustium.logical_decoding_message")
         .is_some_and(|value| value == &serde_json::Value::Bool(true))
 }
 
@@ -369,13 +388,6 @@ fn payload_schema(
         .iter()
         .map(|field| avro_field(field, false))
         .collect::<Vec<_>>();
-    let row_schema = serde_json::json!({
-        "type": "record",
-        "name": "Value",
-        "namespace": namespace,
-        "connect.name": format!("{namespace}.Value"),
-        "fields": row_fields
-    });
     let source_schema = source_schema(event, &namespace);
     let transaction_schema = serde_json::json!({
         "type": "record",
@@ -387,6 +399,39 @@ fn payload_schema(
             {"name": "total_order", "type": ["null", "long"], "default": null},
             {"name": "data_collection_order", "type": ["null", "long"], "default": null}
         ]
+    });
+    if is_logical_decoding_message(event) {
+        let message_schema = serde_json::json!({
+            "type": "record",
+            "name": "Message",
+            "namespace": namespace,
+            "connect.name": "io.debezium.connector.postgresql.Message",
+            "fields": row_fields
+        });
+        return wire_schema(
+            format!("{destination}-value"),
+            serde_json::json!({
+                "type": "record",
+                "name": "Envelope",
+                "namespace": namespace,
+                "connect.name": "io.debezium.connector.postgresql.MessageValue",
+                "rustium.event.schema.version": event.schema.version,
+                "fields": [
+                    {"name": "source", "type": source_schema},
+                    {"name": "op", "type": "string"},
+                    {"name": "ts_ms", "type": "long"},
+                    {"name": "transaction", "type": ["null", transaction_schema], "default": null},
+                    {"name": "message", "type": message_schema}
+                ]
+            }),
+        );
+    }
+    let row_schema = serde_json::json!({
+        "type": "record",
+        "name": "Value",
+        "namespace": namespace,
+        "connect.name": format!("{namespace}.Value"),
+        "fields": row_fields
     });
     wire_schema(
         format!("{destination}-value"),
@@ -615,7 +660,51 @@ fn envelope_value(
         .map(|row| row_value(row, &field_refs, unavailable_value, false))
         .transpose()?
         .unwrap_or(Value::Null);
-    let transaction = event
+    Ok(Value::Record(vec![
+        ("before".into(), before),
+        ("after".into(), after),
+        ("source".into(), source_value(event)?),
+        (
+            "op".into(),
+            Value::String(operation_code(event.operation).into()),
+        ),
+        (
+            "ts_ms".into(),
+            Value::Long(event.observed_time.timestamp_millis()),
+        ),
+        ("transaction".into(), transaction_value(event)?),
+    ]))
+}
+
+fn logical_message_value(
+    event: &ChangeEvent,
+    fields: &[AdjustedField<'_>],
+    unavailable_value: &str,
+) -> Result<Value> {
+    let message = event.after.as_ref().ok_or_else(|| {
+        Error::Encoding("PostgreSQL logical decoding message has no content".into())
+    })?;
+    let field_refs = fields.iter().collect::<Vec<_>>();
+    Ok(Value::Record(vec![
+        ("source".into(), source_value(event)?),
+        (
+            "op".into(),
+            Value::String(operation_code(event.operation).into()),
+        ),
+        (
+            "ts_ms".into(),
+            Value::Long(event.observed_time.timestamp_millis()),
+        ),
+        ("transaction".into(), transaction_value(event)?),
+        (
+            "message".into(),
+            row_value(message, &field_refs, unavailable_value, false)?,
+        ),
+    ]))
+}
+
+fn transaction_value(event: &ChangeEvent) -> Result<Value> {
+    event
         .transaction
         .as_ref()
         .map(|transaction| -> Result<Value> {
@@ -638,21 +727,7 @@ fn envelope_value(
             ]))
         })
         .transpose()?
-        .unwrap_or(Value::Null);
-    Ok(Value::Record(vec![
-        ("before".into(), before),
-        ("after".into(), after),
-        ("source".into(), source_value(event)?),
-        (
-            "op".into(),
-            Value::String(operation_code(event.operation).into()),
-        ),
-        (
-            "ts_ms".into(),
-            Value::Long(event.observed_time.timestamp_millis()),
-        ),
-        ("transaction".into(), transaction),
-    ]))
+        .map_or(Ok(Value::Null), Ok)
 }
 
 fn source_value(event: &ChangeEvent) -> Result<Value> {
@@ -1015,6 +1090,50 @@ mod tests {
         }
     }
 
+    fn logical_message_event() -> ChangeEvent {
+        let mut event = event();
+        event.source.connector = "postgresql".into();
+        event.source.schema = Some(String::new());
+        event.source.table = Some(String::new());
+        event
+            .source
+            .attributes
+            .insert("rustium.logical_decoding_message".into(), true.into());
+        event.position = SourcePosition::Postgres(PostgresPosition {
+            lsn: 64,
+            commit_lsn: Some(64),
+            transaction_id: None,
+            event_serial: 1,
+            snapshot: false,
+        });
+        event.transaction = None;
+        event.operation = Operation::Message;
+        event.before = None;
+        event.after = Some(indexmap! {
+            "prefix".into() => DataValue::String("orders.created".into()),
+            "content".into() => DataValue::Bytes(b"payload".to_vec()),
+        });
+        event.schema = EventSchema {
+            name: "inventory.Message".into(),
+            version: 1,
+            fields: vec![
+                FieldSchema {
+                    name: "prefix".into(),
+                    type_name: "text".into(),
+                    optional: true,
+                    primary_key: true,
+                },
+                FieldSchema {
+                    name: "content".into(),
+                    type_name: "bytea".into(),
+                    optional: true,
+                    primary_key: false,
+                },
+            ],
+        };
+        event
+    }
+
     fn connector_events() -> [(&'static str, ChangeEvent); 3] {
         let mysql = event();
 
@@ -1138,6 +1257,42 @@ mod tests {
             &Value::String("global".into())
         );
         assert_eq!(field(&payload, "op"), &Value::String("c".into()));
+    }
+
+    #[test]
+    fn emits_postgresql_logical_decoding_message_contract() {
+        let encoded = encoder(16).encode(&logical_message_event()).unwrap();
+        assert_eq!(encoded.destination, "inventory.message");
+        assert_eq!(
+            encoded.key_schema.as_ref().unwrap().subject,
+            "inventory.message-key"
+        );
+        assert_eq!(
+            encoded.payload_schema.as_ref().unwrap().subject,
+            "inventory.message-value"
+        );
+        let key = decode(
+            encoded.key.as_ref().unwrap(),
+            encoded.key_schema.as_ref().unwrap(),
+        );
+        assert_eq!(
+            union(field(&key, "prefix")),
+            &Value::String("orders.created".into())
+        );
+        let payload = decode(
+            encoded.payload.as_ref().unwrap(),
+            encoded.payload_schema.as_ref().unwrap(),
+        );
+        assert_eq!(field(&payload, "op"), &Value::String("m".into()));
+        let message = field(&payload, "message");
+        assert_eq!(
+            union(field(message, "prefix")),
+            &Value::String("orders.created".into())
+        );
+        assert_eq!(
+            union(field(message, "content")),
+            &Value::Bytes(b"payload".to_vec())
+        );
     }
 
     #[test]

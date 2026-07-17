@@ -43,6 +43,8 @@ The additive PostgreSQL `source.slot_failover` flag defaults to false and is omi
 
 The additive PostgreSQL `source.interval_handling_mode` field defaults to `postgres` and is omitted from semantic fingerprint material at that value, preserving the original PostgreSQL text contract. Debezium properties intentionally default `interval.handling.mode` to `numeric`. Changing to `numeric` or `string` changes the fingerprint and downstream field values, including interval array elements. Stop the connector, review schemas and consumers, and introduce the mode through the normal fingerprinted configuration-change procedure.
 
+The additive native PostgreSQL `source.logical_decoding_messages` flag defaults to false and is omitted from semantic fingerprint material with empty message-prefix filters. Debezium properties intentionally enable all logical decoding messages by default. Enabling native capture, or adding `source.message_prefix_include_list` / `source.message_prefix_exclude_list`, changes the fingerprint and adds `<topic.prefix>.message` records. Stop the connector, review topic provisioning and consumer handling for the prefix key and message envelope, then introduce the change through the normal fingerprinted configuration procedure. Existing checkpoints and connector-state versions remain readable because the change adds no persisted state field.
+
 ### Checkpoint migration
 
 Checkpoint JSON version 2 adds an optional connector-state envelope. Version 1 JSON without that field remains readable. PostgreSQL and MySQL cannot safely resume a completed version 1 checkpoint without persistent schema history, so they fail closed and require a backup, reset, and new initial snapshot. SQL Server's tested resume path does not depend on connector state and can read version 1 when the source cursor and CDC retention remain valid.
@@ -126,6 +128,8 @@ SQLite storage version 与 JSON checkpoint version 相互独立。Storage migrat
 新增的 PostgreSQL `source.slot_failover` 标志默认为 false，该值不会进入 semantic fingerprint 材料。启用后 fingerprint 会变化，并允许 Rustium 使用 PostgreSQL 17 failover 同步创建或更新 managed logical slot。启用前应停止 connector，确认目标是 PostgreSQL 17+ 主库，并确认账号有权管理该 slot。旧版本和 standby 节点会记录 warning 并保留普通 slot；external slot ownership 会拒绝该选项。
 
 新增的 PostgreSQL `source.interval_handling_mode` 字段默认为 `postgres`，该值不会进入 semantic fingerprint material，从而保持原 PostgreSQL 文本契约。Debezium properties 有意将 `interval.handling.mode` 默认设为 `numeric`。切换到 `numeric` 或 `string` 会改变 fingerprint 和下游字段值，包括 interval array element。应先停止 connector，审查 schema 和 consumer，再通过正常的 fingerprint 配置变更流程引入该模式。
+
+新增的 PostgreSQL 原生 `source.logical_decoding_messages` 标志默认为 false；message prefix filter 为空时不会进入 semantic fingerprint material。Debezium properties 有意默认启用全部 logical decoding message。启用原生捕获，或增加 `source.message_prefix_include_list` / `source.message_prefix_exclude_list`，都会改变 fingerprint，并新增 `<topic.prefix>.message` record。应先停止 connector，审查 topic provisioning 以及 consumer 对 prefix key 和 message envelope 的处理，再通过正常的 fingerprint 配置变更流程引入。该变更没有新增持久化状态字段，因此既有 checkpoint 和 connector-state version 仍可读取。
 
 ### Checkpoint 迁移
 

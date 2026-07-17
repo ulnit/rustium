@@ -16,6 +16,8 @@ PostgreSQL `slot.failover` maps to native `source.slot_failover`. It defaults to
 
 PostgreSQL `interval.handling.mode` accepts Debezium `numeric` and `string`; properties default to `numeric`. Native `source.interval_handling_mode` additionally accepts the backward-compatible `postgres` default, which is omitted from fingerprint material.
 
+PostgreSQL Debezium properties enable logical decoding messages by default and map `message.prefix.include.list` / `message.prefix.exclude.list` to anchored native filters. Native `source.logical_decoding_messages` defaults to false; enabling capture or adding filters is fingerprinted.
+
 ## 简体中文
 
 Rustium 的版本化配置模型、校验、环境变量插值、语义指纹，以及 PostgreSQL、MySQL、SQL Server、sink、格式和 runtime 的 Debezium 兼容 `.properties` 解析。
@@ -33,3 +35,5 @@ PostgreSQL `publish.via.partition.root` 映射为原生 `source.publish_via_part
 PostgreSQL `slot.failover` 映射为原生 `source.slot_failover`。默认值为 false，只有启用时才进入 fingerprint；failover 配置只适用于 managed slot。
 
 PostgreSQL `interval.handling.mode` 接受 Debezium 的 `numeric` 和 `string`，properties 默认使用 `numeric`。原生 `source.interval_handling_mode` 还接受向后兼容的默认值 `postgres`，该默认值不会进入 fingerprint material。
+
+PostgreSQL Debezium properties 默认启用 logical decoding message，并把 `message.prefix.include.list` / `message.prefix.exclude.list` 映射为 anchored 原生过滤器。原生 `source.logical_decoding_messages` 默认为 false；启用捕获或增加过滤器都会进入 fingerprint。

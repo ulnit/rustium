@@ -98,6 +98,9 @@ impl TestSettings {
             read_only: false,
             hstore_handling_mode: "json".into(),
             interval_handling_mode: "postgres".into(),
+            logical_decoding_messages: false,
+            message_prefix_include_list: Vec::new(),
+            message_prefix_exclude_list: Vec::new(),
         }
     }
 }
@@ -1631,6 +1634,158 @@ async fn keeps_snapshot_and_streaming_type_conversion_identical() -> TestResult 
         eprintln!("PostgreSQL type test cleanup also failed: {cleanup_error}");
     }
     outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires external PostgreSQL logical replication"]
+async fn captures_debezium_logical_decoding_messages() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_message_{}", &suffix[..12]);
+    let publication = format!("rustium_pg_message_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_pg_message_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-message-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let capture_result = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (id integer PRIMARY KEY, note text NOT NULL); \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        config.logical_decoding_messages = true;
+        config.message_prefix_include_list = vec![r"allowed\..*".into()];
+        let source = PostgresSource::new(
+            connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 32,
+                include_collections: Vec::new(),
+            },
+        );
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let result: TestResult = async {
+            wait_for_active_slot(&client, &slot_name).await?;
+
+            client
+                .batch_execute(&format!(
+                    "SELECT pg_logical_emit_message(false, 'ignored.prefix', 'ignored'); \
+                 SELECT pg_logical_emit_message(false, 'allowed.binary', decode('00ff10', 'hex')); \
+                 BEGIN; \
+                 SELECT pg_logical_emit_message(true, 'allowed.transactional', 'transaction-content'); \
+                 INSERT INTO public.{table_name} VALUES (1, 'same-transaction'); \
+                 COMMIT;"
+                ))
+                .await?;
+
+            let filtered = receive(&mut output).await?;
+            require(
+                filtered.event.is_none()
+                    && filtered.boundary == RecordBoundary::TransactionCommit,
+                "filtered non-transactional logical message did not advance a safe checkpoint boundary",
+            )?;
+
+            let non_transactional = receive(&mut output).await?;
+            require(
+                non_transactional.boundary == RecordBoundary::TransactionCommit,
+                "non-transactional logical message was not independently committable",
+            )?;
+            let non_transactional_event = non_transactional
+                .event
+                .ok_or_else(|| test_error("non-transactional logical message has no event"))?;
+            require(
+                non_transactional_event.operation == Operation::Message
+                    && non_transactional_event.transaction.is_none()
+                    && non_transactional_event.source.schema.as_deref() == Some("")
+                    && non_transactional_event.source.table.as_deref() == Some("")
+                    && non_transactional_event
+                        .after
+                        .as_ref()
+                        .and_then(|row| row.get("prefix"))
+                        == Some(&DataValue::String("allowed.binary".into()))
+                    && non_transactional_event
+                        .after
+                        .as_ref()
+                        .and_then(|row| row.get("content"))
+                        == Some(&DataValue::Bytes(vec![0x00, 0xff, 0x10])),
+                "non-transactional logical message metadata or binary content is incorrect",
+            )?;
+
+            let transactional = receive(&mut output).await?;
+            require(
+                transactional.boundary == RecordBoundary::Data,
+                "transactional logical message was committed before its transaction",
+            )?;
+            let transactional_event = transactional
+                .event
+                .ok_or_else(|| test_error("transactional logical message has no event"))?;
+            let message_transaction_id = match &transactional_event.position {
+                SourcePosition::Postgres(position) => position.transaction_id,
+                _ => None,
+            };
+            require(
+                transactional_event.operation == Operation::Message
+                    && message_transaction_id.is_some()
+                    && transactional_event
+                        .transaction
+                        .as_ref()
+                        .is_some_and(|transaction| transaction.total_order == Some(1))
+                    && transactional_event
+                        .after
+                        .as_ref()
+                        .and_then(|row| row.get("prefix"))
+                        == Some(&DataValue::String("allowed.transactional".into())),
+                "transactional logical message metadata is incorrect",
+            )?;
+
+            let insert = receive(&mut output).await?;
+            let insert_event = insert
+                .event
+                .ok_or_else(|| test_error("same-transaction insert has no event"))?;
+            let insert_transaction_id = match &insert_event.position {
+                SourcePosition::Postgres(position) => position.transaction_id,
+                _ => None,
+            };
+            require(
+                insert_event.operation == Operation::Create
+                    && insert_transaction_id == message_transaction_id
+                    && insert_event
+                        .transaction
+                        .as_ref()
+                        .is_some_and(|transaction| transaction.total_order == Some(2)),
+                "logical message and row event did not preserve source transaction order",
+            )?;
+
+            let commit = receive(&mut output).await?;
+            require(
+                commit.event.is_none()
+                    && commit.boundary == RecordBoundary::TransactionCommit
+                    && match &commit.position {
+                        SourcePosition::Postgres(position) => {
+                            position.transaction_id == message_transaction_id
+                        }
+                        _ => false,
+                    },
+                "logical message transaction did not end at the expected commit boundary",
+            )?;
+            Ok(())
+        }
+        .await;
+
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(result, stop_result)
+    }
+    .await;
+
+    let cleanup_result = cleanup(&client, &publication, &slot_name, &[&table_name]).await;
+    connection_task.abort();
+    let _ = connection_task.await;
+    capture_result?;
+    cleanup_result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

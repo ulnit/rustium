@@ -282,6 +282,18 @@ impl SourceConfig {
                             config.interval_handling_mode.clone().into(),
                         );
                 }
+                if config.captures_logical_decoding_messages() {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "logical_decoding_messages".into(),
+                            serde_json::json!({
+                                "include": config.message_prefix_include_list,
+                                "exclude": config.message_prefix_exclude_list,
+                            }),
+                        );
+                }
                 semantic
             }
             Self::Mysql(config) => {
@@ -446,6 +458,12 @@ pub struct PostgresSourceConfig {
     pub hstore_handling_mode: String,
     #[serde(default = "default_postgres_interval_handling_mode")]
     pub interval_handling_mode: String,
+    #[serde(default)]
+    pub logical_decoding_messages: bool,
+    #[serde(default)]
+    pub message_prefix_include_list: Vec<String>,
+    #[serde(default)]
+    pub message_prefix_exclude_list: Vec<String>,
 }
 
 impl PostgresSourceConfig {
@@ -532,6 +550,25 @@ impl PostgresSourceConfig {
                 "source.interval_handling_mode must be postgres, numeric, or string".into(),
             ));
         }
+        if !self.message_prefix_include_list.is_empty()
+            && !self.message_prefix_exclude_list.is_empty()
+        {
+            return Err(Error::Configuration(
+                "source.message_prefix_include_list and source.message_prefix_exclude_list are mutually exclusive"
+                    .into(),
+            ));
+        }
+        for pattern in self
+            .message_prefix_include_list
+            .iter()
+            .chain(&self.message_prefix_exclude_list)
+        {
+            if Regex::new(pattern).is_err() {
+                return Err(Error::Configuration(format!(
+                    "PostgreSQL logical decoding message prefix selector {pattern:?} is not a valid regular expression"
+                )));
+            }
+        }
         if self.signal_poll_interval.is_zero() {
             return Err(Error::Configuration(
                 "source.signal_poll_interval must be greater than zero".into(),
@@ -614,6 +651,30 @@ impl PostgresSourceConfig {
             validate_name(table, "source.signal_data_collection table")?;
         }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn captures_logical_decoding_messages(&self) -> bool {
+        self.logical_decoding_messages
+            || !self.message_prefix_include_list.is_empty()
+            || !self.message_prefix_exclude_list.is_empty()
+    }
+
+    #[must_use]
+    pub fn includes_message_prefix(&self, prefix: &str) -> bool {
+        if !self.captures_logical_decoding_messages() {
+            return false;
+        }
+        let included = self.message_prefix_include_list.is_empty()
+            || self
+                .message_prefix_include_list
+                .iter()
+                .any(|pattern| regex_matches(pattern, prefix));
+        included
+            && !self
+                .message_prefix_exclude_list
+                .iter()
+                .any(|pattern| regex_matches(pattern, prefix))
     }
 
     pub fn connection_url(&self, replication: bool) -> Result<String> {
@@ -1961,6 +2022,13 @@ sink:
                 .interval_handling_mode,
             "postgres"
         );
+        assert!(
+            !config
+                .source
+                .as_postgresql()
+                .unwrap()
+                .captures_logical_decoding_messages()
+        );
         assert_eq!(
             config
                 .source
@@ -1988,6 +2056,45 @@ sink:
         assert!(
             config.source.semantic_config()["interval_handling_mode"].is_null(),
             "the native PostgreSQL interval mode must preserve the old fingerprint shape"
+        );
+        assert!(
+            config.source.semantic_config()["logical_decoding_messages"].is_null(),
+            "disabled native logical decoding messages must preserve the old fingerprint shape"
+        );
+    }
+
+    #[test]
+    fn parses_native_postgresql_logical_decoding_message_filters() {
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  logical_decoding_messages: true\n  message_prefix_include_list: [orders\\..*, audit]\n",
+        ))
+        .unwrap();
+        let source = configured.source.as_postgresql().unwrap();
+        assert!(source.includes_message_prefix("orders.created"));
+        assert!(source.includes_message_prefix("audit"));
+        assert!(!source.includes_message_prefix("orders"));
+        assert_ne!(
+            Config::from_yaml(CONFIG).unwrap().fingerprint(),
+            configured.fingerprint()
+        );
+
+        let conflicting = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  message_prefix_include_list: [orders]\n  message_prefix_exclude_list: [audit]\n",
+        ))
+        .unwrap_err();
+        assert!(conflicting.to_string().contains("mutually exclusive"));
+
+        let invalid = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  message_prefix_include_list: ['[']\n",
+        ))
+        .unwrap_err();
+        assert!(
+            invalid
+                .to_string()
+                .contains("not a valid regular expression")
         );
     }
 

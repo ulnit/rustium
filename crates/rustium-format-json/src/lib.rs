@@ -2,9 +2,10 @@
 
 use std::collections::BTreeMap;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use rustium_core::{
-    ChangeEvent, EncodedEvent, Error, EventEncoder, FieldSchema, Operation, Result, Row,
+    ChangeEvent, DataValue, EncodedEvent, Error, EventEncoder, FieldSchema, Operation, Result, Row,
     SourcePosition, WireSchema, WireSchemaType,
 };
 
@@ -133,18 +134,34 @@ impl EventEncoder for DebeziumJsonEncoder {
         }
         let source_ts = event.source_time.map(|time| time.timestamp_millis());
         let source = debezium_source(event, source_ts)?;
-        let payload = serde_json::json!({
-            "before": event.before.as_ref().map(|row| row_to_json(row, &self.config.unavailable_value)),
-            "after": event.after.as_ref().map(|row| row_to_json(row, &self.config.unavailable_value)),
-            "source": source,
-            "op": operation_code(event.operation),
-            "ts_ms": event.observed_time.timestamp_millis(),
-            "transaction": event.transaction.as_ref().map(|transaction| serde_json::json!({
+        let transaction = event.transaction.as_ref().map(|transaction| {
+            serde_json::json!({
                 "id": transaction.id,
                 "total_order": transaction.total_order,
                 "data_collection_order": transaction.collection_order,
-            })),
+            })
         });
+        let payload = if is_logical_decoding_message(event) {
+            let message = event.after.as_ref().ok_or_else(|| {
+                Error::Encoding("PostgreSQL logical decoding message has no content".into())
+            })?;
+            serde_json::json!({
+                "source": source,
+                "op": operation_code(event.operation),
+                "ts_ms": event.observed_time.timestamp_millis(),
+                "transaction": transaction,
+                "message": logical_message_to_json(message, &self.config.unavailable_value),
+            })
+        } else {
+            serde_json::json!({
+                "before": event.before.as_ref().map(|row| row_to_json(row, &self.config.unavailable_value)),
+                "after": event.after.as_ref().map(|row| row_to_json(row, &self.config.unavailable_value)),
+                "source": source,
+                "op": operation_code(event.operation),
+                "ts_ms": event.observed_time.timestamp_millis(),
+                "transaction": transaction,
+            })
+        };
         build_encoded(event, &self.config, payload)
     }
 
@@ -180,10 +197,13 @@ fn build_encoded(
     payload: serde_json::Value,
 ) -> Result<EncodedEvent> {
     let heartbeat = is_heartbeat(event);
+    let logical_message = is_logical_decoding_message(event);
     let destination = if heartbeat {
         config.heartbeat_topic_name.clone().unwrap_or_else(|| {
             format!("{}.{}", config.heartbeat_topics_prefix, config.topic_prefix)
         })
+    } else if logical_message {
+        format!("{}.message", config.topic_prefix)
     } else {
         let table = event
             .source
@@ -224,6 +244,11 @@ fn build_encoded(
     headers.insert("rustium.content.type".into(), "application/json".into());
     if heartbeat {
         headers.insert("rustium.record.type".into(), "heartbeat".into());
+    } else if logical_message {
+        headers.insert(
+            "rustium.record.type".into(),
+            "logical-decoding-message".into(),
+        );
     }
     Ok(EncodedEvent {
         id: event.id.clone(),
@@ -241,6 +266,14 @@ fn is_heartbeat(event: &ChangeEvent) -> bool {
         .source
         .attributes
         .get("rustium.heartbeat")
+        .is_some_and(|value| value == &serde_json::Value::Bool(true))
+}
+
+fn is_logical_decoding_message(event: &ChangeEvent) -> bool {
+    event
+        .source
+        .attributes
+        .get("rustium.logical_decoding_message")
         .is_some_and(|value| value == &serde_json::Value::Bool(true))
 }
 
@@ -324,6 +357,19 @@ fn row_to_json(row: &Row, unavailable_value: &str) -> serde_json::Value {
         .into()
 }
 
+fn logical_message_to_json(row: &Row, unavailable_value: &str) -> serde_json::Value {
+    row.iter()
+        .map(|(name, value)| {
+            let value = match value {
+                DataValue::Bytes(value) => STANDARD.encode(value).into(),
+                value => value.to_json(unavailable_value),
+            };
+            (name.clone(), value)
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
 fn json_key_schema(
     event: &ChangeEvent,
     destination: &str,
@@ -383,6 +429,51 @@ fn json_payload_schema(
             "additionalProperties": false,
             "properties": {"ts_ms": {"type": "integer"}},
             "required": ["ts_ms"],
+        })
+    } else if is_logical_decoding_message(event) {
+        let message_schema = json_row_schema(event, config);
+        serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "title": schema_title(event, "Envelope"),
+            "$comment": format!("Rustium EventSchema version {}", event.schema.version),
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "source": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "version": {"type": "string"},
+                        "connector": {"type": "string"},
+                        "name": {"type": "string"},
+                        "ts_ms": {"type": ["integer", "null"]},
+                        "snapshot": {"type": "string"},
+                        "db": {"type": "string"},
+                        "schema": {"type": ["string", "null"]},
+                        "table": {"type": ["string", "null"]}
+                    },
+                    "required": ["version", "connector", "name", "ts_ms", "snapshot", "db", "schema", "table"]
+                },
+                "op": {"type": "string", "enum": ["m"]},
+                "ts_ms": {"type": "integer"},
+                "transaction": {
+                    "anyOf": [
+                        {"type": "null"},
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "id": {"type": "string"},
+                                "total_order": {"type": ["integer", "null"]},
+                                "data_collection_order": {"type": ["integer", "null"]}
+                            },
+                            "required": ["id", "total_order", "data_collection_order"]
+                        }
+                    ]
+                },
+                "message": message_schema
+            },
+            "required": ["source", "op", "ts_ms", "transaction", "message"]
         })
     } else {
         let row_schema = json_row_schema(event, config);
@@ -648,6 +739,50 @@ mod tests {
         }
     }
 
+    fn logical_message_event() -> ChangeEvent {
+        let mut event = event();
+        event.source.connector = "postgresql".into();
+        event.source.schema = Some(String::new());
+        event.source.table = Some(String::new());
+        event
+            .source
+            .attributes
+            .insert("rustium.logical_decoding_message".into(), true.into());
+        event.position = SourcePosition::Postgres(PostgresPosition {
+            lsn: 64,
+            commit_lsn: Some(64),
+            transaction_id: None,
+            event_serial: 1,
+            snapshot: false,
+        });
+        event.transaction = None;
+        event.operation = Operation::Message;
+        event.before = None;
+        event.after = Some(indexmap! {
+            "prefix".into() => DataValue::String("orders.created".into()),
+            "content".into() => DataValue::Bytes(b"payload".to_vec()),
+        });
+        event.schema = EventSchema {
+            name: "orders.Message".into(),
+            version: 1,
+            fields: vec![
+                FieldSchema {
+                    name: "prefix".into(),
+                    type_name: "text".into(),
+                    optional: true,
+                    primary_key: true,
+                },
+                FieldSchema {
+                    name: "content".into(),
+                    type_name: "bytea".into(),
+                    optional: true,
+                    primary_key: false,
+                },
+            ],
+        };
+        event
+    }
+
     fn encoded_fixture(event: &ChangeEvent) -> serde_json::Value {
         let encoded = DebeziumJsonEncoder::new(JsonEncoderConfig {
             topic_prefix: "app".into(),
@@ -813,6 +948,44 @@ mod tests {
         assert_eq!(value["after"]["attributes"]["region"], "global");
         assert!(value["after"]["attributes"]["optional"].is_null());
         assert!(encoded.key.is_some());
+    }
+
+    #[test]
+    fn emits_postgresql_logical_decoding_message_contracts() {
+        let config = JsonEncoderConfig {
+            topic_prefix: "app".into(),
+            unavailable_value: "__unavailable".into(),
+            tombstones_on_delete: true,
+            heartbeat_topics_prefix: "__debezium-heartbeat".into(),
+            heartbeat_topic_name: None,
+        };
+        let event = logical_message_event();
+        let encoded = DebeziumJsonEncoder::new(config.clone())
+            .encode(&event)
+            .unwrap();
+        assert_eq!(encoded.destination, "app.message");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(encoded.key.as_ref().unwrap()).unwrap(),
+            serde_json::json!({"prefix": "orders.created"})
+        );
+        let payload =
+            serde_json::from_slice::<serde_json::Value>(encoded.payload.as_ref().unwrap()).unwrap();
+        assert_eq!(payload["op"], "m");
+        assert_eq!(payload["source"]["schema"], "");
+        assert_eq!(payload["source"]["table"], "");
+        assert_eq!(payload["message"]["prefix"], "orders.created");
+        assert_eq!(payload["message"]["content"], "cGF5bG9hZA==");
+        assert!(payload.get("before").is_none());
+        assert!(payload.get("after").is_none());
+
+        let schema_encoded = DebeziumJsonSchemaEncoder::new(config)
+            .encode(&event)
+            .unwrap();
+        let definition: serde_json::Value =
+            serde_json::from_str(&schema_encoded.payload_schema.unwrap().definition).unwrap();
+        assert!(definition["properties"]["message"].is_object());
+        assert!(definition["properties"].get("before").is_none());
+        assert_eq!(schema_encoded.destination, "app.message");
     }
 
     #[test]

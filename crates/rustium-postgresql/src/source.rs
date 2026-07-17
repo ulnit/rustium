@@ -438,7 +438,7 @@ impl SourceConnector for PostgresSource {
             Duration::from_secs(30),
             retry_config,
         )
-        .with_messages(false)
+        .with_messages(self.config.captures_logical_decoding_messages())
         .with_slot_options(slot_options);
 
         let mut stream = LogicalReplicationStream::new(&replication_url, stream_config)
@@ -1358,8 +1358,20 @@ impl StreamingState {
                     None,
                 )
             }
-            EventType::Message { .. }
-            | EventType::Relation { .. }
+            EventType::Message {
+                flags,
+                prefix,
+                content,
+                ..
+            } => self.logical_decoding_message_record(
+                lsn,
+                connector_name,
+                config,
+                flags,
+                &prefix,
+                content.as_ref(),
+            ),
+            EventType::Relation { .. }
             | EventType::Type { .. }
             | EventType::Origin { .. }
             | EventType::StreamStop
@@ -1556,6 +1568,124 @@ impl StreamingState {
             observed_time: Utc::now(),
         };
         Ok(Some(SourceRecord::data(event)))
+    }
+
+    fn logical_decoding_message_record(
+        &mut self,
+        lsn: u64,
+        connector_name: &str,
+        config: &PostgresSourceConfig,
+        flags: u8,
+        prefix: &str,
+        content: &[u8],
+    ) -> Result<Option<SourceRecord>> {
+        let transactional = flags & 1 == 1;
+        let transaction_id = transactional
+            .then(|| self.transaction.as_ref().map(|transaction| transaction.id))
+            .flatten();
+        let event_serial = self.next_serial(lsn);
+        let position = SourcePosition::Postgres(PostgresPosition {
+            lsn,
+            commit_lsn: (!transactional).then_some(lsn),
+            transaction_id,
+            event_serial,
+            snapshot: false,
+        });
+        if self.should_skip(&position) {
+            return Ok(None);
+        }
+
+        if !config.includes_message_prefix(prefix) {
+            return Ok((!transactional).then_some(SourceRecord {
+                event: None,
+                position,
+                boundary: RecordBoundary::TransactionCommit,
+                connector_state: None,
+                signal_acknowledgements: Vec::new(),
+            }));
+        }
+
+        let transaction = self.transaction.as_mut().map(|transaction| {
+            transaction.total_order += 1;
+            let collection_order = transaction
+                .collection_order
+                .entry((String::new(), "message".into()))
+                .or_insert(0);
+            *collection_order += 1;
+            TransactionMetadata {
+                id: transaction.id.to_string(),
+                total_order: Some(transaction.total_order),
+                collection_order: Some(*collection_order),
+            }
+        });
+        let observed_time = Utc::now();
+        let source_time = self
+            .transaction
+            .as_ref()
+            .map_or(Some(observed_time), |transaction| {
+                Some(transaction.source_time)
+            });
+        let mut attributes = BTreeMap::new();
+        attributes.insert("rustium.logical_decoding_message".into(), true.into());
+        attributes.insert("transactional".into(), transactional.into());
+        let mut after = Row::new();
+        after.insert("prefix".into(), DataValue::String(prefix.into()));
+        after.insert("content".into(), DataValue::Bytes(content.to_vec()));
+        let event = ChangeEvent {
+            id: EventId::deterministic(
+                connector_name,
+                &config.database,
+                &position,
+                &format!("{}.message", config.database),
+                event_serial,
+            ),
+            source: SourceMetadata {
+                connector: "postgresql".into(),
+                connector_name: connector_name.into(),
+                database: config.database.clone(),
+                schema: Some(String::new()),
+                table: Some(String::new()),
+                snapshot: false,
+                version: CONNECTOR_VERSION.into(),
+                attributes,
+            },
+            position: position.clone(),
+            transaction,
+            operation: Operation::Message,
+            before: None,
+            after: Some(after),
+            schema: EventSchema {
+                name: format!("{connector_name}.Message"),
+                version: 1,
+                fields: vec![
+                    FieldSchema {
+                        name: "prefix".into(),
+                        type_name: "text".into(),
+                        optional: true,
+                        primary_key: true,
+                    },
+                    FieldSchema {
+                        name: "content".into(),
+                        type_name: "bytea".into(),
+                        optional: true,
+                        primary_key: false,
+                    },
+                ],
+            },
+            source_time,
+            observed_time,
+        };
+        Ok(Some(SourceRecord {
+            event: Some(event),
+            position,
+            boundary: if transactional {
+                RecordBoundary::Data
+            } else {
+                RecordBoundary::TransactionCommit
+            },
+            connector_state: None,
+            signal_acknowledgements: Vec::new(),
+        }))
     }
 
     fn commit_record(&mut self, commit_lsn: u64, end_lsn: u64) -> Result<Option<SourceRecord>> {
@@ -2966,7 +3096,7 @@ mod tests {
     use std::time::SystemTime;
 
     use indexmap::IndexMap;
-    use rustium_config::TableSelection;
+    use rustium_config::{Config, TableSelection};
     use rustium_core::{Checkpoint, ConnectorIdentity};
     use tokio::sync::{mpsc, watch};
     use tokio_util::sync::CancellationToken;
@@ -3003,6 +3133,123 @@ mod tests {
             event.after.unwrap().get("ts_ms"),
             Some(DataValue::Int64(_))
         ));
+    }
+
+    #[test]
+    fn converts_and_filters_logical_decoding_messages_at_safe_boundaries() {
+        let mut config = Config::from_yaml(
+            r#"
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: logical-message-test
+source:
+  type: postgresql
+  database: inventory
+  username: rustium
+  password: secret
+  publication: inventory_publication
+  slot_name: inventory_slot
+sink:
+  type: stdout
+  topic_prefix: inventory
+"#,
+        )
+        .unwrap()
+        .source
+        .as_postgresql()
+        .unwrap()
+        .clone();
+        config.logical_decoding_messages = true;
+        config.message_prefix_include_list = vec![r"orders\..*".into()];
+        let mut state = StreamingState::new(HashMap::new(), None, false);
+
+        let filtered = state
+            .logical_decoding_message_record(
+                100,
+                "logical-message-test",
+                &config,
+                0,
+                "audit",
+                b"ignored",
+            )
+            .unwrap()
+            .unwrap();
+        assert!(filtered.event.is_none());
+        assert_eq!(filtered.boundary, RecordBoundary::TransactionCommit);
+        assert_eq!(
+            filtered.position,
+            SourcePosition::Postgres(PostgresPosition {
+                lsn: 100,
+                commit_lsn: Some(100),
+                transaction_id: None,
+                event_serial: 1,
+                snapshot: false,
+            })
+        );
+
+        let accepted = state
+            .logical_decoding_message_record(
+                101,
+                "logical-message-test",
+                &config,
+                0,
+                "orders.created",
+                b"payload",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.boundary, RecordBoundary::TransactionCommit);
+        let event = accepted.event.unwrap();
+        assert_eq!(event.operation, Operation::Message);
+        assert_eq!(event.source.schema.as_deref(), Some(""));
+        assert_eq!(event.source.table.as_deref(), Some(""));
+        assert_eq!(
+            event
+                .source
+                .attributes
+                .get("rustium.logical_decoding_message"),
+            Some(&true.into())
+        );
+        assert_eq!(
+            event.after.as_ref().and_then(|row| row.get("prefix")),
+            Some(&DataValue::String("orders.created".into()))
+        );
+        assert_eq!(
+            event.after.as_ref().and_then(|row| row.get("content")),
+            Some(&DataValue::Bytes(b"payload".to_vec()))
+        );
+
+        state.transaction = Some(ActiveTransaction {
+            id: 42,
+            source_time: Utc::now(),
+            total_order: 0,
+            collection_order: HashMap::new(),
+        });
+        let transactional = state
+            .logical_decoding_message_record(
+                102,
+                "logical-message-test",
+                &config,
+                1,
+                "orders.updated",
+                b"transactional",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(transactional.boundary, RecordBoundary::Data);
+        let event = transactional.event.unwrap();
+        assert_eq!(
+            event.position,
+            SourcePosition::Postgres(PostgresPosition {
+                lsn: 102,
+                commit_lsn: None,
+                transaction_id: Some(42),
+                event_serial: 1,
+                snapshot: false,
+            })
+        );
+        assert_eq!(event.transaction.unwrap().total_order, Some(1));
     }
 
     #[test]
@@ -3414,6 +3661,9 @@ mod tests {
             read_only: false,
             hstore_handling_mode: "json".into(),
             interval_handling_mode: "postgres".into(),
+            logical_decoding_messages: false,
+            message_prefix_include_list: Vec::new(),
+            message_prefix_exclude_list: Vec::new(),
         };
         let mut source = PostgresSource::new(
             "inventory-postgresql",

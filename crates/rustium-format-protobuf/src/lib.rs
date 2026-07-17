@@ -116,6 +116,7 @@ impl DebeziumProtobufEncoder {
     fn encode_one(&self, event: &ChangeEvent) -> Result<EncodedEvent> {
         let destination = destination(event, &self.config)?;
         let heartbeat = is_heartbeat(event);
+        let logical_message = is_logical_decoding_message(event);
         let fields = adjusted_fields(event)?;
 
         let (key, key_schema) = if heartbeat {
@@ -163,6 +164,8 @@ impl DebeziumProtobufEncoder {
                     ProtoValue::I64(event.observed_time.timestamp_millis()),
                 )?;
                 Ok(message)
+            } else if logical_message {
+                build_logical_message(event, &fields, descriptor, &self.config.unavailable_value)
             } else {
                 build_envelope_message(event, &fields, descriptor, &self.config.unavailable_value)
             }
@@ -176,6 +179,11 @@ impl DebeziumProtobufEncoder {
         );
         if heartbeat {
             headers.insert("rustium.record.type".into(), "heartbeat".into());
+        } else if logical_message {
+            headers.insert(
+                "rustium.record.type".into(),
+                "logical-decoding-message".into(),
+            );
         }
         Ok(EncodedEvent {
             id: event.id.clone(),
@@ -280,6 +288,9 @@ fn destination(event: &ChangeEvent, config: &ProtobufEncoderConfig) -> Result<St
             format!("{}.{}", config.heartbeat_topics_prefix, config.topic_prefix)
         }));
     }
+    if is_logical_decoding_message(event) {
+        return Ok(format!("{}.message", config.topic_prefix));
+    }
     let table = event
         .source
         .table
@@ -308,6 +319,14 @@ fn is_heartbeat(event: &ChangeEvent) -> bool {
         .source
         .attributes
         .get("rustium.heartbeat")
+        .is_some_and(|value| value == &serde_json::Value::Bool(true))
+}
+
+fn is_logical_decoding_message(event: &ChangeEvent) -> bool {
+    event
+        .source
+        .attributes
+        .get("rustium.logical_decoding_message")
         .is_some_and(|value| value == &serde_json::Value::Bool(true))
 }
 
@@ -445,6 +464,43 @@ fn payload_schema(
     }
 
     let package = protobuf_package(event);
+    if is_logical_decoding_message(event) {
+        let mut definition = schema_header(&package);
+        push_line(&mut definition, 0, "message Envelope {");
+        push_line(&mut definition, 1, "message Message {");
+        for field in fields {
+            push_field_wrapper(&mut definition, field, 2);
+        }
+        for field in fields {
+            push_line(
+                &mut definition,
+                2,
+                &format!("Field_{} {} = {};", field.name, field.name, field.number),
+            );
+        }
+        push_line(&mut definition, 1, "}");
+        push_source_schema(&mut definition, event, 1);
+        push_line(&mut definition, 1, "message Transaction {");
+        push_line(&mut definition, 2, "string id = 1;");
+        push_line(&mut definition, 2, "optional uint64 total_order = 2;");
+        push_line(
+            &mut definition,
+            2,
+            "optional uint64 data_collection_order = 3;",
+        );
+        push_line(&mut definition, 1, "}");
+        push_line(&mut definition, 1, "Source source = 1;");
+        push_line(&mut definition, 1, "string op = 2;");
+        push_line(&mut definition, 1, "int64 ts_ms = 3;");
+        push_line(&mut definition, 1, "Transaction transaction = 4;");
+        push_line(&mut definition, 1, "Message message = 5;");
+        push_line(&mut definition, 0, "}");
+        return generated_schema(
+            format!("{destination}-value"),
+            definition,
+            format!("{package}.Envelope"),
+        );
+    }
     let mut definition = schema_header(&package);
     push_line(&mut definition, 0, "message Envelope {");
     push_line(&mut definition, 1, "message Value {");
@@ -759,6 +815,45 @@ fn build_envelope_message(
         "ts_ms",
         ProtoValue::I64(event.observed_time.timestamp_millis()),
     )?;
+    set_transaction(event, descriptor, &mut envelope)?;
+    Ok(envelope)
+}
+
+fn build_logical_message(
+    event: &ChangeEvent,
+    fields: &[AdjustedField<'_>],
+    descriptor: &MessageDescriptor,
+    unavailable: &str,
+) -> Result<DynamicMessage> {
+    let row = event.after.as_ref().ok_or_else(|| {
+        Error::Encoding("PostgreSQL logical decoding message has no content".into())
+    })?;
+    let mut envelope = DynamicMessage::new(descriptor.clone());
+    let source_descriptor = message_field_descriptor(descriptor, "source")?;
+    let source = build_source_message(event, &source_descriptor)?;
+    set_field(&mut envelope, "source", ProtoValue::Message(source))?;
+    set_field(
+        &mut envelope,
+        "op",
+        ProtoValue::String(operation_code(event.operation).into()),
+    )?;
+    set_field(
+        &mut envelope,
+        "ts_ms",
+        ProtoValue::I64(event.observed_time.timestamp_millis()),
+    )?;
+    set_transaction(event, descriptor, &mut envelope)?;
+    let message_descriptor = message_field_descriptor(descriptor, "message")?;
+    let message = build_row_message(row, fields, &message_descriptor, unavailable)?;
+    set_field(&mut envelope, "message", ProtoValue::Message(message))?;
+    Ok(envelope)
+}
+
+fn set_transaction(
+    event: &ChangeEvent,
+    descriptor: &MessageDescriptor,
+    envelope: &mut DynamicMessage,
+) -> Result<()> {
     if let Some(transaction) = &event.transaction {
         let descriptor = message_field_descriptor(descriptor, "transaction")?;
         let mut message = DynamicMessage::new(descriptor);
@@ -777,9 +872,9 @@ fn build_envelope_message(
                 ProtoValue::U64(value),
             )?;
         }
-        set_field(&mut envelope, "transaction", ProtoValue::Message(message))?;
+        set_field(envelope, "transaction", ProtoValue::Message(message))?;
     }
-    Ok(envelope)
+    Ok(())
 }
 
 fn build_row_message(
@@ -1328,6 +1423,40 @@ mod tests {
         }
     }
 
+    fn logical_message_event() -> ChangeEvent {
+        let mut event = event();
+        event.source.connector = "postgresql".into();
+        event.source.schema = Some(String::new());
+        event.source.table = Some(String::new());
+        event
+            .source
+            .attributes
+            .insert("rustium.logical_decoding_message".into(), true.into());
+        event.position = SourcePosition::Postgres(PostgresPosition {
+            lsn: 64,
+            commit_lsn: Some(64),
+            transaction_id: None,
+            event_serial: 1,
+            snapshot: false,
+        });
+        event.transaction = None;
+        event.operation = Operation::Message;
+        event.before = None;
+        event.after = Some(indexmap! {
+            "prefix".into() => DataValue::String("orders.created".into()),
+            "content".into() => DataValue::Bytes(b"payload".to_vec()),
+        });
+        event.schema = EventSchema {
+            name: "inventory.Message".into(),
+            version: 1,
+            fields: vec![
+                field("prefix", "text", true, true),
+                field("content", "bytea", true, false),
+            ],
+        };
+        event
+    }
+
     fn connector_events() -> [(&'static str, ChangeEvent); 3] {
         let mysql = event();
 
@@ -1502,6 +1631,42 @@ mod tests {
             &ProtoValue::I32(1)
         );
         assert_eq!(string_field(&payload, "op"), "c");
+    }
+
+    #[test]
+    fn emits_postgresql_logical_decoding_message_contract() {
+        let encoded = encoder(32).encode(&logical_message_event()).unwrap();
+        assert_eq!(encoded.destination, "inventory.message");
+        assert_eq!(
+            encoded.key_schema.as_ref().unwrap().subject,
+            "inventory.message-key"
+        );
+        assert_eq!(
+            encoded.payload_schema.as_ref().unwrap().subject,
+            "inventory.message-value"
+        );
+        let key = decode(
+            encoded.key.as_ref().unwrap(),
+            encoded.key_schema.as_ref().unwrap(),
+        );
+        assert_eq!(string_field(&key, "prefix"), "orders.created");
+        let payload = decode(
+            encoded.payload.as_ref().unwrap(),
+            encoded.payload_schema.as_ref().unwrap(),
+        );
+        assert_eq!(string_field(&payload, "op"), "m");
+        let message = message_field(&payload, "message");
+        assert_eq!(
+            string_field(&message_field(&message, "prefix"), "value"),
+            "orders.created"
+        );
+        assert_eq!(
+            message_field(&message, "content")
+                .get_field_by_name("value")
+                .unwrap()
+                .as_ref(),
+            &ProtoValue::Bytes(Bytes::from_static(b"payload"))
+        );
     }
 
     #[test]
