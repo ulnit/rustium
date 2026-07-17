@@ -786,6 +786,7 @@ impl SourceConnector for PostgresSource {
             status_update_interval_ms = self.config.status_update_interval.as_millis(),
             tcp_keepalive = self.config.tcp_keepalive,
             lsn_flush_mode = ?self.config.lsn_flush_mode,
+            schema_refresh_mode = ?self.config.schema_refresh_mode,
             "PostgreSQL streaming started"
         );
 
@@ -3717,7 +3718,7 @@ mod tests {
     use std::time::SystemTime;
 
     use indexmap::IndexMap;
-    use rustium_config::{Config, TableSelection};
+    use rustium_config::{Config, PostgresSchemaRefreshMode, TableSelection};
     use rustium_core::{Checkpoint, ConnectorIdentity};
     use tokio::sync::{mpsc, watch};
     use tokio_util::sync::CancellationToken;
@@ -4233,6 +4234,133 @@ sink:
     }
 
     #[test]
+    fn row_updates_do_not_refresh_pgoutput_schema_for_missing_toast_columns() {
+        let table_schema = TableSchema {
+            schema: "public".into(),
+            table: "documents".into(),
+            event_schema: EventSchema {
+                name: "test.public.documents.Envelope".into(),
+                version: 7,
+                fields: vec![
+                    FieldSchema {
+                        name: "id".into(),
+                        type_name: "bigint".into(),
+                        optional: false,
+                        primary_key: true,
+                    },
+                    FieldSchema {
+                        name: "body".into(),
+                        type_name: "text".into(),
+                        optional: false,
+                        primary_key: false,
+                    },
+                    FieldSchema {
+                        name: "revision".into(),
+                        type_name: "integer".into(),
+                        optional: false,
+                        primary_key: false,
+                    },
+                ],
+            },
+            column_types: vec![
+                PostgresColumnType {
+                    name: "id".into(),
+                    type_oid: 20,
+                    type_modifier: -1,
+                },
+                PostgresColumnType {
+                    name: "body".into(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                },
+                PostgresColumnType {
+                    name: "revision".into(),
+                    type_oid: 23,
+                    type_modifier: -1,
+                },
+            ],
+            opaque_columns: Vec::new(),
+        };
+
+        for mode in [
+            PostgresSchemaRefreshMode::ColumnsDiff,
+            PostgresSchemaRefreshMode::ColumnsDiffExcludeUnchangedToast,
+        ] {
+            for (old_body, expected_body) in [
+                (
+                    Some("large-before-value"),
+                    DataValue::String("large-before-value".into()),
+                ),
+                (None, DataValue::Unavailable),
+            ] {
+                let mut config = postgres_streaming_test_config();
+                config.schema_refresh_mode = mode;
+                let key = table_schema.key();
+                let mut state = StreamingState::new(
+                    HashMap::from([(key.clone(), table_schema.clone())]),
+                    None,
+                    false,
+                );
+                let mut old_data = RowData::new();
+                old_data.push(Arc::from("id"), ColumnValue::text("1"));
+                if let Some(body) = old_body {
+                    old_data.push(Arc::from("body"), ColumnValue::text(body));
+                }
+                let mut new_data = RowData::new();
+                new_data.push(Arc::from("id"), ColumnValue::text("1"));
+                new_data.push(Arc::from("revision"), ColumnValue::text("2"));
+
+                let record = state
+                    .data_record(
+                        100,
+                        "test",
+                        &config,
+                        "public",
+                        "documents",
+                        42,
+                        Operation::Update,
+                        Some(old_data),
+                        Some(new_data),
+                        Some(vec!["id".into()]),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let event = record.event.unwrap();
+                assert_eq!(event.after.as_ref().unwrap()["body"], expected_body);
+                assert_eq!(event.schema.version, 7);
+                assert_eq!(state.schemas[&key].event_schema.version, 7);
+                assert!(!state.schema_dirty);
+                assert!(record.connector_state.is_none());
+            }
+        }
+    }
+
+    fn postgres_streaming_test_config() -> PostgresSourceConfig {
+        Config::from_yaml(
+            r#"
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: test
+source:
+  type: postgresql
+  database: app
+  username: rustium
+  password: secret
+  publication: test_publication
+  slot_name: test_slot
+sink:
+  type: stdout
+"#,
+        )
+        .unwrap()
+        .source
+        .as_postgresql()
+        .unwrap()
+        .clone()
+    }
+
+    #[test]
     fn versions_relation_driven_schema_changes() {
         let original = TableSchema {
             schema: "public".into(),
@@ -4460,6 +4588,7 @@ sink:
             interval_handling_mode: "postgres".into(),
             include_unknown_datatypes: false,
             money_fraction_digits: 2,
+            schema_refresh_mode: PostgresSchemaRefreshMode::ColumnsDiff,
             logical_decoding_messages: false,
             message_prefix_include_list: Vec::new(),
             message_prefix_exclude_list: Vec::new(),

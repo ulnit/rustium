@@ -3,14 +3,20 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 postgres_version=${RUSTIUM_POSTGRES_EXTENSION_VERSION:-17}
+postgres_image=${RUSTIUM_POSTGRES_EXTENSION_BASE_IMAGE:-postgres:${postgres_version}}
 image=${RUSTIUM_POSTGRES_EXTENSION_IMAGE:-rustium/postgres-extensions:${postgres_version}}
 container="rustium-pg-extensions-${postgres_version}-$$"
 database=cdc_demo
 password=rustium-extension-test
 dockerfile="$root/crates/rustium-postgresql/tests/postgresql-extensions.Dockerfile"
 tls_dir=$(mktemp -d "${TMPDIR:-/tmp}/rustium-postgres-tls.XXXXXX")
+tunnel_pid=
 
 cleanup() {
+    if [[ -n $tunnel_pid ]]; then
+        kill "$tunnel_pid" >/dev/null 2>&1 || true
+        wait "$tunnel_pid" 2>/dev/null || true
+    fi
     docker rm -f "$container" >/dev/null 2>&1 || true
     rm -rf "$tls_dir"
 }
@@ -18,6 +24,7 @@ trap cleanup EXIT INT TERM
 
 docker build \
     --build-arg "POSTGRES_VERSION=$postgres_version" \
+    --build-arg "POSTGRES_IMAGE=$postgres_image" \
     --tag "$image" \
     --file "$dockerfile" \
     "$root/crates/rustium-postgresql/tests"
@@ -58,6 +65,33 @@ docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres -d "$database" \
 
 mapping=$(docker port "$container" 5432/tcp)
 port=${mapping##*:}
+if [[ -n ${RUSTIUM_POSTGRES_DOCKER_SSH_HOST:-} ]]; then
+    local_port=${RUSTIUM_POSTGRES_DOCKER_SSH_LOCAL_PORT:-55433}
+    if nc -z 127.0.0.1 "$local_port" >/dev/null 2>&1; then
+        echo "local SSH tunnel port $local_port is already in use" >&2
+        exit 1
+    fi
+    ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -N \
+        -L "127.0.0.1:${local_port}:127.0.0.1:${port}" \
+        "$RUSTIUM_POSTGRES_DOCKER_SSH_HOST" &
+    tunnel_pid=$!
+    tunnel_ready=false
+    for _ in $(seq 1 50); do
+        if nc -z 127.0.0.1 "$local_port" >/dev/null 2>&1; then
+            tunnel_ready=true
+            break
+        fi
+        if ! kill -0 "$tunnel_pid" >/dev/null 2>&1; then
+            wait "$tunnel_pid"
+        fi
+        sleep 0.1
+    done
+    if [[ $tunnel_ready != true ]]; then
+        echo "PostgreSQL SSH tunnel did not become ready" >&2
+        exit 1
+    fi
+    port=$local_port
+fi
 docker cp "$container:/etc/postgresql/rustium-tls/ca.crt" "$tls_dir/ca.crt"
 docker cp "$container:/etc/postgresql/rustium-tls/wrong-ca.crt" "$tls_dir/wrong-ca.crt"
 
@@ -88,6 +122,15 @@ RUSTIUM_POSTGRES_TEST_PASSWORD="$password" \
 RUSTIUM_POSTGRES_TEST_DATABASE="$database" \
 cargo test -p rustium-postgresql --test postgresql_external --locked -- \
     converts_debezium_money_fraction_digits_across_snapshot_and_wal \
+    --ignored --exact --nocapture
+
+RUSTIUM_POSTGRES_TEST_HOST=127.0.0.1 \
+RUSTIUM_POSTGRES_TEST_PORT="$port" \
+RUSTIUM_POSTGRES_TEST_USER=postgres \
+RUSTIUM_POSTGRES_TEST_PASSWORD="$password" \
+RUSTIUM_POSTGRES_TEST_DATABASE="$database" \
+cargo test -p rustium-postgresql --test postgresql_external --locked -- \
+    keeps_pgoutput_schema_stable_for_unchanged_toast_updates \
     --ignored --exact --nocapture
 
 RUSTIUM_POSTGRES_TEST_HOST=127.0.0.1 \

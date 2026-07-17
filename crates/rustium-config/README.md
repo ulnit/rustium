@@ -18,6 +18,8 @@ PostgreSQL `interval.handling.mode` accepts Debezium `numeric` and `string`; pro
 
 PostgreSQL `money.fraction.digits` maps to native `source.money_fraction_digits` and defaults to `2`. Non-default signed 16-bit scales are fingerprinted because they change MONEY schemas and values.
 
+PostgreSQL `schema.refresh.mode` maps to native `source.schema_refresh_mode` and accepts `columns_diff` or `columns_diff_exclude_unchanged_toast`. Both are operationally equivalent with pgoutput Relation-driven schemas and are excluded from fingerprints.
+
 PostgreSQL Debezium properties enable logical decoding messages by default and map `message.prefix.include.list` / `message.prefix.exclude.list` to anchored native filters. Native `source.logical_decoding_messages` defaults to false; enabling capture or adding filters is fingerprinted.
 
 ## 简体中文
@@ -39,5 +41,7 @@ PostgreSQL `slot.failover` 映射为原生 `source.slot_failover`。默认值为
 PostgreSQL `interval.handling.mode` 接受 Debezium 的 `numeric` 和 `string`，properties 默认使用 `numeric`。原生 `source.interval_handling_mode` 还接受向后兼容的默认值 `postgres`，该默认值不会进入 fingerprint material。
 
 PostgreSQL `money.fraction.digits` 映射为原生 `source.money_fraction_digits`，默认值为 `2`。非默认的有符号 16 位 scale 会改变 MONEY schema 与值，因此进入 fingerprint。
+
+PostgreSQL `schema.refresh.mode` 映射为原生 `source.schema_refresh_mode`，接受 `columns_diff` 或 `columns_diff_exclude_unchanged_toast`。在 pgoutput Relation-driven schema 下两者运维行为等价，因此不进入 fingerprint。
 
 PostgreSQL Debezium properties 默认启用 logical decoding message，并把 `message.prefix.include.list` / `message.prefix.exclude.list` 映射为 anchored 原生过滤器。原生 `source.logical_decoding_messages` 默认为 false；启用捕获或增加过滤器都会进入 fingerprint。

@@ -535,6 +535,8 @@ pub struct PostgresSourceConfig {
     #[serde(default = "default_postgres_money_fraction_digits")]
     pub money_fraction_digits: i16,
     #[serde(default)]
+    pub schema_refresh_mode: PostgresSchemaRefreshMode,
+    #[serde(default)]
     pub logical_decoding_messages: bool,
     #[serde(default)]
     pub message_prefix_include_list: Vec<String>,
@@ -1374,6 +1376,14 @@ pub enum PostgresLsnFlushMode {
     ConnectorAndDriver,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostgresSchemaRefreshMode {
+    #[default]
+    ColumnsDiff,
+    ColumnsDiffExcludeUnchangedToast,
+}
+
 impl PostgresOffsetMismatchStrategy {
     #[must_use]
     pub const fn advances_slot(self) -> bool {
@@ -2193,6 +2203,10 @@ sink:
             postgres.money_fraction_digits,
             default_postgres_money_fraction_digits()
         );
+        assert_eq!(
+            postgres.schema_refresh_mode,
+            PostgresSchemaRefreshMode::ColumnsDiff
+        );
         let connection_url = Url::parse(&postgres.connection_url(true).unwrap()).unwrap();
         assert!(
             connection_url
@@ -2274,6 +2288,10 @@ sink:
         assert!(
             config.source.semantic_config()["money_fraction_digits"].is_null(),
             "the default PostgreSQL money scale must preserve the old fingerprint shape"
+        );
+        assert!(
+            config.source.semantic_config()["schema_refresh_mode"].is_null(),
+            "the pgoutput schema refresh compatibility mode must not change fingerprints"
         );
         assert!(
             config.source.semantic_config()["logical_decoding_messages"].is_null(),
@@ -2659,6 +2677,37 @@ sink:
             Config::from_yaml(&CONFIG.replace(
                 "  slot_name: rustium_orders\n",
                 "  slot_name: rustium_orders\n  money_fraction_digits: 32768\n",
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_native_postgresql_schema_refresh_modes_without_changing_fingerprints() {
+        let baseline = Config::from_yaml(CONFIG).unwrap();
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  schema_refresh_mode: columns_diff_exclude_unchanged_toast\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .schema_refresh_mode,
+            PostgresSchemaRefreshMode::ColumnsDiffExcludeUnchangedToast
+        );
+        assert_eq!(baseline.fingerprint(), configured.fingerprint());
+        assert!(
+            configured.source.semantic_config()["schema_refresh_mode"].is_null(),
+            "schema.refresh.mode is operational compatibility under pgoutput"
+        );
+
+        assert!(
+            Config::from_yaml(&CONFIG.replace(
+                "  slot_name: rustium_orders\n",
+                "  slot_name: rustium_orders\n  schema_refresh_mode: invalid\n",
             ))
             .is_err()
         );

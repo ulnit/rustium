@@ -16,8 +16,8 @@ use rdkafka::{
 };
 use rustium_config::{
     PostgresLsnFlushMode, PostgresOffsetMismatchStrategy, PostgresReplicaIdentity,
-    PostgresReplicaIdentityRule, PostgresSourceConfig, PublicationAutoCreateMode, SlotOwnership,
-    SnapshotConfig, SnapshotMode, TableSelection,
+    PostgresReplicaIdentityRule, PostgresSchemaRefreshMode, PostgresSourceConfig,
+    PublicationAutoCreateMode, SlotOwnership, SnapshotConfig, SnapshotMode, TableSelection,
 };
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
@@ -118,6 +118,7 @@ impl TestSettings {
             interval_handling_mode: "postgres".into(),
             include_unknown_datatypes: false,
             money_fraction_digits: 2,
+            schema_refresh_mode: PostgresSchemaRefreshMode::ColumnsDiff,
             logical_decoding_messages: false,
             message_prefix_include_list: Vec::new(),
             message_prefix_exclude_list: Vec::new(),
@@ -1782,6 +1783,230 @@ async fn converts_debezium_money_fraction_digits_across_snapshot_and_wal() -> Te
         eprintln!("PostgreSQL money cleanup also failed: {cleanup_error}");
     }
     outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn keeps_pgoutput_schema_stable_for_unchanged_toast_updates() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome: TestResult = async {
+        for (mode_index, mode) in [
+            PostgresSchemaRefreshMode::ColumnsDiff,
+            PostgresSchemaRefreshMode::ColumnsDiffExcludeUnchangedToast,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (identity_index, replica_identity_full) in [false, true].into_iter().enumerate() {
+                run_unchanged_toast_case(
+                    &settings,
+                    &client,
+                    &suffix,
+                    mode_index,
+                    mode,
+                    identity_index,
+                    replica_identity_full,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    connection_task.abort();
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_unchanged_toast_case(
+    settings: &TestSettings,
+    client: &Client,
+    suffix: &str,
+    mode_index: usize,
+    mode: PostgresSchemaRefreshMode,
+    identity_index: usize,
+    replica_identity_full: bool,
+) -> TestResult {
+    let name_suffix = format!("{mode_index}_{identity_index}_{}", &suffix[..8]);
+    let table_name = format!("rustium_pg_toast_{name_suffix}");
+    let publication = format!("rustium_toast_pub_{name_suffix}");
+    let slot_name = format!("rustium_toast_slot_{name_suffix}");
+    let connector_name = format!("postgresql-toast-{name_suffix}");
+
+    let outcome: TestResult = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (\
+                    id BIGINT PRIMARY KEY, \
+                    body TEXT NOT NULL, \
+                    revision INTEGER NOT NULL\
+                 ); \
+                 ALTER TABLE public.{table_name} ALTER COLUMN body SET STORAGE EXTERNAL; \
+                 INSERT INTO public.{table_name} \
+                 SELECT 1, string_agg(md5(value::text), ''), 0 \
+                 FROM generate_series(1, 2048) AS value; \
+                 CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+        if replica_identity_full {
+            client
+                .batch_execute(&format!(
+                    "ALTER TABLE public.{table_name} REPLICA IDENTITY FULL"
+                ))
+                .await?;
+        }
+        require_toast_chunks(client, &table_name).await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        config.schema_refresh_mode = mode;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let capture_result: TestResult = async {
+            let snapshot_event = loop {
+                let record = receive(&mut output).await?;
+                if let Some(event) = record.event
+                    && event.operation == Operation::Read
+                {
+                    break event;
+                }
+            };
+            let schema_version = snapshot_event.schema.version;
+            let snapshot_body = snapshot_event
+                .after
+                .as_ref()
+                .and_then(|row| row.get("body"))
+                .and_then(|value| match value {
+                    DataValue::String(value) => Some(value.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| test_error("TOAST snapshot has no text body"))?;
+            require(
+                snapshot_body.len() >= 65_536,
+                "TOAST snapshot body is smaller than the generated fixture",
+            )?;
+            loop {
+                if receive(&mut output).await?.boundary == RecordBoundary::SnapshotComplete {
+                    break;
+                }
+            }
+            wait_for_active_slot(client, &slot_name).await?;
+
+            for revision in 1..=3 {
+                client
+                    .execute(
+                        &format!("UPDATE public.{table_name} SET revision = $1 WHERE id = 1"),
+                        &[&revision],
+                    )
+                    .await?;
+                let update_record = loop {
+                    let record = receive(&mut output).await?;
+                    if record
+                        .event
+                        .as_ref()
+                        .is_some_and(|event| event.operation == Operation::Update)
+                    {
+                        break record;
+                    }
+                };
+                require(
+                    update_record.connector_state.is_none(),
+                    "unchanged TOAST update unexpectedly dirtied PostgreSQL schema state",
+                )?;
+                let update_event = update_record
+                    .event
+                    .ok_or_else(|| test_error("TOAST update record has no event"))?;
+                require(
+                    update_event.schema.version == schema_version,
+                    "unchanged TOAST update changed the event schema version",
+                )?;
+                let after = update_event
+                    .after
+                    .as_ref()
+                    .ok_or_else(|| test_error("TOAST update has no after row"))?;
+                require(
+                    after.get("revision") == Some(&DataValue::Int32(revision)),
+                    "TOAST update revision is incorrect",
+                )?;
+                if replica_identity_full {
+                    require(
+                        after.get("body") == Some(&DataValue::String(snapshot_body.clone())),
+                        "REPLICA IDENTITY FULL did not reuse the before-image TOAST value",
+                    )?;
+                } else {
+                    require(
+                        after.get("body") == Some(&DataValue::Unavailable),
+                        "default replica identity did not expose unchanged TOAST as unavailable",
+                    )?;
+                }
+                let commit = loop {
+                    let record = receive(&mut output).await?;
+                    if record.boundary == RecordBoundary::TransactionCommit {
+                        break record;
+                    }
+                };
+                require(
+                    commit.connector_state.is_none(),
+                    "unchanged TOAST commit unexpectedly persisted new schema state",
+                )?;
+            }
+            Ok(())
+        }
+        .await;
+        let stop_result = stop_source(cancellation, source_task).await;
+        combine_capture_and_stop(capture_result, stop_result)
+    }
+    .await;
+
+    let cleanup_result = cleanup(client, &publication, &slot_name, &[&table_name]).await;
+    match (outcome, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+async fn require_toast_chunks(client: &Client, table_name: &str) -> TestResult {
+    let toast_relation = client
+        .query_one(
+            "SELECT toast.relname \
+             FROM pg_class AS parent \
+             JOIN pg_namespace AS namespace ON namespace.oid = parent.relnamespace \
+             JOIN pg_class AS toast ON toast.oid = parent.reltoastrelid \
+             WHERE namespace.nspname = 'public' AND parent.relname = $1",
+            &[&table_name],
+        )
+        .await?
+        .get::<_, String>(0);
+    require(
+        toast_relation
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+        "PostgreSQL returned an unsafe TOAST relation name",
+    )?;
+    let chunk_count = client
+        .query_one(
+            &format!("SELECT count(*)::BIGINT FROM pg_toast.{toast_relation}"),
+            &[],
+        )
+        .await?
+        .get::<_, i64>(0);
+    require(
+        chunk_count > 0,
+        "generated PostgreSQL text was not stored in TOAST chunks",
+    )
 }
 
 fn verify_money_schema(schema: &rustium_core::EventSchema) -> TestResult {

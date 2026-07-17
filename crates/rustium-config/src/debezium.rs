@@ -256,6 +256,11 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
             )?,
             include_unknown_datatypes: bool_value(&properties, "include.unknown.datatypes", false)?,
             money_fraction_digits: i16_value(&properties, "money.fraction.digits", 2)?,
+            schema_refresh_mode: postgres_schema_refresh_mode(
+                properties
+                    .get("schema.refresh.mode")
+                    .map_or("columns_diff", String::as_str),
+            )?,
             logical_decoding_messages: true,
             message_prefix_include_list: csv_property(
                 properties.get("message.prefix.include.list"),
@@ -1174,6 +1179,18 @@ fn postgres_interval_handling_mode(mode: &str) -> Result<String> {
     }
 }
 
+fn postgres_schema_refresh_mode(mode: &str) -> Result<PostgresSchemaRefreshMode> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "columns_diff" => Ok(PostgresSchemaRefreshMode::ColumnsDiff),
+        "columns_diff_exclude_unchanged_toast" => {
+            Ok(PostgresSchemaRefreshMode::ColumnsDiffExcludeUnchangedToast)
+        }
+        _ => Err(Error::Configuration(format!(
+            "schema.refresh.mode={mode:?} must be columns_diff or columns_diff_exclude_unchanged_toast"
+        ))),
+    }
+}
+
 fn postgres_offset_mismatch_strategy(strategy: &str) -> Result<PostgresOffsetMismatchStrategy> {
     match strategy.trim().to_ascii_lowercase().as_str() {
         "no_validation" => Ok(PostgresOffsetMismatchStrategy::NoValidation),
@@ -1422,6 +1439,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "database.tcpKeepAlive",
         "include.unknown.datatypes",
         "money.fraction.digits",
+        "schema.refresh.mode",
         "slot.max.retries",
         "slot.retry.delay.ms",
         "slot.stream.params",
@@ -2288,6 +2306,68 @@ money.fraction.digits=32768
         )
         .unwrap_err();
         assert!(overflow.to_string().contains("short integer"));
+    }
+
+    #[test]
+    fn maps_postgres_schema_refresh_modes_without_changing_fingerprints() {
+        let baseline = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+"#,
+        )
+        .unwrap();
+        let configured = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+schema.refresh.mode= COLUMNS_DIFF_EXCLUDE_UNCHANGED_TOAST
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .schema_refresh_mode,
+            PostgresSchemaRefreshMode::ColumnsDiffExcludeUnchangedToast
+        );
+        assert_eq!(baseline.fingerprint(), configured.fingerprint());
+        assert!(
+            configured
+                .compatibility_warnings
+                .iter()
+                .all(|warning| { !warning.contains("schema.refresh.mode is not implemented") })
+        );
+
+        let invalid = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+schema.refresh.mode=toast_guessing
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            invalid
+                .to_string()
+                .contains("must be columns_diff or columns_diff_exclude_unchanged_toast")
+        );
     }
 
     #[test]
