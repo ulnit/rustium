@@ -39,6 +39,7 @@ jobs:
           cargo test --workspace --locked
           for package in \
             rustium \
+            rustium-column-transform \
             rustium-config \
             rustium-core \
             rustium-format-avro \
@@ -93,6 +94,7 @@ jobs:
           set -euo pipefail
           for package in \
             rustium-config \
+            rustium-column-transform \
             rustium-format-avro \
             rustium-format-json \
             rustium-format-protobuf \

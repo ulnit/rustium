@@ -2992,6 +2992,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustium-column-transform"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "md-5 0.10.6",
+ "md2",
+ "regex",
+ "rustium-config",
+ "rustium-core",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "sha3",
+]
+
+[[package]]
 name = "rustium-config"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -3081,6 +3095,7 @@ dependencies = [
  "p12-keystore",
  "rdkafka",
  "regex",
+ "rustium-column-transform",
  "rustium-config",
  "rustium-core",
  "rustium-signal-kafka",
@@ -3102,19 +3117,15 @@ dependencies = [
  "bigdecimal",
  "chrono",
  "indexmap",
- "md-5 0.10.6",
- "md2",
  "pg_walstream",
  "rdkafka",
  "regex",
+ "rustium-column-transform",
  "rustium-config",
  "rustium-core",
  "rustium-signal-kafka",
  "serde",
  "serde_json",
- "sha1 0.10.7",
- "sha2 0.10.9",
- "sha3",
  "tempfile",
  "tokio",
  "tokio-postgres",

@@ -32,7 +32,7 @@ PostgreSQL `schema.refresh.mode` maps to native `source.schema_refresh_mode` and
 
 PostgreSQL Debezium properties enable logical decoding messages by default and map `message.prefix.include.list` / `message.prefix.exclude.list` to anchored native filters. Native `source.logical_decoding_messages` defaults to false; enabling capture or adding filters is fingerprinted.
 
-PostgreSQL column transformations map Debezium's `column.truncate.to.<length>.chars`, `column.mask.with.<length>.chars`, `column.mask.hash.<algorithm>.with.salt.<salt>`, and `column.mask.hash.v2.<algorithm>.with.salt.<salt>` properties to native `source.column_transformations`. Selectors are anchored, case-insensitive `schema.table.column` regular expressions and category priority is truncate, fixed mask, hash V1, then hash V2. Hash salts are validated as non-empty and are represented in semantic fingerprints only by SHA-256 digest.
+PostgreSQL and MySQL column transformations map Debezium's `column.truncate.to.<length>.chars`, `column.mask.with.<length>.chars`, `column.mask.hash.<algorithm>.with.salt.<salt>`, and `column.mask.hash.v2.<algorithm>.with.salt.<salt>` properties to native `source.column_transformations`. Selectors are anchored, case-insensitive `schema.table.column` or `database.table.column` regular expressions and category priority is truncate, fixed mask, hash V1, then hash V2. Hash salts are validated as non-empty and are represented in semantic fingerprints only by SHA-256 digest.
 
 ## 简体中文
 
@@ -68,4 +68,4 @@ PostgreSQL `schema.refresh.mode` 映射为原生 `source.schema_refresh_mode`，
 
 PostgreSQL Debezium properties 默认启用 logical decoding message，并把 `message.prefix.include.list` / `message.prefix.exclude.list` 映射为 anchored 原生过滤器。原生 `source.logical_decoding_messages` 默认为 false；启用捕获或增加过滤器都会进入 fingerprint。
 
-PostgreSQL 列转换把 Debezium 的 `column.truncate.to.<length>.chars`、`column.mask.with.<length>.chars`、`column.mask.hash.<algorithm>.with.salt.<salt>` 和 `column.mask.hash.v2.<algorithm>.with.salt.<salt>` 映射为原生 `source.column_transformations`。Selector 是 anchored、大小写不敏感的 `schema.table.column` 正则，类别优先级为 truncate、固定 mask、hash V1、hash V2。Hash salt 必须非空，并且在 semantic fingerprint 中只保存 SHA-256 digest。
+PostgreSQL 和 MySQL 列转换把 Debezium 的 `column.truncate.to.<length>.chars`、`column.mask.with.<length>.chars`、`column.mask.hash.<algorithm>.with.salt.<salt>` 和 `column.mask.hash.v2.<algorithm>.with.salt.<salt>` 映射为原生 `source.column_transformations`。Selector 是 anchored、大小写不敏感的 `schema.table.column` 或 `database.table.column` 正则，类别优先级为 truncate、固定 mask、hash V1、hash V2。Hash salt 必须非空，并且在 semantic fingerprint 中只保存 SHA-256 digest。

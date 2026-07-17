@@ -19,6 +19,7 @@ jks.workspace = true
 mysql_async.workspace = true
 p12-keystore.workspace = true
 regex.workspace = true
+rustium-column-transform.workspace = true
 rustium-config.workspace = true
 rustium-core.workspace = true
 serde_json.workspace = true

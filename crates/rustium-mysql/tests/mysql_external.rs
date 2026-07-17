@@ -15,7 +15,10 @@ use rdkafka::{
     topic_partition_list::{Offset, TopicPartitionList},
     util::Timeout,
 };
-use rustium_config::{MySqlSourceConfig, SnapshotConfig, SnapshotMode, TableSelection};
+use rustium_config::{
+    ColumnHashAlgorithm, ColumnHashVersion, ColumnTransformRule, MySqlSourceConfig, SnapshotConfig,
+    SnapshotMode, TableSelection,
+};
 use rustium_core::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, ConnectorStateEnvelope, DataValue, Operation,
     RecordBoundary, RetryPolicy, SignalRecord, SignalSender, SourceConnector, SourceContext,
@@ -301,6 +304,220 @@ async fn recovers_completed_snapshot_before_kafka_signal_offset_commit() -> Test
         (Ok(()), Err(error), _, _)
         | (Ok(()), Ok(()), Err(error), _)
         | (Ok(()), Ok(()), Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external MySQL 8.0+ server with row binlog and GTID enabled"]
+async fn applies_debezium_column_transformations_across_mysql_snapshot_binlog_and_incremental()
+-> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_transform_{}", &suffix[..12]);
+    let connector_name = format!("mysql-transform-{}", &suffix[..12]);
+    let qualified_table = format!(
+        "{}.{}",
+        quote_identifier(&settings.database),
+        quote_identifier(&table_name)
+    );
+    let mut admin = connect_admin(&settings).await?;
+    let outcome: TestResult = async {
+        admin
+            .query_drop(format!(
+                "CREATE TABLE {qualified_table} (id BIGINT PRIMARY KEY, customer VARCHAR(10) NOT NULL, secret VARCHAR(20) NOT NULL, email VARCHAR(64) NOT NULL, payload VARBINARY(8) NOT NULL)"
+            ))
+            .await?;
+        admin
+            .query_drop(format!(
+                "INSERT INTO {qualified_table} VALUES (1,'Alice','classified','alice@example.com',X'0102030405'),(2,'Bob','top-secret','bob@example.com',X'0A0B0C0D')"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&table_name);
+        config.column_transformations = vec![
+            ColumnTransformRule::Truncate {
+                length: 3,
+                columns: vec![format!(r"{}\.{table_name}\.customer", settings.database)],
+            },
+            ColumnTransformRule::Mask {
+                length: 4,
+                columns: vec![format!(r"{}\.{table_name}\.secret", settings.database)],
+            },
+            ColumnTransformRule::Hash {
+                algorithm: ColumnHashAlgorithm::Sha256,
+                salt: "mysql-salt".into(),
+                version: ColumnHashVersion::V2,
+                columns: vec![format!(r"{}\.{table_name}\.email", settings.database)],
+            },
+            ColumnTransformRule::Truncate {
+                length: 3,
+                columns: vec![format!(r"{}\.{table_name}\.payload", settings.database)],
+            },
+        ];
+
+        let mut source = MySqlSource::new(
+            &connector_name,
+            config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) = start_source(source, None, None);
+        let snapshot_result: TestResult<(SourcePosition, ConnectorStateEnvelope)> = async {
+            let mut rows = BTreeMap::new();
+            loop {
+                let record = receive(&mut output).await?;
+                if record.boundary == RecordBoundary::SnapshotComplete {
+                    require(rows.len() == 2, "MySQL transform snapshot did not emit two rows")?;
+                    break Ok((
+                        record.position,
+                        record
+                            .connector_state
+                            .ok_or_else(|| test_error("transform snapshot has no schema state"))?,
+                    ));
+                }
+                let event = record
+                    .event
+                    .ok_or_else(|| test_error("transform snapshot record has no event"))?;
+                let after = event
+                    .after
+                    .ok_or_else(|| test_error("transform snapshot event has no after"))?;
+                let id = after
+                    .get("id")
+                    .and_then(mysql_integer)
+                    .ok_or_else(|| test_error("transform snapshot row has no id"))?;
+                require(
+                    after.get("customer") == Some(&DataValue::String("Ali".into()))
+                        || after.get("customer") == Some(&DataValue::String("Bob".into())),
+                    "MySQL snapshot customer was not truncated",
+                )?;
+                require(
+                    after.get("secret") == Some(&DataValue::String("****".into())),
+                    "MySQL snapshot secret was not masked",
+                )?;
+                require(
+                    after.get("payload").and_then(data_bytes).is_some_and(|value| value.len() == 3),
+                    "MySQL snapshot binary payload was not truncated",
+                )?;
+                let expected = match id {
+                    1 => "cafaddd425f5710fc9211785653741e0ae5066e7386276af0df9ae4ae4dc0839",
+                    2 => "d90637d6dd4ca64a6924cf9146a4256a3b300971c1e219e290421d078535a63c",
+                    _ => return Err(test_error("unexpected MySQL snapshot id")),
+                };
+                require(
+                    after.get("email") == Some(&DataValue::String(expected.into())),
+                    "MySQL snapshot email hash did not match Debezium V2 semantics",
+                )?;
+                rows.insert(id, after);
+            }
+        }
+        .await;
+        let (snapshot_position, schema_history) =
+            finish_source(cancellation, source_task, snapshot_result).await?;
+
+        let checkpoint = Checkpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            connector_name: connector_name.clone(),
+            generation: uuid::Uuid::new_v4(),
+            source_position: snapshot_position.clone(),
+            snapshot_completed: true,
+            config_fingerprint: "mysql-transform-test".into(),
+            updated_at: SystemTime::now(),
+            connector_state: Some(schema_history.clone()),
+        };
+        let mut source = MySqlSource::new(
+            &connector_name,
+            config.clone(),
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (mut output, cancellation, source_task) =
+            start_source(source, Some(checkpoint.clone()), Some(snapshot_position.clone()));
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        admin
+            .query_drop(format!(
+                "INSERT INTO {qualified_table} VALUES (3,'Carol','private','carol@example.com',X'0E0F1011')"
+            ))
+            .await?;
+        let binlog_result: TestResult<SourcePosition> = async {
+            loop {
+                let record = receive(&mut output).await?;
+                let Some(event) = record.event else { continue };
+                let Some(after) = event.after else { continue };
+                if event.operation == Operation::Create
+                    && after.get("id").and_then(mysql_integer) == Some(3)
+                {
+                    require(after.get("customer") == Some(&DataValue::String("Car".into())), "MySQL binlog customer was not truncated")?;
+                    require(after.get("secret") == Some(&DataValue::String("****".into())), "MySQL binlog secret was not masked")?;
+                    require(after.get("email") == Some(&DataValue::String("14974b6eb8ef01cf9bbc6677325fe0418689aeae5879659286d26e18cc6998ed".into())), "MySQL binlog email hash was not transformed")?;
+                    require(after.get("payload").and_then(data_bytes).is_some_and(|value| value.len() == 3), "MySQL binlog payload was not truncated")?;
+                    break Ok(record.position);
+                }
+            }
+        }
+        .await;
+        let binlog_position = finish_source(cancellation, source_task, binlog_result).await?;
+
+        let checkpoint = Checkpoint {
+            source_position: binlog_position.clone(),
+            connector_state: Some(schema_history),
+            ..checkpoint
+        };
+        config.signal_enabled_channels = vec!["in-process".into()];
+        config.incremental_snapshot_chunk_size = 1;
+        let mut source = MySqlSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Never,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+        let (mut output, signal_sender, cancellation, source_task) =
+            start_source_with_signals(source, Some(checkpoint), Some(binlog_position));
+        signal_sender
+            .send(SignalRecord::new(
+                "mysql-transform-incremental",
+                "execute-snapshot",
+                serde_json::json!({
+                    "type": "incremental",
+                    "data-collections": [format!("{}.{}", settings.database, table_name)]
+                }),
+            ))
+            .await?;
+        let incremental_result: TestResult<()> = async {
+            let mut rows = 0;
+            loop {
+                let record = receive(&mut output).await?;
+                let Some(event) = record.event else { continue };
+                if event.source.attributes.get("rustium.snapshot.kind").and_then(serde_json::Value::as_str) != Some("incremental") { continue; }
+                let after = event.after.ok_or_else(|| test_error("incremental transform event has no after"))?;
+                require(after.get("secret") == Some(&DataValue::String("****".into())), "MySQL incremental secret was not masked")?;
+                require(after.get("payload").and_then(data_bytes).is_some_and(|value| value.len() == 3), "MySQL incremental payload was not truncated")?;
+                rows += 1;
+                if rows == 3 { break Ok(()) }
+            }
+        }.await;
+        finish_source(cancellation, source_task, incremental_result).await
+    }.await;
+    let cleanup = admin
+        .query_drop(format!("DROP TABLE IF EXISTS {qualified_table}"))
+        .await
+        .map_err(boxed_error);
+    let close = admin.disconnect().await.map_err(boxed_error);
+    match (outcome, cleanup, close) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), _, _) => Err(error),
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error),
     }
 }
 
@@ -823,6 +1040,7 @@ impl TestSettings {
             signal_kafka_group_id: "kafka-signal".into(),
             signal_kafka_poll_timeout: Duration::from_millis(100),
             signal_kafka_consumer_properties: std::collections::BTreeMap::new(),
+            column_transformations: Vec::new(),
         }
     }
 }
@@ -1882,6 +2100,13 @@ fn mysql_integer(value: &DataValue) -> Option<i128> {
         DataValue::Int32(value) => Some(i128::from(*value)),
         DataValue::Int64(value) => Some(i128::from(*value)),
         DataValue::UInt64(value) => Some(i128::from(*value)),
+        _ => None,
+    }
+}
+
+fn data_bytes(value: &DataValue) -> Option<&[u8]> {
+    match value {
+        DataValue::Bytes(bytes) => Some(bytes),
         _ => None,
     }
 }

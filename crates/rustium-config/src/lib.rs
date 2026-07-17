@@ -428,6 +428,17 @@ impl SourceConfig {
                             "kafka_group_id": config.signal_kafka_group_id,
                         }),
                     );
+                if !config.column_transformations.is_empty() {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "column_transformations".into(),
+                            serde_json::Value::Array(column_transformation_semantics(
+                                &config.column_transformations,
+                            )),
+                        );
+                }
                 semantic
             }
             Self::Sqlserver(config) => {
@@ -999,6 +1010,8 @@ pub struct MySqlSourceConfig {
     pub signal_kafka_poll_timeout: Duration,
     #[serde(default)]
     pub signal_kafka_consumer_properties: BTreeMap<String, String>,
+    #[serde(default)]
+    pub column_transformations: Vec<ColumnTransformRule>,
 }
 
 impl MySqlSourceConfig {
@@ -1116,6 +1129,9 @@ impl MySqlSourceConfig {
                     )));
                 }
             }
+        }
+        for rule in &self.column_transformations {
+            rule.validate()?;
         }
         if !matches!(
             self.ssl_mode.as_str(),
@@ -3455,6 +3471,35 @@ sink:
         let implicit_utc =
             Config::from_yaml(&raw.replace("  connection_time_zone: Etc/UTC\n", "")).unwrap();
         assert_eq!(config.fingerprint(), implicit_utc.fingerprint());
+    }
+
+    #[test]
+    fn parses_native_mysql_column_transformations_into_fingerprint() {
+        let raw = r#"
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: inventory-mysql
+source:
+  type: mysql
+  username: rustium
+  password: secret
+  databases: [inventory]
+sink:
+  type: stdout
+  topic_prefix: inventory
+"#;
+        let baseline = Config::from_yaml(raw).unwrap();
+        let configured = Config::from_yaml(&raw.replace(
+            "sink:\n",
+            "  column_transformations:\n    - kind: truncate\n      length: 3\n      columns: ['inventory\\.orders\\.customer']\n    - kind: hash\n      algorithm: sha256\n      salt: mysql-private-salt\n      version: v2\n      columns: ['inventory\\.orders\\.email']\nsink:\n",
+        ))
+        .unwrap();
+        let source = configured.source.as_mysql().unwrap();
+        assert_eq!(source.column_transformations.len(), 2);
+        assert_ne!(baseline.fingerprint(), configured.fingerprint());
+        let semantic = configured.source.semantic_config().to_string();
+        assert!(!semantic.contains("mysql-private-salt"));
     }
 
     #[test]

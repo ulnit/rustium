@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/rustium-cli",
+    "crates/rustium-column-transform",
     "crates/rustium-config",
     "crates/rustium-core",
     "crates/rustium-format-avro",
@@ -53,6 +54,7 @@ rdkafka = { version = "0.39.0", features = ["cmake-build", "ssl", "sasl"] }
 regex = "1.11.1"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 rustium-config = { version = "0.1.0-alpha.1", path = "crates/rustium-config" }
+rustium-column-transform = { version = "0.1.0-alpha.1", path = "crates/rustium-column-transform" }
 rustium-core = { version = "0.1.0-alpha.1", path = "crates/rustium-core" }
 rustium-format-avro = { version = "0.1.0-alpha.1", path = "crates/rustium-format-avro" }
 rustium-format-json = { version = "0.1.0-alpha.1", path = "crates/rustium-format-json" }

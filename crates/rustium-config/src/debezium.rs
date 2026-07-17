@@ -299,7 +299,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
             message_prefix_exclude_list: csv_property(
                 properties.get("message.prefix.exclude.list"),
             ),
-            column_transformations: postgres_column_transformations(&properties)?,
+            column_transformations: column_transformations(&properties)?,
         })),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -504,6 +504,7 @@ fn parse_mysql(properties: &BTreeMap<String, String>) -> Result<Config> {
                         .map(|key| (key.to_string(), value.clone()))
                 })
                 .collect(),
+            column_transformations: column_transformations(properties)?,
         }),
         SnapshotConfig {
             mode: snapshot_mode(
@@ -1410,7 +1411,7 @@ fn postgres_replica_identity_rules(
     )
 }
 
-fn postgres_column_transformations(
+fn column_transformations(
     properties: &BTreeMap<String, String>,
 ) -> Result<Vec<ColumnTransformRule>> {
     let mut rules = Vec::new();
@@ -2905,6 +2906,42 @@ signal.consumer.security.protocol=SASL_SSL
         assert_eq!(source.signal_kafka_group_id, "orders-signal-group");
         assert_eq!(source.signal_kafka_poll_timeout, Duration::from_millis(75));
         assert_eq!(source.incremental_snapshot_chunk_size, 128);
+    }
+
+    #[test]
+    fn maps_mysql_column_transformations_with_debezium_priority() {
+        let config = parse(
+            r#"
+name=mysql
+connector.class=io.debezium.connector.mysql.MySqlConnector
+database.hostname=mysql
+database.user=rustium
+database.password=secret
+topic.prefix=inventory
+column.mask.hash.v2.sha256.with.salt.mysql-salt=inventory\.orders\.email
+column.mask.with.4.chars=inventory\.orders\.secret
+column.truncate.to.3.chars=inventory\.orders\.customer
+"#,
+        )
+        .unwrap();
+        let source = config.source.as_mysql().unwrap();
+        assert_eq!(source.column_transformations.len(), 3);
+        assert!(matches!(
+            &source.column_transformations[0],
+            ColumnTransformRule::Truncate { length: 3, .. }
+        ));
+        assert!(matches!(
+            &source.column_transformations[1],
+            ColumnTransformRule::Mask { length: 4, .. }
+        ));
+        assert!(matches!(
+            &source.column_transformations[2],
+            ColumnTransformRule::Hash {
+                version: ColumnHashVersion::V2,
+                algorithm: ColumnHashAlgorithm::Sha256,
+                ..
+            }
+        ));
     }
 
     #[test]

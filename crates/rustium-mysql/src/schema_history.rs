@@ -833,6 +833,7 @@ mod tests {
             signal_kafka_group_id: "kafka-signal".into(),
             signal_kafka_poll_timeout: Duration::from_millis(100),
             signal_kafka_consumer_properties: std::collections::BTreeMap::new(),
+            column_transformations: Vec::new(),
         }
     }
 

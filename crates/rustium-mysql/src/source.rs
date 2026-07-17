@@ -22,6 +22,7 @@ use rustium_core::{
 };
 use tracing::{debug, info, warn};
 
+use crate::column_transform::ColumnTransformer;
 use crate::schema_history::{
     IncrementalSnapshotProgress, MySqlKeyValue, TableSchema, apply_ddl, decode_connector_state,
     encode_connector_state, encode_schema_history,
@@ -397,7 +398,13 @@ impl MySqlIncrementalSnapshot {
         let mut remaining_keys = HashSet::with_capacity(row_count);
         for (row, key) in chunk.rows {
             remaining_keys.insert(key.clone());
-            rows.push((convert_snapshot_row(row, &schema.event_schema)?, key));
+            let mut row = convert_snapshot_row(row, &schema.event_schema)?;
+            source
+                .column_transformer
+                .as_ref()
+                .expect("validated transformer")
+                .transform_row(&mut row, &schema);
+            rows.push((row, key));
         }
         self.window = Some(MySqlIncrementalWindow {
             collection,
@@ -564,6 +571,7 @@ pub struct MySqlSource {
     source_server_id: u32,
     gtid_source_filter: Option<GtidSourceFilter>,
     retry_policy: RetryPolicy,
+    column_transformer: Option<ColumnTransformer>,
 }
 
 impl MySqlSource {
@@ -586,6 +594,7 @@ impl MySqlSource {
             source_server_id: 0,
             gtid_source_filter: None,
             retry_policy,
+            column_transformer: None,
         }
     }
 
@@ -596,6 +605,8 @@ impl MySqlSource {
     }
 
     async fn validate_source(&mut self) -> Result<()> {
+        self.column_transformer =
+            Some(ColumnTransformer::new(&self.config.column_transformations)?);
         self.gtid_source_filter = GtidSourceFilter::from_config(&self.config)?;
         let mut connection = connect(&self.config).await?;
         let version = connection.server_version();
@@ -718,6 +729,9 @@ impl MySqlSource {
                     self.snapshot.fetch_size,
                     &mut ordinal,
                     output,
+                    self.column_transformer
+                        .as_ref()
+                        .expect("validated transformer"),
                 )
                 .await?;
             }
@@ -1088,6 +1102,9 @@ impl MySqlSource {
                     source_time,
                     &self.connector_name,
                     &self.config,
+                    self.column_transformer
+                        .as_ref()
+                        .expect("validated transformer"),
                 )?
             }
             EventData::XidEvent(xid) => state
@@ -1427,6 +1444,11 @@ impl SourceConnector for MySqlSource {
             self.schemas.clone(),
             resume_position.clone(),
         );
+        let column_transformer = self.column_transformer.clone().map_or_else(
+            || ColumnTransformer::new(&self.config.column_transformations),
+            Ok,
+        )?;
+        self.column_transformer = Some(column_transformer.clone());
         let mut heartbeat_connection = open_heartbeat_connection(&self.config).await?;
         let mut incremental =
             MySqlIncrementalSnapshot::new(incremental_progress, completed_signal_ids);
@@ -2072,6 +2094,7 @@ impl StreamingState {
         source_time: Option<DateTime<Utc>>,
         connector_name: &str,
         config: &MySqlSourceConfig,
+        column_transformer: &ColumnTransformer,
     ) -> Result<Vec<SourceRecord>> {
         let database = table_map.database_name().into_owned();
         let table = table_map.table_name().into_owned();
@@ -2157,7 +2180,7 @@ impl StreamingState {
                 continue;
             }
 
-            let event = ChangeEvent {
+            let mut event = ChangeEvent {
                 id: EventId::deterministic(
                     connector_name,
                     &database,
@@ -2175,6 +2198,7 @@ impl StreamingState {
                 source_time: event_source_time,
                 observed_time: Utc::now(),
             };
+            column_transformer.transform_event(&mut event, &schema);
             records.push(SourceRecord::data(event));
         }
         Ok(records)
@@ -2524,6 +2548,7 @@ async fn snapshot_table(
     fetch_size: usize,
     ordinal: &mut u64,
     output: &tokio::sync::mpsc::Sender<Result<SourceRecord>>,
+    column_transformer: &ColumnTransformer,
 ) -> Result<()> {
     let qualified = format!(
         "{}.{}",
@@ -2573,7 +2598,7 @@ async fn snapshot_table(
                 *ordinal,
                 true,
             );
-            let event = ChangeEvent {
+            let mut event = ChangeEvent {
                 id: EventId::deterministic(
                     connector_name,
                     &schema.database,
@@ -2597,6 +2622,7 @@ async fn snapshot_table(
                 source_time: None,
                 observed_time: Utc::now(),
             };
+            column_transformer.transform_event(&mut event, schema);
             output
                 .send(Ok(SourceRecord::data(event)))
                 .await
@@ -3247,6 +3273,7 @@ mod tests {
             signal_kafka_group_id: "kafka-signal".into(),
             signal_kafka_poll_timeout: std::time::Duration::from_millis(100),
             signal_kafka_consumer_properties: std::collections::BTreeMap::new(),
+            column_transformations: Vec::new(),
         }
     }
 
