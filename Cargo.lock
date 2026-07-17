@@ -3071,6 +3071,7 @@ name = "rustium-postgresql"
 version = "0.1.0-alpha.1"
 dependencies = [
  "async-trait",
+ "bigdecimal",
  "chrono",
  "indexmap",
  "pg_walstream",

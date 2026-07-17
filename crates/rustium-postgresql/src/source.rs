@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use bigdecimal::{BigDecimal, RoundingMode};
 use chrono::{DateTime, Utc};
 use pg_walstream::{
     ChangeEvent as WalEvent, ColumnValue, EventType, LogicalReplicationStream, OriginFilter,
@@ -30,7 +31,7 @@ use crate::{
     incremental_snapshot::{ClosedWindow, IncrementalSnapshotController, Signal},
     schema_history::{
         PostgresColumnType, TableSchema, decode_connector_state, encode_connector_state,
-        encode_schema_history, schema_from_relation,
+        encode_schema_history, postgres_field_type_name, schema_from_relation,
     },
 };
 
@@ -247,6 +248,7 @@ impl PostgresSource {
                 &columns,
                 &resolved_types,
                 config.include_unknown_datatypes,
+                config.money_fraction_digits,
                 previous.as_ref(),
                 catalog.as_ref(),
             )
@@ -1872,6 +1874,7 @@ impl StreamingState {
                 &table_schema,
                 &config.hstore_handling_mode,
                 &config.interval_handling_mode,
+                config.money_fraction_digits,
             )
         });
         let mut after = new_data.as_ref().map(|row| {
@@ -1880,6 +1883,7 @@ impl StreamingState {
                 &table_schema,
                 &config.hstore_handling_mode,
                 &config.interval_handling_mode,
+                config.money_fraction_digits,
             )
         });
         if let Some(after) = &mut after {
@@ -2735,7 +2739,10 @@ pub(crate) fn query_table_schema(
             fields.push(FieldSchema {
                 name: name.clone(),
                 type_name: if supported {
-                    required_value(&result, index, 1, "column type")?
+                    postgres_field_type_name(
+                        &required_value(&result, index, 1, "column type")?,
+                        config.money_fraction_digits,
+                    )
                 } else {
                     "bytea".into()
                 },
@@ -2780,6 +2787,7 @@ fn convert_row(
     schema: &TableSchema,
     hstore_handling_mode: &str,
     interval_handling_mode: &str,
+    money_fraction_digits: i16,
 ) -> Row {
     row.iter()
         .filter_map(|(name, value)| {
@@ -2803,6 +2811,7 @@ fn convert_row(
                         type_name,
                         hstore_handling_mode,
                         interval_handling_mode,
+                        money_fraction_digits,
                     )
                 },
             ))
@@ -2828,6 +2837,7 @@ pub(crate) fn convert_snapshot_value(
             &field.type_name,
             &config.hstore_handling_mode,
             &config.interval_handling_mode,
+            config.money_fraction_digits,
         )
     }
 }
@@ -2844,6 +2854,7 @@ fn convert_value(
     type_name: &str,
     hstore_handling_mode: &str,
     interval_handling_mode: &str,
+    money_fraction_digits: i16,
 ) -> DataValue {
     match value {
         ColumnValue::Null => DataValue::Null,
@@ -2857,6 +2868,7 @@ fn convert_value(
                 type_name,
                 hstore_handling_mode,
                 interval_handling_mode,
+                money_fraction_digits,
             )
         }
     }
@@ -2864,7 +2876,7 @@ fn convert_value(
 
 #[cfg(test)]
 pub(crate) fn convert_text(value: &str, type_name: &str) -> DataValue {
-    convert_text_with_modes(value, type_name, "json", "postgres")
+    convert_text_with_modes(value, type_name, "json", "postgres", 2)
 }
 
 pub(crate) fn convert_text_with_modes(
@@ -2872,6 +2884,7 @@ pub(crate) fn convert_text_with_modes(
     type_name: &str,
     hstore_handling_mode: &str,
     interval_handling_mode: &str,
+    money_fraction_digits: i16,
 ) -> DataValue {
     if let Some(element_type) = type_name.trim().strip_suffix("[]") {
         return parse_postgres_array(
@@ -2879,6 +2892,7 @@ pub(crate) fn convert_text_with_modes(
             element_type,
             hstore_handling_mode,
             interval_handling_mode,
+            money_fraction_digits,
         )
         .unwrap_or_else(|| DataValue::String(value.into()));
     }
@@ -2897,7 +2911,9 @@ pub(crate) fn convert_text_with_modes(
                 .parse::<f64>()
                 .map_or_else(|_| DataValue::String(value.into()), DataValue::Float64),
         },
-        "numeric" | "decimal" | "money" => DataValue::Decimal(value.into()),
+        "numeric" | "decimal" => DataValue::Decimal(value.into()),
+        "money" => parse_postgres_money(value, money_fraction_digits)
+            .map_or_else(|| DataValue::String(value.into()), DataValue::Decimal),
         "json" | "jsonb" => serde_json::from_str(value)
             .map_or_else(|_| DataValue::String(value.into()), DataValue::Json),
         "uuid" => uuid::Uuid::parse_str(value)
@@ -2939,6 +2955,43 @@ fn unqualified_base_type(type_name: &str) -> &str {
         .unwrap_or(type_name)
         .trim()
         .trim_matches('"')
+}
+
+fn parse_postgres_money(value: &str, fraction_digits: i16) -> Option<String> {
+    let mut value = value.trim();
+    let parenthesized = value.starts_with('(') && value.ends_with(')');
+    if parenthesized {
+        value = value.get(1..value.len().checked_sub(1)?)?.trim();
+    }
+    let signed = value.starts_with('-');
+    if signed {
+        value = value.get(1..)?.trim_start();
+    }
+    if value
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_ascii_digit() && character != '.')
+    {
+        value = value.get(
+            value
+                .char_indices()
+                .nth(1)
+                .map_or(value.len(), |(index, _)| index)..,
+        )?;
+    }
+    let normalized = value.replace(',', "");
+    let negative = parenthesized || signed;
+    let normalized = if negative {
+        format!("-{normalized}")
+    } else {
+        normalized
+    };
+    let decimal = normalized.parse::<BigDecimal>().ok()?;
+    Some(
+        decimal
+            .with_scale_round(i64::from(fraction_digits), RoundingMode::HalfUp)
+            .to_plain_string(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -3407,6 +3460,7 @@ fn parse_postgres_array(
     element_type: &str,
     hstore_handling_mode: &str,
     interval_handling_mode: &str,
+    money_fraction_digits: i16,
 ) -> Option<DataValue> {
     let start = value.find('{')?;
     let dimensions = &value[..start];
@@ -3429,6 +3483,7 @@ fn parse_postgres_array(
         element_type,
         hstore_handling_mode,
         interval_handling_mode,
+        money_fraction_digits,
     };
     let parsed = parser.parse_array()?;
     parser.skip_whitespace();
@@ -3442,6 +3497,7 @@ struct PostgresArrayParser<'a> {
     element_type: &'a str,
     hstore_handling_mode: &'a str,
     interval_handling_mode: &'a str,
+    money_fraction_digits: i16,
 }
 
 impl PostgresArrayParser<'_> {
@@ -3487,6 +3543,7 @@ impl PostgresArrayParser<'_> {
                             self.element_type,
                             self.hstore_handling_mode,
                             self.interval_handling_mode,
+                            self.money_fraction_digits,
                         ));
                     }
                     b'\\' => {
@@ -3528,6 +3585,7 @@ impl PostgresArrayParser<'_> {
                 self.element_type,
                 self.hstore_handling_mode,
                 self.interval_handling_mode,
+                self.money_fraction_digits,
             ))
         }
     }
@@ -3917,6 +3975,47 @@ sink:
     }
 
     #[test]
+    fn converts_debezium_postgres_money_with_configured_scale() {
+        for (value, expected) in [
+            ("$1,234.45", "1234.5"),
+            ("-$1,234.45", "-1234.5"),
+            ("($1,234.55)", "-1234.6"),
+            ("€1,234.45", "1234.5"),
+        ] {
+            assert_eq!(
+                convert_text_with_modes(value, "money(1)", "json", "postgres", 1),
+                DataValue::Decimal(expected.into()),
+                "value={value}"
+            );
+        }
+        assert_eq!(
+            convert_text_with_modes("$0.49", "money(0)", "json", "postgres", 0),
+            DataValue::Decimal("0".into())
+        );
+        assert_eq!(
+            convert_text_with_modes("$1,234.45", "money(-1)", "json", "postgres", -1),
+            DataValue::Decimal("1230".into())
+        );
+        assert_eq!(
+            convert_text_with_modes("USD 1.00", "money(2)", "json", "postgres", 2),
+            DataValue::String("USD 1.00".into())
+        );
+        assert_eq!(
+            convert_text_with_modes(
+                r#"{"$1,234.45","($2,345.55)"}"#,
+                "money(1)[]",
+                "json",
+                "postgres",
+                1,
+            ),
+            DataValue::Array(vec![
+                DataValue::Decimal("1234.5".into()),
+                DataValue::Decimal("-2345.6".into()),
+            ])
+        );
+    }
+
+    #[test]
     fn converts_all_postgresql_interval_styles_with_debezium_modes() {
         let positive = PostgresInterval {
             years: 1,
@@ -3934,12 +4033,12 @@ sink:
         ] {
             assert_eq!(parse_interval(value), Some(positive), "value={value}");
             assert_eq!(
-                convert_text_with_modes(value, "interval", "json", "numeric"),
+                convert_text_with_modes(value, "interval", "json", "numeric", 2),
                 DataValue::Int64(37_091_106_789_000),
                 "value={value}"
             );
             assert_eq!(
-                convert_text_with_modes(value, "interval", "json", "string"),
+                convert_text_with_modes(value, "interval", "json", "string", 2),
                 DataValue::String("P1Y2M3DT4H5M6.789S".into()),
                 "value={value}"
             );
@@ -3961,7 +4060,7 @@ sink:
         ] {
             assert_eq!(parse_interval(value), Some(negative), "value={value}");
             assert_eq!(
-                convert_text_with_modes(value, "interval", "json", "numeric"),
+                convert_text_with_modes(value, "interval", "json", "numeric", 2),
                 DataValue::Int64(-37_091_106_789_000),
                 "value={value}"
             );
@@ -3989,22 +4088,22 @@ sink:
     fn preserves_legacy_and_malformed_interval_text_and_converts_arrays() {
         let value = "2 days 03:04:05.006";
         assert_eq!(
-            convert_text_with_modes(value, "interval", "json", "postgres"),
+            convert_text_with_modes(value, "interval", "json", "postgres", 2),
             DataValue::String(value.into())
         );
         assert_eq!(
-            convert_text_with_modes("not an interval", "interval", "json", "numeric"),
+            convert_text_with_modes("not an interval", "interval", "json", "numeric", 2),
             DataValue::String("not an interval".into())
         );
         assert_eq!(
-            convert_text_with_modes(r#"{"1 day","2 days"}"#, "interval[]", "json", "numeric",),
+            convert_text_with_modes(r#"{"1 day","2 days"}"#, "interval[]", "json", "numeric", 2,),
             DataValue::Array(vec![
                 DataValue::Int64(86_400_000_000),
                 DataValue::Int64(172_800_000_000),
             ])
         );
         assert_eq!(
-            convert_text_with_modes(r#"{"1 day","2 days"}"#, "interval[]", "json", "string",),
+            convert_text_with_modes(r#"{"1 day","2 days"}"#, "interval[]", "json", "string", 2,),
             DataValue::Array(vec![
                 DataValue::String("P0Y0M1DT0H0M0S".into()),
                 DataValue::String("P0Y0M2DT0H0M0S".into()),
@@ -4059,7 +4158,7 @@ sink:
             }))
         );
         assert_eq!(
-            convert_text_with_modes(value, "hstore", "map", "postgres"),
+            convert_text_with_modes(value, "hstore", "map", "postgres", 2),
             DataValue::Map(BTreeMap::from([
                 ("alpha".into(), DataValue::String("one".into())),
                 (
@@ -4360,6 +4459,7 @@ sink:
             hstore_handling_mode: "json".into(),
             interval_handling_mode: "postgres".into(),
             include_unknown_datatypes: false,
+            money_fraction_digits: 2,
             logical_decoding_messages: false,
             message_prefix_include_list: Vec::new(),
             message_prefix_exclude_list: Vec::new(),

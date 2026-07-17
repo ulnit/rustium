@@ -11,7 +11,7 @@ This document defines the currently supported alpha upgrade behavior. It is inte
 | Native configuration API | `rustium.io/v1alpha1` | Strict YAML/properties validation; unknown fields fail |
 | SQLite storage schema (`PRAGMA user_version`) | `1` | Version `0` initializes to `1`; future versions fail without downgrade |
 | JSON `Checkpoint.schema_version` | `2` | Version `1` remains readable when its connector contract permits it |
-| PostgreSQL schema-history envelope | `5` | Versions `1` through `5` read; older checkpoints without history fail closed |
+| PostgreSQL schema-history envelope | `6` | Versions `1` through `6` read; older checkpoints without history fail closed |
 | MySQL schema-history envelope | `3` | Versions `1` through `3` read; v2 offset progress is safely replayable |
 | SQL Server connector-state envelope | `1` | Version `1` only |
 
@@ -43,6 +43,8 @@ The additive PostgreSQL `source.slot_failover` flag defaults to false and is omi
 
 The additive PostgreSQL `source.interval_handling_mode` field defaults to `postgres` and is omitted from semantic fingerprint material at that value, preserving the original PostgreSQL text contract. Debezium properties intentionally default `interval.handling.mode` to `numeric`. Changing to `numeric` or `string` changes the fingerprint and downstream field values, including interval array elements. Stop the connector, review schemas and consumers, and introduce the mode through the normal fingerprinted configuration-change procedure.
 
+The additive PostgreSQL `source.money_fraction_digits` field maps Debezium `money.fraction.digits` and defaults to `2`. The default is omitted from semantic fingerprint material. A non-default signed 16-bit scale changes MONEY field schemas and `HALF_UP` values, so it changes the fingerprint. Stop the connector, review downstream decimal consumers and schema subjects, then introduce the new scale through the normal fingerprinted configuration-change procedure. Existing connector-state versions remain readable and exact catalog matches normalize historical MONEY field names to the configured scale.
+
 The additive native PostgreSQL `source.logical_decoding_messages` flag defaults to false and is omitted from semantic fingerprint material with empty message-prefix filters. Debezium properties intentionally enable all logical decoding messages by default. Enabling native capture, or adding `source.message_prefix_include_list` / `source.message_prefix_exclude_list`, changes the fingerprint and adds `<topic.prefix>.message` records. Stop the connector, review topic provisioning and consumer handling for the prefix key and message envelope, then introduce the change through the normal fingerprinted configuration procedure. Existing checkpoints and connector-state versions remain readable because the change adds no persisted state field.
 
 ### Checkpoint migration
@@ -53,7 +55,7 @@ The SQLite storage schema is initialized and migrated by `rustium-state`. Curren
 
 ### Connector-state migration
 
-- PostgreSQL schema history versions 1 through 5 are deserialized with defaults for additive fields. The current state keeps table layouts, type metadata, incremental keyset progress, pause state, and a bounded completed-signal history.
+- PostgreSQL schema history versions 1 through 6 are deserialized with defaults for additive fields. The current state keeps table layouts, type metadata, opaque unknown-type columns, incremental keyset progress, pause state, and a bounded completed-signal history.
 - MySQL schema history versions 1 through 3 are deserialized. Version 2 offset progress remains readable and is replayed from the collection start; version 3 persists typed keyset progress and completed signal IDs.
 - SQL Server connector state currently accepts version 1 only. Unknown versions fail before CDC polling.
 
@@ -97,7 +99,7 @@ Use `rustium state reset --config <path> --confirm` only after backing up state 
 | 原生配置 API | `rustium.io/v1alpha1` | 严格校验 YAML/properties，未知字段失败 |
 | SQLite storage schema (`PRAGMA user_version`) | `1` | version `0` 初始化到 `1`，未来版本拒绝且不降级 |
 | JSON `Checkpoint.schema_version` | `2` | version `1` 在连接器契约允许时仍可读取 |
-| PostgreSQL schema-history envelope | `5` | 可读取 `1` 到 `5`；没有 history 的旧 checkpoint fail-closed |
+| PostgreSQL schema-history envelope | `6` | 可读取 `1` 到 `6`；没有 history 的旧 checkpoint fail-closed |
 | MySQL schema-history envelope | `3` | 可读取 `1` 到 `3`；v2 offset progress 可安全重放 |
 | SQL Server connector-state envelope | `1` | 只接受 version `1` |
 
@@ -129,6 +131,8 @@ SQLite storage version 与 JSON checkpoint version 相互独立。Storage migrat
 
 新增的 PostgreSQL `source.interval_handling_mode` 字段默认为 `postgres`，该值不会进入 semantic fingerprint material，从而保持原 PostgreSQL 文本契约。Debezium properties 有意将 `interval.handling.mode` 默认设为 `numeric`。切换到 `numeric` 或 `string` 会改变 fingerprint 和下游字段值，包括 interval array element。应先停止 connector，审查 schema 和 consumer，再通过正常的 fingerprint 配置变更流程引入该模式。
 
+新增的 PostgreSQL `source.money_fraction_digits` 字段映射 Debezium `money.fraction.digits`，默认值为 `2`，该默认值不会进入 semantic fingerprint material。非默认的有符号 16 位 scale 会改变 MONEY field schema 和 `HALF_UP` 值，因此会改变 fingerprint。应先停止 connector，审查下游 decimal consumer 与 schema subject，再通过正常的 fingerprint 配置变更流程引入新 scale。既有 connector-state version 仍可读取，按 catalog 精确匹配的历史 MONEY field name 会归一化为配置 scale。
+
 新增的 PostgreSQL 原生 `source.logical_decoding_messages` 标志默认为 false；message prefix filter 为空时不会进入 semantic fingerprint material。Debezium properties 有意默认启用全部 logical decoding message。启用原生捕获，或增加 `source.message_prefix_include_list` / `source.message_prefix_exclude_list`，都会改变 fingerprint，并新增 `<topic.prefix>.message` record。应先停止 connector，审查 topic provisioning 以及 consumer 对 prefix key 和 message envelope 的处理，再通过正常的 fingerprint 配置变更流程引入。该变更没有新增持久化状态字段，因此既有 checkpoint 和 connector-state version 仍可读取。
 
 ### Checkpoint 迁移
@@ -139,7 +143,7 @@ SQLite storage schema 由 `rustium-state` 初始化和迁移。当前 version 1 
 
 ### Connector-state 迁移
 
-- PostgreSQL schema history 可读取 version 1 到 5，并为新增字段使用默认值；当前状态保存 table layout、类型 metadata、增量 keyset progress、pause 状态和有界 completed-signal history。
+- PostgreSQL schema history 可读取 version 1 到 6，并为新增字段使用默认值；当前状态保存 table layout、类型 metadata、opaque 未知类型列、增量 keyset progress、pause 状态和有界 completed-signal history。
 - MySQL schema history 可读取 version 1 到 3。Version 2 offset progress 仍可读，并从集合开头安全重放；version 3 持久化带类型 keyset progress 和 completed signal ID。
 - SQL Server connector state 当前只接受 version 1，未知 version 会在 CDC polling 前失败。
 

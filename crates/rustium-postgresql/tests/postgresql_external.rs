@@ -117,6 +117,7 @@ impl TestSettings {
             hstore_handling_mode: "json".into(),
             interval_handling_mode: "postgres".into(),
             include_unknown_datatypes: false,
+            money_fraction_digits: 2,
             logical_decoding_messages: false,
             message_prefix_include_list: Vec::new(),
             message_prefix_exclude_list: Vec::new(),
@@ -1653,6 +1654,148 @@ async fn keeps_snapshot_and_streaming_type_conversion_identical() -> TestResult 
         eprintln!("PostgreSQL type test cleanup also failed: {cleanup_error}");
     }
     outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an external PostgreSQL 14+ server with logical replication enabled"]
+async fn converts_debezium_money_fraction_digits_across_snapshot_and_wal() -> TestResult {
+    let settings = TestSettings::from_env()?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table_name = format!("rustium_pg_money_{}", &suffix[..12]);
+    let publication = format!("rustium_money_pub_{}", &suffix[..12]);
+    let slot_name = format!("rustium_money_slot_{}", &suffix[..12]);
+    let connector_name = format!("postgresql-money-{}", &suffix[..12]);
+    let (client, connection_task) = connect(&settings).await?;
+
+    let outcome = async {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{table_name} (id BIGINT PRIMARY KEY, positive_amount MONEY NOT NULL, negative_amount MONEY NOT NULL); INSERT INTO public.{table_name} VALUES (1, 1234.45, -2345.55); CREATE PUBLICATION {publication} FOR TABLE public.{table_name};"
+            ))
+            .await?;
+
+        let mut config = settings.source_config(&publication, &slot_name, &table_name);
+        config.money_fraction_digits = 1;
+        let mut source = PostgresSource::new(
+            &connector_name,
+            config,
+            SnapshotConfig {
+                mode: SnapshotMode::Initial,
+                fetch_size: 1,
+                include_collections: Vec::new(),
+            },
+        );
+        source.validate().await?;
+
+        let (mut output, cancellation, source_task) = start_source(source, None);
+        let capture_result: TestResult<(Row, Row)> = async {
+            let snapshot_row = loop {
+                let record = receive(&mut output).await?;
+                if record.boundary == RecordBoundary::SnapshotComplete {
+                    return Err(test_error(
+                        "PostgreSQL money snapshot completed without a data row",
+                    ));
+                }
+                if record.boundary != RecordBoundary::Data {
+                    continue;
+                }
+                let event = record.event.ok_or_else(|| {
+                    test_error("PostgreSQL money snapshot record has no event")
+                })?;
+                require(
+                    event.operation == Operation::Read,
+                    "PostgreSQL money snapshot event is not a read",
+                )?;
+                verify_money_schema(&event.schema)?;
+                break event.after.ok_or_else(|| {
+                    test_error("PostgreSQL money snapshot event has no after row")
+                })?;
+            };
+
+            loop {
+                let record = receive(&mut output).await?;
+                if record.boundary == RecordBoundary::SnapshotComplete {
+                    break;
+                }
+            }
+            wait_for_active_slot(&client, &slot_name).await?;
+            client
+                .batch_execute(&format!(
+                    "INSERT INTO public.{table_name} VALUES (2, 1234.45, -2345.55)"
+                ))
+                .await?;
+            let streaming_row = loop {
+                let record = receive(&mut output).await?;
+                if record.boundary != RecordBoundary::Data {
+                    continue;
+                }
+                let event = record.event.ok_or_else(|| {
+                    test_error("PostgreSQL money streaming record has no event")
+                })?;
+                require(
+                    event.operation == Operation::Create,
+                    "PostgreSQL money streaming event is not a create",
+                )?;
+                verify_money_schema(&event.schema)?;
+                break event.after.ok_or_else(|| {
+                    test_error("PostgreSQL money streaming event has no after row")
+                })?;
+            };
+            Ok((snapshot_row, streaming_row))
+        }
+        .await;
+
+        let stop_result = stop_source(cancellation, source_task).await;
+        let (mut snapshot_row, mut streaming_row) =
+            combine_capture_and_stop(capture_result, stop_result)?;
+        require(
+            snapshot_row.shift_remove("id") == Some(DataValue::Int64(1)),
+            "PostgreSQL money snapshot id is incorrect",
+        )?;
+        require(
+            streaming_row.shift_remove("id") == Some(DataValue::Int64(2)),
+            "PostgreSQL money streaming id is incorrect",
+        )?;
+        require(
+            snapshot_row == streaming_row,
+            "PostgreSQL money snapshot and WAL conversion differ",
+        )?;
+        require(
+            snapshot_row.get("positive_amount")
+                == Some(&DataValue::Decimal("1234.5".into())),
+            "PostgreSQL positive money HALF_UP conversion failed",
+        )?;
+        require(
+            snapshot_row.get("negative_amount")
+                == Some(&DataValue::Decimal("-2345.6".into())),
+            "PostgreSQL negative money HALF_UP conversion failed",
+        )
+    }
+    .await;
+
+    let cleanup_result = cleanup(&client, &publication, &slot_name, &[&table_name]).await;
+    connection_task.abort();
+    if let Err(cleanup_error) = cleanup_result {
+        if outcome.is_ok() {
+            return Err(cleanup_error);
+        }
+        eprintln!("PostgreSQL money cleanup also failed: {cleanup_error}");
+    }
+    outcome
+}
+
+fn verify_money_schema(schema: &rustium_core::EventSchema) -> TestResult {
+    for field in ["positive_amount", "negative_amount"] {
+        require(
+            schema
+                .fields
+                .iter()
+                .find(|candidate| candidate.name == field)
+                .is_some_and(|candidate| candidate.type_name == "money(1)"),
+            &format!("PostgreSQL money field {field} does not use configured scale"),
+        )?;
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

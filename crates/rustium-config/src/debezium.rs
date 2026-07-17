@@ -255,6 +255,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
                     .map_or("numeric", String::as_str),
             )?,
             include_unknown_datatypes: bool_value(&properties, "include.unknown.datatypes", false)?,
+            money_fraction_digits: i16_value(&properties, "money.fraction.digits", 2)?,
             logical_decoding_messages: true,
             message_prefix_include_list: csv_property(
                 properties.get("message.prefix.include.list"),
@@ -1093,6 +1094,14 @@ fn u16_value(properties: &BTreeMap<String, String>, name: &str, default: u16) ->
     })
 }
 
+fn i16_value(properties: &BTreeMap<String, String>, name: &str, default: i16) -> Result<i16> {
+    properties.get(name).map_or(Ok(default), |value| {
+        value.parse().map_err(|error| {
+            Error::Configuration(format!("property {name} must be a short integer: {error}"))
+        })
+    })
+}
+
 fn u32_value(properties: &BTreeMap<String, String>, name: &str, default: u32) -> Result<u32> {
     properties.get(name).map_or(Ok(default), |value| {
         value.parse().map_err(|error| {
@@ -1412,6 +1421,7 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "status.update.interval.ms",
         "database.tcpKeepAlive",
         "include.unknown.datatypes",
+        "money.fraction.digits",
         "slot.max.retries",
         "slot.retry.delay.ms",
         "slot.stream.params",
@@ -2211,6 +2221,73 @@ include.unknown.datatypes=true
         assert!(configured.compatibility_warnings.iter().all(|warning| {
             !warning.contains("include.unknown.datatypes is recognized but not implemented")
         }));
+    }
+
+    #[test]
+    fn maps_postgres_money_fraction_digits() {
+        let configured = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.hostname=postgres
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+money.fraction.digits=4
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .money_fraction_digits,
+            4
+        );
+        assert_eq!(
+            configured.source.semantic_config()["money_fraction_digits"],
+            4
+        );
+        assert!(configured.compatibility_warnings.iter().all(|warning| {
+            !warning.contains("money.fraction.digits is recognized but not implemented")
+        }));
+
+        let negative = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+money.fraction.digits=-1
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            negative
+                .source
+                .as_postgresql()
+                .unwrap()
+                .money_fraction_digits,
+            -1
+        );
+
+        let overflow = parse(
+            r#"
+name=orders-cdc
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+database.user=rustium
+database.password=secret
+database.dbname=app
+topic.prefix=app
+money.fraction.digits=32768
+"#,
+        )
+        .unwrap_err();
+        assert!(overflow.to_string().contains("short integer"));
     }
 
     #[test]

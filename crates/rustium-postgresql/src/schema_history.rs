@@ -30,6 +30,31 @@ impl TableSchema {
     }
 }
 
+pub(crate) fn postgres_field_type_name(type_name: &str, money_fraction_digits: i16) -> String {
+    let trimmed = type_name.trim();
+    let (scalar, array) = trimmed
+        .strip_suffix("[]")
+        .map_or((trimmed, false), |scalar| (scalar, true));
+    let base = scalar
+        .split('(')
+        .next()
+        .unwrap_or(scalar)
+        .trim()
+        .rsplit('.')
+        .next()
+        .unwrap_or(scalar)
+        .trim()
+        .trim_matches('"');
+    if base == "money" {
+        format!(
+            "money({money_fraction_digits}){}",
+            if array { "[]" } else { "" }
+        )
+    } else {
+        type_name.into()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct IncrementalSnapshotProgress {
     pub(crate) signal_id: String,
@@ -135,6 +160,7 @@ pub(crate) fn schema_from_relation(
     columns: &[RelationColumn],
     resolved_types: &[(String, bool)],
     include_unknown_datatypes: bool,
+    money_fraction_digits: i16,
     previous: Option<&TableSchema>,
     catalog: Option<&TableSchema>,
 ) -> Result<TableSchema> {
@@ -168,8 +194,8 @@ pub(crate) fn schema_from_relation(
                         })
                     })
                     .map_or_else(
-                        || resolved_type_name.clone(),
-                        |field| field.type_name.clone(),
+                        || postgres_field_type_name(resolved_type_name, money_fraction_digits),
+                        |field| postgres_field_type_name(&field.type_name, money_fraction_digits),
                     ),
                 optional: metadata.is_none_or(|field| field.optional),
                 primary_key: column.is_key,
@@ -397,6 +423,7 @@ mod tests {
             &columns,
             &[("bigint".into(), true), ("text".into(), true)],
             false,
+            2,
             Some(&previous),
             Some(&catalog),
         )
@@ -439,6 +466,7 @@ mod tests {
             &columns,
             &resolved,
             false,
+            2,
             None,
             None,
         )
@@ -454,6 +482,7 @@ mod tests {
             &columns,
             &resolved,
             true,
+            2,
             None,
             None,
         )
@@ -461,6 +490,33 @@ mod tests {
         assert_eq!(captured.event_schema.fields.len(), 2);
         assert_eq!(captured.event_schema.fields[1].type_name, "bytea");
         assert_eq!(captured.opaque_columns, ["payload"]);
+    }
+
+    #[test]
+    fn applies_configured_money_scale_to_relation_schemas() {
+        let columns = [RelationColumn {
+            name: Arc::from("amount"),
+            type_id: 790,
+            type_modifier: -1,
+            is_key: false,
+        }];
+        let schema = schema_from_relation(
+            "public",
+            "payments",
+            "test.public.payments.Envelope".into(),
+            &columns,
+            &[("money".into(), true)],
+            false,
+            4,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(schema.event_schema.fields[0].type_name, "money(4)");
+        assert_eq!(
+            postgres_field_type_name("pg_catalog.money[]", 1),
+            "money(1)[]"
+        );
     }
 
     #[test]
@@ -482,6 +538,7 @@ mod tests {
             &[column],
             &[("text".into(), true)],
             true,
+            2,
             Some(&previous),
             None,
         )

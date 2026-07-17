@@ -44,6 +44,7 @@ source:
   hstore_handling_mode: json
   interval_handling_mode: postgres
   include_unknown_datatypes: false
+  money_fraction_digits: 2
   logical_decoding_messages: false
   # message_prefix_include_list: [orders\..*, audit]
   # message_prefix_exclude_list: [internal\..*]

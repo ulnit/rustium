@@ -324,6 +324,15 @@ impl SourceConfig {
                         .expect("source semantic is an object")
                         .insert("include_unknown_datatypes".into(), true.into());
                 }
+                if config.money_fraction_digits != default_postgres_money_fraction_digits() {
+                    semantic
+                        .as_object_mut()
+                        .expect("source semantic is an object")
+                        .insert(
+                            "money_fraction_digits".into(),
+                            config.money_fraction_digits.into(),
+                        );
+                }
                 if config.captures_logical_decoding_messages() {
                     semantic
                         .as_object_mut()
@@ -523,6 +532,8 @@ pub struct PostgresSourceConfig {
     pub interval_handling_mode: String,
     #[serde(default)]
     pub include_unknown_datatypes: bool,
+    #[serde(default = "default_postgres_money_fraction_digits")]
+    pub money_fraction_digits: i16,
     #[serde(default)]
     pub logical_decoding_messages: bool,
     #[serde(default)]
@@ -2046,6 +2057,9 @@ fn default_hstore_handling_mode() -> String {
 fn default_postgres_interval_handling_mode() -> String {
     "postgres".into()
 }
+const fn default_postgres_money_fraction_digits() -> i16 {
+    2
+}
 fn default_signal_enabled_channels() -> Vec<String> {
     vec!["source".into()]
 }
@@ -2175,6 +2189,10 @@ sink:
         assert!(postgres.database_initial_statements.is_empty());
         assert!(postgres.ssl_root_cert.is_none());
         assert!(!postgres.include_unknown_datatypes);
+        assert_eq!(
+            postgres.money_fraction_digits,
+            default_postgres_money_fraction_digits()
+        );
         let connection_url = Url::parse(&postgres.connection_url(true).unwrap()).unwrap();
         assert!(
             connection_url
@@ -2252,6 +2270,10 @@ sink:
         assert!(
             config.source.semantic_config()["include_unknown_datatypes"].is_null(),
             "omitting unknown PostgreSQL datatypes must preserve the old fingerprint shape"
+        );
+        assert!(
+            config.source.semantic_config()["money_fraction_digits"].is_null(),
+            "the default PostgreSQL money scale must preserve the old fingerprint shape"
         );
         assert!(
             config.source.semantic_config()["logical_decoding_messages"].is_null(),
@@ -2593,6 +2615,52 @@ sink:
         assert_ne!(
             Config::from_yaml(CONFIG).unwrap().fingerprint(),
             configured.fingerprint()
+        );
+    }
+
+    #[test]
+    fn parses_native_postgresql_money_fraction_digits() {
+        let configured = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  money_fraction_digits: 4\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            configured
+                .source
+                .as_postgresql()
+                .unwrap()
+                .money_fraction_digits,
+            4
+        );
+        assert_eq!(
+            configured.source.semantic_config()["money_fraction_digits"],
+            4
+        );
+        assert_ne!(
+            Config::from_yaml(CONFIG).unwrap().fingerprint(),
+            configured.fingerprint()
+        );
+
+        let negative = Config::from_yaml(&CONFIG.replace(
+            "  slot_name: rustium_orders\n",
+            "  slot_name: rustium_orders\n  money_fraction_digits: -1\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            negative
+                .source
+                .as_postgresql()
+                .unwrap()
+                .money_fraction_digits,
+            -1
+        );
+        assert!(
+            Config::from_yaml(&CONFIG.replace(
+                "  slot_name: rustium_orders\n",
+                "  slot_name: rustium_orders\n  money_fraction_digits: 32768\n",
+            ))
+            .is_err()
         );
     }
 

@@ -86,6 +86,15 @@ RUSTIUM_POSTGRES_TEST_PORT="$port" \
 RUSTIUM_POSTGRES_TEST_USER=postgres \
 RUSTIUM_POSTGRES_TEST_PASSWORD="$password" \
 RUSTIUM_POSTGRES_TEST_DATABASE="$database" \
+cargo test -p rustium-postgresql --test postgresql_external --locked -- \
+    converts_debezium_money_fraction_digits_across_snapshot_and_wal \
+    --ignored --exact --nocapture
+
+RUSTIUM_POSTGRES_TEST_HOST=127.0.0.1 \
+RUSTIUM_POSTGRES_TEST_PORT="$port" \
+RUSTIUM_POSTGRES_TEST_USER=postgres \
+RUSTIUM_POSTGRES_TEST_PASSWORD="$password" \
+RUSTIUM_POSTGRES_TEST_DATABASE="$database" \
 RUSTIUM_POSTGRES_RECONNECT_SOAK_CYCLES="${RUSTIUM_POSTGRES_RECONNECT_SOAK_CYCLES:-3}" \
 cargo test -p rustium-postgresql --test postgresql_external --locked -- \
     reconnects_after_replication_backend_termination \
