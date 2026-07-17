@@ -1313,6 +1313,9 @@ fn transform_emitted_event(
     let (Some(schema), Some(table)) = (&event.source.schema, &event.source.table) else {
         return Ok(());
     };
+    if schema.is_empty() || table.is_empty() {
+        return Ok(());
+    }
     let table_schema = schemas
         .get(&(schema.clone(), table.clone()))
         .ok_or_else(|| {
