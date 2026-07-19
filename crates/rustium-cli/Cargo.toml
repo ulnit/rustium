@@ -1,5 +1,5 @@
 [package]
-name = "rustium"
+name = "rustium-cdc"
 description = "Standalone Rustium CDC service"
 version.workspace = true
 edition.workspace = true

@@ -2968,7 +2968,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustium"
+name = "rustium-cdc"
 version = "0.1.0-alpha.1"
 dependencies = [
  "clap",

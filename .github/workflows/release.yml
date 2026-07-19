@@ -55,7 +55,7 @@ jobs:
         run: |
           set -euo pipefail
           for package in \
-            rustium \
+            rustium-cdc \
             rustium-column-transform \
             rustium-config \
             rustium-core \

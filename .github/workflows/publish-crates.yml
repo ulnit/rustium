@@ -38,7 +38,7 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test --workspace --locked
           for package in \
-            rustium \
+            rustium-cdc \
             rustium-column-transform \
             rustium-config \
             rustium-core \
@@ -153,4 +153,4 @@ jobs:
       - name: Publish rustium CLI
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p rustium --locked --token "$CARGO_REGISTRY_TOKEN"
+        run: cargo publish -p rustium-cdc --locked --token "$CARGO_REGISTRY_TOKEN"

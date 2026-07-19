@@ -24,7 +24,7 @@ COPY crates ./crates
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/src/rustium/target,sharing=locked \
-    cargo build --locked --release --package rustium \
+    cargo build --locked --release --package rustium-cdc \
     && install -D -m 0755 target/release/rustium /out/rustium
 
 FROM debian:bookworm-slim AS runtime

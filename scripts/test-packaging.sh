@@ -21,7 +21,7 @@ command -v helm >/dev/null
 # Validate every package manifest, included README, and format contract fixture
 # without claiming unpublished internal crates already exist on crates.io.
 for package in \
-  rustium \
+  rustium-cdc \
   rustium-column-transform \
   rustium-config \
   rustium-core \
