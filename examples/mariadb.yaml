@@ -1,0 +1,29 @@
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: mariadb-cdc
+source:
+  type: mariadb
+  bridge:
+    type: http
+    listen: 127.0.0.1:18080
+    path: /events
+  command: ${DEBEZIUM_SERVER}
+  properties:
+    connector.class: io.debezium.connector.mariadb.MariaDbConnector
+    topic.prefix: inventory
+    database.hostname: ${MARIADB_HOST}
+    database.port: "3306"
+    database.user: ${MARIADB_USER}
+    database.password: ${MARIADB_PASSWORD}
+    database.server.id: "1841"
+    database.include.list: inventory
+    table.include.list: inventory.orders
+    snapshot.mode: initial
+format:
+  kind: debezium_json
+sink:
+  type: stdout
+  topic_prefix: inventory
+state:
+  path: /var/lib/rustium/mariadb.db

@@ -296,7 +296,7 @@ fn destination(event: &ChangeEvent, config: &ProtobufEncoderConfig) -> Result<St
         .table
         .as_deref()
         .ok_or_else(|| Error::Encoding("event has no source table".into()))?;
-    if event.source.connector == "mysql" {
+    if event.source.schema.is_none() {
         Ok(format!(
             "{}.{}.{}",
             config.topic_prefix, event.source.database, table
@@ -592,6 +592,11 @@ fn push_source_schema(output: &mut String, event: &ChangeEvent, indent: usize) {
             "optional uint64 cluster_time_seconds = 21;",
             "optional uint32 cluster_time_increment = 22;",
             "uint64 event_serial_no = 23;",
+        ],
+        SourcePosition::Debezium(_) => &[
+            "string source_offset = 20;",
+            "string record_id = 21;",
+            "uint64 event_serial_no = 22;",
         ],
     };
     for field in connector_fields {
@@ -1224,6 +1229,23 @@ fn build_source_message(
                 ProtoValue::U64(position.event_serial),
             )?;
         }
+        SourcePosition::Debezium(position) => {
+            set_field(
+                &mut source,
+                "source_offset",
+                ProtoValue::String(serde_json::to_string(&position.source)?),
+            )?;
+            set_field(
+                &mut source,
+                "record_id",
+                ProtoValue::String(position.record_id.clone()),
+            )?;
+            set_field(
+                &mut source,
+                "event_serial_no",
+                ProtoValue::U64(position.event_serial),
+            )?;
+        }
     }
     Ok(source)
 }
@@ -1407,8 +1429,8 @@ mod tests {
     use chrono::Utc;
     use indexmap::indexmap;
     use rustium_core::{
-        EventId, EventSchema, MySqlPosition, PostgresPosition, SourceMetadata, SqlServerPosition,
-        TransactionMetadata,
+        DebeziumPosition, EventId, EventSchema, MySqlPosition, PostgresPosition, SourceMetadata,
+        SqlServerPosition, TransactionMetadata,
     };
 
     use super::*;
@@ -1909,6 +1931,27 @@ mod tests {
         assert_eq!(
             string_field(&message_field(&payload, "source"), "commit_lsn"),
             "0001:0002:0003"
+        );
+
+        let mut bridge = postgres.clone();
+        bridge.source.connector = "vitess".into();
+        bridge.source.schema = None;
+        bridge.position = SourcePosition::Debezium(DebeziumPosition {
+            connector: "vitess".into(),
+            source: BTreeMap::from([("vgtid".into(), "commerce/0-1-7".into())]),
+            record_id: "record-7".into(),
+            event_serial: 7,
+            snapshot: false,
+        });
+        let encoded = encoder.encode(&bridge).unwrap();
+        assert_eq!(encoded.destination, "inventory.app.customers");
+        let payload = decode(
+            encoded.payload.as_ref().unwrap(),
+            encoded.payload_schema.as_ref().unwrap(),
+        );
+        assert_eq!(
+            string_field(&message_field(&payload, "source"), "record_id"),
+            "record-7"
         );
 
         let mut heartbeat = event();

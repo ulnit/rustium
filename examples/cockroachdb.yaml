@@ -1,0 +1,29 @@
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: cockroachdb-cdc
+source:
+  type: cockroachdb
+  bridge:
+    type: http
+    listen: 127.0.0.1:18080
+    path: /events
+  command: ${DEBEZIUM_SERVER}
+  properties:
+    connector.class: io.debezium.connector.cockroachdb.CockroachDBConnector
+    topic.prefix: cockroachdb
+    database.hostname: ${COCKROACHDB_HOST}
+    database.port: "26257"
+    database.user: ${COCKROACHDB_USER}
+    database.password: ${COCKROACHDB_PASSWORD}
+    database.dbname: defaultdb
+    table.include.list: public.orders
+    cockroachdb.changefeed.sink.uri: ${COCKROACHDB_CHANGEFEED_KAFKA_URI}
+    snapshot.mode: initial
+format:
+  kind: debezium_json
+sink:
+  type: stdout
+  topic_prefix: cockroachdb
+state:
+  path: /var/lib/rustium/cockroachdb.db

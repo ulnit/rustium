@@ -4,6 +4,30 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
     let interpolated = interpolate_environment(raw)?;
     let properties = parse_properties(&interpolated)?;
     let connector_class = required(&properties, "connector.class")?;
+    if connector_class.contains("MariaDbConnector") {
+        return parse_debezium_bridge(&properties, DebeziumConnectorKind::Mariadb);
+    }
+    if connector_class.contains("Db2Connector") {
+        return parse_debezium_bridge(&properties, DebeziumConnectorKind::Db2);
+    }
+    if connector_class.contains("Cassandra") {
+        return parse_debezium_bridge(&properties, DebeziumConnectorKind::Cassandra);
+    }
+    if connector_class.contains("VitessConnector") {
+        return parse_debezium_bridge(&properties, DebeziumConnectorKind::Vitess);
+    }
+    if connector_class.contains("SpannerConnector") {
+        return parse_debezium_bridge(&properties, DebeziumConnectorKind::Spanner);
+    }
+    if connector_class.contains("InformixConnector") {
+        return parse_debezium_bridge(&properties, DebeziumConnectorKind::Informix);
+    }
+    if connector_class.contains("CockroachDBConnector") {
+        return parse_debezium_bridge(&properties, DebeziumConnectorKind::CockroachDb);
+    }
+    if connector_class.contains("YashanDbConnector") || connector_class.contains("YashanDB") {
+        return parse_debezium_bridge(&properties, DebeziumConnectorKind::YashanDb);
+    }
     if connector_class.contains("MySqlConnector") {
         return parse_mysql(&properties);
     }
@@ -18,7 +42,7 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
     }
     if !connector_class.contains("PostgresConnector") {
         return Err(Error::Configuration(format!(
-            "unsupported Debezium connector.class {connector_class:?}; supported sources are PostgreSQL, MySQL, SQL Server, Oracle, and MongoDB"
+            "unsupported Debezium connector.class {connector_class:?}; supported sources are PostgreSQL, MySQL, MariaDB, SQL Server, Oracle, MongoDB, Db2, Cassandra, Vitess, Spanner, Informix, CockroachDB, and YashanDB"
         )));
     }
     if let Some(plugin) = properties.get("plugin.name")
@@ -861,6 +885,149 @@ fn parse_mongodb(properties: &BTreeMap<String, String>) -> Result<Config> {
     )
 }
 
+fn parse_debezium_bridge(
+    properties: &BTreeMap<String, String>,
+    kind: DebeziumConnectorKind,
+) -> Result<Config> {
+    let bridge_type = properties.get("rustium.debezium.bridge.type").map_or_else(
+        || {
+            if kind == DebeziumConnectorKind::Cassandra {
+                "kafka"
+            } else {
+                "http"
+            }
+        },
+        String::as_str,
+    );
+    let bridge = match bridge_type {
+        "http" => DebeziumBridgeConfig::Http {
+            listen: properties
+                .get("rustium.debezium.http.listen")
+                .cloned()
+                .unwrap_or_else(default_debezium_bridge_listen),
+            path: properties
+                .get("rustium.debezium.http.path")
+                .cloned()
+                .unwrap_or_else(default_debezium_bridge_path),
+            authentication_token: properties
+                .get("rustium.debezium.http.authentication.token")
+                .cloned(),
+            request_timeout: duration_ms(
+                properties,
+                "rustium.debezium.http.request.timeout.ms",
+                default_debezium_bridge_request_timeout(),
+            )?,
+            max_body_size: usize_value(
+                properties,
+                "rustium.debezium.http.max.body.bytes",
+                default_debezium_bridge_max_body_size(),
+            )?,
+        },
+        "kafka" => DebeziumBridgeConfig::Kafka {
+            bootstrap_servers: csv_property(
+                properties
+                    .get("rustium.debezium.kafka.bootstrap.servers")
+                    .or_else(|| properties.get("bootstrap.servers")),
+            ),
+            topics: csv_property(properties.get("rustium.debezium.kafka.topics")),
+            group_id: properties
+                .get("rustium.debezium.kafka.group.id")
+                .cloned()
+                .unwrap_or_else(default_debezium_bridge_group_id),
+            consumer_properties: properties
+                .iter()
+                .filter_map(|(key, value)| {
+                    key.strip_prefix("rustium.debezium.kafka.consumer.")
+                        .map(|key| (key.to_string(), value.clone()))
+                })
+                .collect(),
+            poll_timeout: duration_ms(
+                properties,
+                "rustium.debezium.kafka.poll.timeout.ms",
+                default_debezium_bridge_request_timeout(),
+            )?,
+        },
+        value => {
+            return Err(Error::Configuration(format!(
+                "rustium.debezium.bridge.type must be http or kafka; found {value:?}"
+            )));
+        }
+    };
+    let bridge_properties = properties
+        .iter()
+        .filter(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "name"
+                    | "key.converter"
+                    | "value.converter"
+                    | "key.converter.schemas.enable"
+                    | "value.converter.schemas.enable"
+            ) && !key.starts_with("rustium.")
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let source = DebeziumSourceConfig {
+        bridge,
+        command: properties.get("rustium.debezium.command").cloned(),
+        command_args: csv_property(properties.get("rustium.debezium.command.args")),
+        command_environment: properties
+            .iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix("rustium.debezium.command.env.")
+                    .map(|key| (key.to_string(), value.clone()))
+            })
+            .collect(),
+        properties: bridge_properties,
+        offset_file: properties
+            .get("offset.storage.file.filename")
+            .cloned()
+            .unwrap_or_else(default_debezium_offset_file),
+        schema_history_file: properties
+            .get("schema.history.internal.file.filename")
+            .cloned()
+            .unwrap_or_else(default_debezium_schema_history_file),
+        heartbeat_topics_prefix: properties
+            .get("topic.heartbeat.prefix")
+            .or_else(|| properties.get("heartbeat.topics.prefix"))
+            .cloned()
+            .unwrap_or_else(default_heartbeat_topics_prefix),
+        heartbeat_topic_name: properties.get("topic.heartbeat.name").cloned(),
+    };
+    let source = match kind {
+        DebeziumConnectorKind::Mariadb => SourceConfig::Mariadb(source),
+        DebeziumConnectorKind::Db2 => SourceConfig::Db2(source),
+        DebeziumConnectorKind::Cassandra => SourceConfig::Cassandra(source),
+        DebeziumConnectorKind::Vitess => SourceConfig::Vitess(source),
+        DebeziumConnectorKind::Spanner => SourceConfig::Spanner(source),
+        DebeziumConnectorKind::Informix => SourceConfig::Informix(source),
+        DebeziumConnectorKind::CockroachDb => SourceConfig::Cockroachdb(source),
+        DebeziumConnectorKind::YashanDb => SourceConfig::Yashandb(source),
+    };
+    assemble_config(
+        properties,
+        source,
+        SnapshotConfig {
+            mode: bridge_snapshot_mode(properties.get("snapshot.mode").map(String::as_str)),
+            fetch_size: usize_value(
+                properties,
+                "snapshot.fetch.size",
+                default_snapshot_fetch_size(),
+            )?,
+            include_collections: csv_property(properties.get("snapshot.include.collection.list")),
+        },
+        Vec::new(),
+    )
+}
+
+fn bridge_snapshot_mode(mode: Option<&str>) -> SnapshotMode {
+    match mode.map(str::to_ascii_lowercase).as_deref() {
+        Some("never" | "no_data") => SnapshotMode::Never,
+        Some("when_needed") => SnapshotMode::WhenNeeded,
+        _ => SnapshotMode::Initial,
+    }
+}
+
 fn assemble_config(
     properties: &BTreeMap<String, String>,
     source: SourceConfig,
@@ -869,7 +1036,9 @@ fn assemble_config(
 ) -> Result<Config> {
     let topic_prefix = required(properties, "topic.prefix")?.to_string();
     let sink = sink_config(properties, &topic_prefix)?;
-    warnings.extend(unsupported_warnings(properties));
+    if source.as_debezium().is_none() {
+        warnings.extend(unsupported_warnings(properties));
+    }
     let postgres_source = matches!(&source, SourceConfig::Postgresql(_));
     let mysql_source = matches!(&source, SourceConfig::Mysql(_));
     let errors_max_retries = if properties.contains_key("errors.max.retries") {
@@ -3739,5 +3908,85 @@ topic.prefix=app
         )
         .unwrap_err();
         assert!(error.to_string().contains("online_catalog"));
+    }
+
+    #[test]
+    fn maps_every_remaining_debezium_database_connector_to_the_bridge() {
+        let cases = [
+            (
+                "io.debezium.connector.mariadb.MariaDbConnector",
+                DebeziumConnectorKind::Mariadb,
+            ),
+            (
+                "io.debezium.connector.db2.Db2Connector",
+                DebeziumConnectorKind::Db2,
+            ),
+            (
+                "io.debezium.connector.cassandra.Cassandra4Connector",
+                DebeziumConnectorKind::Cassandra,
+            ),
+            (
+                "io.debezium.connector.vitess.VitessConnector",
+                DebeziumConnectorKind::Vitess,
+            ),
+            (
+                "io.debezium.connector.spanner.SpannerConnector",
+                DebeziumConnectorKind::Spanner,
+            ),
+            (
+                "io.debezium.connector.informix.InformixConnector",
+                DebeziumConnectorKind::Informix,
+            ),
+            (
+                "io.debezium.connector.cockroachdb.CockroachDBConnector",
+                DebeziumConnectorKind::CockroachDb,
+            ),
+            (
+                "io.debezium.connector.yashandb.YashanDbConnector",
+                DebeziumConnectorKind::YashanDb,
+            ),
+        ];
+        for (connector_class, expected) in cases {
+            let raw = format!(
+                "name=bridge-test\nconnector.class={connector_class}\ntopic.prefix=bridge\nrustium.debezium.bridge.type=http\ndatabase.password=secret\n"
+            );
+            let config = parse(&raw).unwrap();
+            let (kind, source) = config.source.as_debezium().unwrap();
+            assert_eq!(kind, expected);
+            assert_eq!(source.properties["connector.class"], connector_class);
+            assert!(config.compatibility_warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn passes_connector_specific_snapshot_modes_through_the_bridge() {
+        let cases = [
+            ("io.debezium.connector.mariadb.MariaDbConnector", "recovery"),
+            (
+                "io.debezium.connector.db2.Db2Connector",
+                "configuration_based",
+            ),
+            (
+                "io.debezium.connector.cassandra.Cassandra4Connector",
+                "ALWAYS",
+            ),
+            ("io.debezium.connector.informix.InformixConnector", "custom"),
+            (
+                "io.debezium.connector.cockroachdb.CockroachDBConnector",
+                "always",
+            ),
+            (
+                "io.debezium.connector.yashandb.YashanDbConnector",
+                "initial_only",
+            ),
+        ];
+        for (connector_class, snapshot_mode) in cases {
+            let raw = format!(
+                "name=bridge-test\nconnector.class={connector_class}\ntopic.prefix=bridge\nrustium.debezium.bridge.type=http\nsnapshot.mode={snapshot_mode}\n"
+            );
+            let config = parse(&raw).unwrap();
+            let (_, source) = config.source.as_debezium().unwrap();
+            assert_eq!(source.properties["snapshot.mode"], snapshot_mode);
+        }
     }
 }

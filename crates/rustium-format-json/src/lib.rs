@@ -210,7 +210,7 @@ fn build_encoded(
             .table
             .as_deref()
             .ok_or_else(|| Error::Encoding("event has no source table".into()))?;
-        if event.source.connector == "mysql" {
+        if event.source.schema.is_none() {
             format!(
                 "{}.{}.{}",
                 config.topic_prefix, event.source.database, table
@@ -340,6 +340,14 @@ fn debezium_source(event: &ChangeEvent, source_ts: Option<i64>) -> Result<serde_
             );
             source.insert("event_serial_no".into(), position.event_serial.into());
         }
+        SourcePosition::Debezium(position) => {
+            source.insert(
+                "source_offset".into(),
+                serde_json::to_string(&position.source)?.into(),
+            );
+            source.insert("record_id".into(), position.record_id.clone().into());
+            source.insert("event_serial_no".into(), position.event_serial.into());
+        }
     }
     Ok(source.into())
 }
@@ -435,6 +443,11 @@ fn json_source_schema(event: &ChangeEvent) -> serde_json::Value {
                 "cluster_time_increment",
                 serde_json::json!({"type": ["integer", "null"]}),
             ),
+            ("event_serial_no", serde_json::json!({"type": "integer"})),
+        ],
+        SourcePosition::Debezium(_) => vec![
+            ("source_offset", serde_json::json!({"type": "string"})),
+            ("record_id", serde_json::json!({"type": "string"})),
             ("event_serial_no", serde_json::json!({"type": "integer"})),
         ],
     };
@@ -746,8 +759,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use indexmap::indexmap;
     use rustium_core::{
-        DataValue, EventId, EventSchema, FieldSchema, MySqlPosition, PostgresPosition,
-        SourceMetadata, SqlServerPosition, TransactionMetadata,
+        DataValue, DebeziumPosition, EventId, EventSchema, FieldSchema, MySqlPosition,
+        PostgresPosition, SourceMetadata, SqlServerPosition, TransactionMetadata,
     };
 
     use super::*;
@@ -923,6 +936,35 @@ mod tests {
             ("mysql", mysql),
             ("sqlserver", sqlserver),
         ]
+    }
+
+    #[test]
+    fn encodes_bridge_offsets_and_routes_sources_without_relational_schemas() {
+        let mut bridge = event();
+        bridge.source.connector = "spanner".into();
+        bridge.source.database = "inventory".into();
+        bridge.source.schema = None;
+        bridge.source.table = Some("Users".into());
+        bridge.position = SourcePosition::Debezium(DebeziumPosition {
+            connector: "spanner".into(),
+            source: BTreeMap::from([
+                ("partition_token".into(), "partition-1".into()),
+                ("sequence".into(), "7".into()),
+            ]),
+            record_id: "record-7".into(),
+            event_serial: 7,
+            snapshot: false,
+        });
+        let fixture = encoded_fixture(&bridge);
+        assert_eq!(fixture["destination"], "app.inventory.Users");
+        assert_eq!(fixture["payload"]["source"]["record_id"], "record-7");
+        let offset: serde_json::Value = serde_json::from_str(
+            fixture["payload"]["source"]["source_offset"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(offset["partition_token"], "partition-1");
     }
 
     fn schema_fixture(event: &ChangeEvent) -> serde_json::Value {

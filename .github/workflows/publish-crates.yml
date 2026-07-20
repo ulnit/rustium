@@ -42,6 +42,7 @@ jobs:
             rustium-column-transform \
             rustium-config \
             rustium-core \
+            rustium-debezium \
             rustium-format-avro \
             rustium-format-json \
             rustium-format-protobuf \
@@ -130,7 +131,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
-          for package in rustium-mysql rustium-postgresql rustium-sqlserver rustium-oracle rustium-mongodb rustium-sink-kafka; do
+          for package in rustium-mysql rustium-postgresql rustium-sqlserver rustium-oracle rustium-mongodb rustium-debezium rustium-sink-kafka; do
             cargo publish -p "$package" --locked --token "$CARGO_REGISTRY_TOKEN"
             sleep 60
           done

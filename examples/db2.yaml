@@ -1,0 +1,28 @@
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: db2-cdc
+source:
+  type: db2
+  bridge:
+    type: http
+    listen: 127.0.0.1:18080
+    path: /events
+  command: ${DEBEZIUM_SERVER}
+  properties:
+    connector.class: io.debezium.connector.db2.Db2Connector
+    topic.prefix: inventory
+    database.hostname: ${DB2_HOST}
+    database.port: "50000"
+    database.user: ${DB2_USER}
+    database.password: ${DB2_PASSWORD}
+    database.dbname: inventory
+    table.include.list: DB2INST1.CUSTOMERS
+    snapshot.mode: initial
+format:
+  kind: debezium_json
+sink:
+  type: stdout
+  topic_prefix: inventory
+state:
+  path: /var/lib/rustium/db2.db

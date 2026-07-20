@@ -14,6 +14,7 @@ This document defines the currently supported alpha upgrade behavior. It is inte
 | PostgreSQL schema-history envelope | `6` | Versions `1` through `6` read; older checkpoints without history fail closed |
 | MySQL schema-history envelope | `3` | Versions `1` through `3` read; v2 offset progress is safely replayable |
 | SQL Server connector-state envelope | `1` | Version `1` only |
+| Debezium bridge source position | `DebeziumPosition` | Connector kind, upstream source coordinates, stable record ID, event serial, and snapshot marker are required |
 
 The SQLite storage version is separate from the JSON checkpoint version. A storage migration must never silently rewrite a future `PRAGMA user_version`. Connector-state versions are format-specific and are validated before a source resumes.
 
@@ -21,7 +22,7 @@ The SQLite storage version is separate from the JSON checkpoint version. A stora
 
 1. Read the release notes and compare the version inventory above with the target binary.
 2. Stop the connector gracefully and wait for `STOPPED`.
-3. Back up the SQLite database or create a CSI VolumeSnapshot. Record its hash, image digest, chart values, configuration fingerprint, source position, and database slot/binlog/CDC identifiers.
+3. Back up the SQLite database or create a CSI VolumeSnapshot. For a managed Debezium bridge, atomically include its `offset_file` and `schema_history_file`. Record the backup hash, image digest, chart values, configuration fingerprint, source position, and database slot/binlog/CDC identifiers.
 4. Run `rustium validate` with the target binary and the unchanged configuration. Resolve capability or compatibility errors before starting.
 5. Confirm that the target binary still uses the same connector name, source identity, topic prefix, state path, and sink durability settings.
 
@@ -59,9 +60,13 @@ The additive PostgreSQL `source.schema_refresh_mode` field maps Debezium `schema
 
 The additive native PostgreSQL `source.logical_decoding_messages` flag defaults to false and is omitted from semantic fingerprint material with empty message-prefix filters. Debezium properties intentionally enable all logical decoding messages by default. Enabling native capture, or adding `source.message_prefix_include_list` / `source.message_prefix_exclude_list`, changes the fingerprint and adds `<topic.prefix>.message` records. Stop the connector, review topic provisioning and consumer handling for the prefix key and message envelope, then introduce the change through the normal fingerprinted configuration procedure. Existing checkpoints and connector-state versions remain readable because the change adds no persisted state field.
 
+The Debezium bridge sources are MariaDB, Db2, Cassandra, Vitess, Spanner, Informix, CockroachDB, and YashanDB. Their semantic fingerprint includes the source kind, HTTP or Kafka bridge contract, managed command and arguments, command-environment key names, non-secret connector and Kafka consumer properties, recovery-file paths, and heartbeat routing. Values of connector or consumer properties whose names identify passwords, secrets, tokens, credentials, or private keys are excluded, as is the HTTP authentication token, so routine secret rotation does not invalidate a checkpoint. Changing topics, Kafka group ID, endpoint path, connector selection properties, command, recovery-file paths, or other fingerprinted values against existing state is rejected. Stop the connector and either restore the prior values or reset and take a controlled new snapshot; never bypass the fingerprint by editing SQLite.
+
 ### Checkpoint migration
 
 Checkpoint JSON version 2 adds an optional connector-state envelope. Version 1 JSON without that field remains readable. PostgreSQL and MySQL cannot safely resume a completed version 1 checkpoint without persistent schema history, so they fail closed and require a backup, reset, and new initial snapshot. SQL Server's tested resume path does not depend on connector state and can read version 1 when the source cursor and CDC retention remain valid.
+
+Bridge sources persist `SourcePosition::Debezium` in the same version 2 checkpoint. The position identifies the connector kind, carries the upstream `source` coordinates, and records a stable upstream record ID plus Rustium event serial. Resume rejects another connector kind. Exact replay of the last record is deduplicated; older replay remains possible when Debezium or Kafka recovery state is restored behind Rustium's checkpoint, so downstream consumers must retain event-ID deduplication.
 
 The SQLite storage schema is initialized and migrated by `rustium-state`. Current version 1 only creates the `checkpoints` table and sets `PRAGMA user_version`. A database reporting a version greater than the binary supports is rejected before any downgrade. Do not edit `user_version` by hand and do not copy a checkpoint between connector identities.
 
@@ -70,6 +75,7 @@ The SQLite storage schema is initialized and migrated by `rustium-state`. Curren
 - PostgreSQL schema history versions 1 through 6 are deserialized with defaults for additive fields. The current state keeps table layouts, type metadata, opaque unknown-type columns, incremental keyset progress, pause state, and a bounded completed-signal history.
 - MySQL schema history versions 1 through 3 are deserialized. Version 2 offset progress remains readable and is replayed from the collection start; version 3 persists typed keyset progress and completed signal IDs.
 - SQL Server connector state currently accepts version 1 only. Unknown versions fail before CDC polling.
+- Managed Debezium Server state is not embedded in the connector-state envelope. Its file offset store and schema history remain in the configured `offset_file` and `schema_history_file`; they form one recovery unit with SQLite. External Kafka mode additionally depends on the configured consumer group, topic partitions, and retained input records.
 
 Do not manually edit JSON payloads. A malformed, duplicate, unknown-format, or unknown-version envelope is a state error and must be handled by restoring a valid backup or resetting with a new snapshot.
 
@@ -79,13 +85,13 @@ Rustium is a single-owner process, not an active/active service. Use a stop, bac
 
 1. Drain or pause upstream operational changes as required by the database retention window.
 2. Stop the old binary and verify its final checkpoint was acknowledged.
-3. Back up state and record the old image digest.
+3. Back up state and record the old image digest. For a managed Debezium bridge, stop the child process first and capture SQLite, `offset_file`, and `schema_history_file` in one consistent backup.
 4. Deploy the new binary or Helm image with the same state PVC and connector configuration.
 5. Run `rustium validate`, then start exactly one replica.
 6. Verify the source position, connector-state version, sink acknowledgements, lag, and first post-upgrade event order.
 7. Keep the backup until the new binary has passed the normal retention and replay observation window.
 
-Do not run two replicas against one state path. A Helm `Recreate` deployment is required for this reason. If the new binary writes a checkpoint, do not roll back in place unless the release explicitly documents reverse-read compatibility. Otherwise stop it, restore the pre-upgrade state backup and image, and resume from the old checkpoint.
+Do not run two replicas against one state path. A Helm `Recreate` deployment is required for this reason. If the new binary writes a checkpoint, do not roll back in place unless the release explicitly documents reverse-read compatibility. Otherwise stop it, restore the pre-upgrade state backup and image, and resume from the old checkpoint. A bridge rollback must restore SQLite and both managed Debezium recovery files from the same backup; Kafka mode must restore the compatible group identity and verify that every required partition offset remains within broker retention.
 
 ### Reset migration
 
@@ -114,6 +120,7 @@ Use `rustium state reset --config <path> --confirm` only after backing up state 
 | PostgreSQL schema-history envelope | `6` | 可读取 `1` 到 `6`；没有 history 的旧 checkpoint fail-closed |
 | MySQL schema-history envelope | `3` | 可读取 `1` 到 `3`；v2 offset progress 可安全重放 |
 | SQL Server connector-state envelope | `1` | 只接受 version `1` |
+| Debezium bridge source position | `DebeziumPosition` | 必须包含 connector kind、上游 source coordinate、稳定 record ID、event serial 和 snapshot marker |
 
 SQLite storage version 与 JSON checkpoint version 相互独立。Storage migration 绝不能静默改写未来的 `PRAGMA user_version`。Connector-state version 按格式分别校验，Source 恢复前必须通过验证。
 
@@ -121,7 +128,7 @@ SQLite storage version 与 JSON checkpoint version 相互独立。Storage migrat
 
 1. 阅读 release notes，并将上表版本与目标 binary 对照。
 2. 优雅停止 connector，等待 `STOPPED`。
-3. 备份 SQLite 数据库或创建 CSI VolumeSnapshot，记录 hash、image digest、Chart values、配置 fingerprint、源位点和数据库 slot/binlog/CDC 标识。
+3. 备份 SQLite 数据库或创建 CSI VolumeSnapshot。Managed Debezium bridge 必须把 `offset_file` 与 `schema_history_file` 原子纳入备份；记录 backup hash、image digest、Chart values、配置 fingerprint、源位点和数据库 slot/binlog/CDC 标识。
 4. 使用目标 binary 和原配置运行 `rustium validate`，先解决能力或兼容性错误。
 5. 确认目标 binary 保持相同 connector name、源身份、topic prefix、state path 和 Sink durability 设置。
 
@@ -159,9 +166,13 @@ SQLite storage version 与 JSON checkpoint version 相互独立。Storage migrat
 
 新增的 PostgreSQL 原生 `source.logical_decoding_messages` 标志默认为 false；message prefix filter 为空时不会进入 semantic fingerprint material。Debezium properties 有意默认启用全部 logical decoding message。启用原生捕获，或增加 `source.message_prefix_include_list` / `source.message_prefix_exclude_list`，都会改变 fingerprint，并新增 `<topic.prefix>.message` record。应先停止 connector，审查 topic provisioning 以及 consumer 对 prefix key 和 message envelope 的处理，再通过正常的 fingerprint 配置变更流程引入。该变更没有新增持久化状态字段，因此既有 checkpoint 和 connector-state version 仍可读取。
 
+Debezium bridge source 包括 MariaDB、Db2、Cassandra、Vitess、Spanner、Informix、CockroachDB 和 YashanDB。它们的 semantic fingerprint 包含 source kind、HTTP 或 Kafka bridge 契约、managed command 及参数、command environment 的 key 名、非 secret connector 与 Kafka consumer properties、恢复文件路径和 heartbeat routing。名称中表示 password、secret、token、credential 或 private key 的 connector 或 consumer property value 不进入 fingerprint，HTTP authentication token 也不进入，因此常规 secret rotation 不会使 checkpoint 失效。在既有 state 上修改 topic、Kafka group ID、endpoint path、connector selection property、command、恢复文件路径或其他 fingerprint 字段会被拒绝。应停止 connector 并恢复旧值，或 reset 后执行受控新 snapshot；绝不能通过编辑 SQLite 绕过 fingerprint。
+
 ### Checkpoint 迁移
 
 Checkpoint JSON version 2 新增可选 connector-state envelope；没有该字段的 version 1 JSON 仍可读。PostgreSQL 和 MySQL 没有持久 schema history 时无法安全恢复已完成的 version 1 checkpoint，因此会 fail-closed，要求备份、reset 和新的 initial snapshot。SQL Server 已验证的恢复路径不依赖 connector state，只要源 cursor 和 CDC retention 有效，仍可读取 version 1。
+
+Bridge source 会在同一个 version 2 checkpoint 中持久化 `SourcePosition::Debezium`。该 position 标识 connector kind，携带上游 `source` coordinate，并保存稳定 upstream record ID 与 Rustium event serial。使用其他 connector kind 恢复会被拒绝。最后一条 record 的精确重放会被去重；如果恢复后的 Debezium 或 Kafka state 落后于 Rustium checkpoint，仍可能重放更早记录，因此下游 consumer 必须保留基于 event ID 的去重。
 
 SQLite storage schema 由 `rustium-state` 初始化和迁移。当前 version 1 只负责创建 `checkpoints` table 并设置 `PRAGMA user_version`。如果数据库报告的 version 高于 binary 支持版本，会在任何降级前拒绝打开。不要手工修改 `user_version`，也不要在不同 connector identity 之间复制 checkpoint。
 
@@ -170,6 +181,7 @@ SQLite storage schema 由 `rustium-state` 初始化和迁移。当前 version 1 
 - PostgreSQL schema history 可读取 version 1 到 6，并为新增字段使用默认值；当前状态保存 table layout、类型 metadata、opaque 未知类型列、增量 keyset progress、pause 状态和有界 completed-signal history。
 - MySQL schema history 可读取 version 1 到 3。Version 2 offset progress 仍可读，并从集合开头安全重放；version 3 持久化带类型 keyset progress 和 completed signal ID。
 - SQL Server connector state 当前只接受 version 1，未知 version 会在 CDC polling 前失败。
+- Managed Debezium Server state 不嵌入 connector-state envelope。它的 file offset store 和 schema history 分别保存在配置的 `offset_file` 与 `schema_history_file`，并与 SQLite 组成单一恢复单元。External Kafka mode 还依赖配置的 consumer group、topic partition 和仍在 retention 内的输入记录。
 
 不要手工编辑 JSON payload。Malformed、重复、未知 format 或未知 version 都是 state error，应恢复有效备份，或 reset 后执行新 snapshot。
 
@@ -179,13 +191,13 @@ Rustium 是单 owner 进程，不是 active/active service。使用 stop、backu
 
 1. 按数据库 retention 窗口要求 drain 或暂停上游运维变更。
 2. 停止旧 binary，确认最终 checkpoint 已确认。
-3. 备份 state，记录旧 image digest。
+3. 备份 state 并记录旧 image digest。Managed Debezium bridge 应先停止 child process，再把 SQLite、`offset_file` 与 `schema_history_file` 纳入同一个一致性备份。
 4. 用相同 state PVC 和 connector 配置部署新 binary 或 Helm image。
 5. 执行 `rustium validate`，然后只启动一个副本。
 6. 检查源位点、connector-state version、Sink 确认、lag 和升级后第一批事件顺序。
 7. 新 binary 经过正常 retention 和 replay 观察窗口后再删除备份。
 
-不要让两个副本访问同一 state path。Helm 的 `Recreate` 策略正是为此设置。如果新 binary 已写入 checkpoint，除非 release 明确保证反向读取兼容，否则不要原地 rollback；应停止新 binary，恢复升级前 state backup 和 image，从旧 checkpoint 继续。
+不要让两个副本访问同一 state path。Helm 的 `Recreate` 策略正是为此设置。如果新 binary 已写入 checkpoint，除非 release 明确保证反向读取兼容，否则不要原地 rollback；应停止新 binary，恢复升级前 state backup 和 image，从旧 checkpoint 继续。Bridge rollback 必须从同一份 backup 恢复 SQLite 与两个 managed Debezium recovery file；Kafka mode 必须恢复兼容的 group identity，并确认所有必需 partition offset 仍位于 broker retention 范围内。
 
 ### Reset 迁移
 

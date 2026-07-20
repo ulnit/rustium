@@ -236,7 +236,7 @@ fn destination(event: &ChangeEvent, config: &AvroEncoderConfig) -> Result<String
         .table
         .as_deref()
         .ok_or_else(|| Error::Encoding("event has no source table".into()))?;
-    if event.source.connector == "mysql" {
+    if event.source.schema.is_none() {
         Ok(format!(
             "{}.{}.{}",
             config.topic_prefix, event.source.database, table
@@ -497,6 +497,11 @@ fn source_schema(event: &ChangeEvent, namespace: &str) -> serde_json::Value {
             serde_json::json!({"name": "resume_token", "type": ["null", "string"], "default": null}),
             serde_json::json!({"name": "cluster_time_seconds", "type": ["null", "long"], "default": null}),
             serde_json::json!({"name": "cluster_time_increment", "type": ["null", "long"], "default": null}),
+            serde_json::json!({"name": "event_serial_no", "type": "long"}),
+        ]),
+        SourcePosition::Debezium(_) => fields.extend([
+            serde_json::json!({"name": "source_offset", "type": "string"}),
+            serde_json::json!({"name": "record_id", "type": "string"}),
             serde_json::json!({"name": "event_serial_no", "type": "long"}),
         ]),
     }
@@ -913,6 +918,22 @@ fn source_value(event: &ChangeEvent) -> Result<Value> {
                 ),
             ]);
         }
+        SourcePosition::Debezium(position) => {
+            values.extend([
+                (
+                    "source_offset".into(),
+                    Value::String(serde_json::to_string(&position.source)?),
+                ),
+                (
+                    "record_id".into(),
+                    Value::String(position.record_id.clone()),
+                ),
+                (
+                    "event_serial_no".into(),
+                    Value::Long(u64_to_i64(position.event_serial, "event serial")?),
+                ),
+            ]);
+        }
     }
     Ok(Value::Record(values))
 }
@@ -1059,8 +1080,8 @@ mod tests {
     use chrono::Utc;
     use indexmap::indexmap;
     use rustium_core::{
-        EventId, EventSchema, MySqlPosition, PostgresPosition, SourceMetadata, SqlServerPosition,
-        TransactionMetadata,
+        DebeziumPosition, EventId, EventSchema, MySqlPosition, PostgresPosition, SourceMetadata,
+        SqlServerPosition, TransactionMetadata,
     };
 
     use super::*;
@@ -1527,6 +1548,28 @@ mod tests {
         assert_eq!(
             field(source, "commit_lsn"),
             &Value::String("0001:0002:0003".into())
+        );
+
+        let mut bridge = postgres.clone();
+        bridge.source.connector = "vitess".into();
+        bridge.source.schema = None;
+        bridge.position = SourcePosition::Debezium(DebeziumPosition {
+            connector: "vitess".into(),
+            source: BTreeMap::from([("vgtid".into(), "commerce/0-1-7".into())]),
+            record_id: "record-7".into(),
+            event_serial: 7,
+            snapshot: false,
+        });
+        let encoded = encoder.encode(&bridge).unwrap();
+        assert_eq!(encoded.destination, "inventory.app.customers");
+        let payload = decode(
+            encoded.payload.as_ref().unwrap(),
+            encoded.payload_schema.as_ref().unwrap(),
+        );
+        let source = field(&payload, "source");
+        assert_eq!(
+            field(source, "record_id"),
+            &Value::String("record-7".into())
         );
 
         let mut heartbeat = event();

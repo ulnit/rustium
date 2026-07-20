@@ -17,6 +17,7 @@ path = "src/main.rs"
 clap.workspace = true
 rustium-config.workspace = true
 rustium-core.workspace = true
+rustium-debezium.workspace = true
 rustium-format-avro.workspace = true
 rustium-format-json.workspace = true
 rustium-format-protobuf.workspace = true

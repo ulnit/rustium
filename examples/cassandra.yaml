@@ -1,0 +1,22 @@
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: cassandra-cdc
+source:
+  type: cassandra
+  bridge:
+    type: kafka
+    bootstrap_servers: ["${KAFKA_BOOTSTRAP_SERVERS}"]
+    topics: ['^cassandra-cluster-1\.inventory\..+']
+    group_id: rustium-cassandra
+    poll_timeout: 1s
+  properties:
+    connector.class: io.debezium.connector.cassandra.Cassandra4Connector
+    topic.prefix: cassandra-cluster-1
+format:
+  kind: debezium_json
+sink:
+  type: stdout
+  topic_prefix: cassandra-cluster-1
+state:
+  path: /var/lib/rustium/cassandra.db

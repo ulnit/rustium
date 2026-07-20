@@ -107,6 +107,7 @@ pub enum SourcePosition {
     SqlServer(SqlServerPosition),
     Oracle(OraclePosition),
     MongoDb(MongoDbPosition),
+    Debezium(DebeziumPosition),
 }
 
 impl SourcePosition {
@@ -118,6 +119,9 @@ impl SourcePosition {
             (Self::SqlServer(left), Self::SqlServer(right)) => left.sort_key() > right.sort_key(),
             (Self::Oracle(left), Self::Oracle(right)) => left.sort_key() > right.sort_key(),
             (Self::MongoDb(left), Self::MongoDb(right)) => left.sort_key() > right.sort_key(),
+            (Self::Debezium(left), Self::Debezium(right)) => {
+                left.connector == right.connector && left.sort_key() > right.sort_key()
+            }
             _ => false,
         }
     }
@@ -230,6 +234,26 @@ impl MongoDbPosition {
             u8::from(!self.snapshot),
             self.event_serial,
         )
+    }
+}
+
+/// Durable position for connectors executed by an upstream Debezium engine.
+///
+/// `source` preserves the connector-specific source metadata without forcing
+/// proprietary offsets such as VGTID or Spanner partition tokens into a
+/// lossy common scalar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebeziumPosition {
+    pub connector: String,
+    pub source: BTreeMap<String, serde_json::Value>,
+    pub record_id: String,
+    pub event_serial: u64,
+    pub snapshot: bool,
+}
+
+impl DebeziumPosition {
+    fn sort_key(&self) -> (u8, u64) {
+        (u8::from(!self.snapshot), self.event_serial)
     }
 }
 

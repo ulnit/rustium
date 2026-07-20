@@ -3003,7 +3003,8 @@ async fn flushes_acknowledged_lsn_immediately_with_timeout() -> TestResult {
                 SourcePosition::MySql(_)
                 | SourcePosition::SqlServer(_)
                 | SourcePosition::Oracle(_)
-                | SourcePosition::MongoDb(_) => {
+                | SourcePosition::MongoDb(_)
+                | SourcePosition::Debezium(_) => {
                     return Err(test_error(
                         "feedback fixture emitted a non-PostgreSQL position",
                     ));
@@ -3218,7 +3219,8 @@ async fn reconciles_debezium_checkpoint_slot_mismatch_strategies() -> TestResult
             SourcePosition::MySql(_)
             | SourcePosition::SqlServer(_)
             | SourcePosition::Oracle(_)
-            | SourcePosition::MongoDb(_) => {
+            | SourcePosition::MongoDb(_)
+            | SourcePosition::Debezium(_) => {
                 return Err(test_error(
                     "offset fixture produced a non-PostgreSQL checkpoint",
                 ));
@@ -6727,7 +6729,8 @@ fn postgres_record_commit_lsn(record: &SourceRecord) -> TestResult<u64> {
         SourcePosition::MySql(_)
         | SourcePosition::SqlServer(_)
         | SourcePosition::Oracle(_)
-        | SourcePosition::MongoDb(_) => Err(test_error(
+        | SourcePosition::MongoDb(_)
+        | SourcePosition::Debezium(_) => Err(test_error(
             "LSN flush fixture emitted a non-PostgreSQL position",
         )),
     }

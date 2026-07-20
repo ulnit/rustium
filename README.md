@@ -18,7 +18,7 @@
 
 ### Overview
 
-Rustium is a standalone, log-based Change Data Capture service. It reads committed database changes, normalizes them into a typed internal event model, and delivers ordered events to stdout or Kafka without requiring a JVM or Kafka Connect.
+Rustium is a standalone, log-based Change Data Capture service. It reads committed database changes, normalizes them into a typed internal event model, and delivers ordered events to stdout or Kafka. PostgreSQL, MySQL, SQL Server, Oracle, and MongoDB use native Rust connectors. Databases whose CDC protocols depend on proprietary clients, node-local logs, or distributed stream APIs integrate through a durable Debezium Engine bridge.
 
 The connector priority is fixed:
 
@@ -27,8 +27,16 @@ The connector priority is fixed:
 3. SQL Server
 4. Oracle
 5. MongoDB
+6. MariaDB
+7. Db2
+8. Cassandra 3/4/5
+9. Vitess
+10. Spanner
+11. Informix
+12. CockroachDB
+13. YashanDB
 
-Oracle and MongoDB are now implemented after the first three connectors' correctness and recovery work. New connectors remain gated behind the same source-position, checkpoint, and external CDC verification contract.
+The first five sources have native Rust implementations. Every remaining database in the current Debezium source catalog is supported through the same durable bridge contract instead of reimplementing proprietary or node-local protocols without their reference engine.
 
 ### Current Status
 
@@ -48,6 +56,7 @@ The repository contains a runnable alpha implementation.
 | SQL Server CDC | Implemented; required Docker CI and external SQL Server 2022 recovery/soak gates pass |
 | Oracle LogMiner CDC | Implemented; unit/configuration gates pass; external ARCHIVELOG + LogMiner gate is opt-in |
 | MongoDB Change Streams CDC | Implemented; unit/configuration gates pass; external replica-set Change Stream gate is opt-in |
+| MariaDB, Db2, Cassandra 3/4/5, Vitess, Spanner, Informix, CockroachDB, and YashanDB | Implemented through the durable Debezium HTTP/Kafka bridge; connector-class/configuration and acknowledgement gates pass; database environments remain external |
 | CLI, health, status, stop, and Prometheus endpoints | Implemented |
 | Reproducible non-root container image and Helm chart source | Implemented; packaging gate runs in CI |
 | Published container image and Helm chart | Not published yet |
@@ -58,7 +67,7 @@ This is not a production-stable release. Persisted state and public configuratio
 ### Implemented Architecture
 
 ```text
- PostgreSQL WAL / MySQL binlog / SQL Server CDC
+ Native database logs / Debezium database engines
               |
               v
         Source connector
@@ -93,6 +102,7 @@ Requirements:
 - Access to SQL Server 2017+ with CDC and SQL Server Agent for the ignored SQL Server external integration test
 - Access to Oracle with ARCHIVELOG, supplemental logging, and LogMiner privileges for the ignored Oracle external integration test
 - Access to MongoDB replica set or sharded cluster for the ignored MongoDB Change Stream integration test
+- A Debezium Server/Kafka Connect distribution with the required connector plug-in for bridge-backed sources; Cassandra uses its per-node standalone Debezium process and the Kafka bridge
 - Docker for the ignored MySQL and SQL Server container integration tests
 
 ```bash
@@ -634,6 +644,26 @@ export RUSTIUM_MONGODB_TEST_DATABASE=cdc_demo
 cargo test -p rustium-mongodb --test mongodb_external -- --ignored --nocapture
 ```
 
+### Remaining Debezium Database Sources
+
+Rustium supports every other source database in the current Debezium catalog: MariaDB, Db2, Cassandra 3/4/5, Vitess, Spanner, Informix, CockroachDB, and YashanDB. These sources use the `rustium-debezium` adapter and retain Debezium's database engine for protocol correctness. This is deliberate: Db2 and Informix require vendor CDC clients, Cassandra requires a process on every database node to parse local commit logs, Vitess uses VStream, and Spanner manages a partitioned Change Stream lifecycle.
+
+The HTTP bridge can launch a Debezium Server command itself. Rustium writes a mode-0600 temporary configuration, forces schema-free JSON over the local HTTP sink, and does not return HTTP success until the event has reached the configured Rustium Sink and its `DebeziumPosition` is persisted. A timeout returns a retryable non-success response. Stable upstream IDs, or a deterministic content hash when no ID is supplied, prevent the final acknowledged request from being duplicated after the HTTP response crash window.
+
+The Kafka bridge disables automatic commits and offset storage. It commits each input topic/partition offset only after Rustium's durable acknowledgement. This mode supports externally managed Kafka Connect/Debezium Server deployments and is required for Debezium Cassandra, which is a standalone per-node producer rather than a Kafka Connect source. Topic entries beginning with `^` use librdkafka regex subscriptions for Cassandra's per-table topics.
+
+Native YAML uses one of these source types:
+
+```text
+mariadb | db2 | cassandra | vitess | spanner | informix | cockroachdb | yashandb
+```
+
+`source.properties` accepts the connector's original Debezium property names without renaming. `source.bridge.type` is `http` or `kafka`. In managed HTTP mode, `source.command` names the Debezium Server launcher; each `command_args` entry may use `{config}` and `{endpoint}` placeholders. `offset_file` and `schema_history_file` are stable Debezium-side recovery files and default to the Rustium working directory. In external HTTP mode, omit `command` and configure Debezium's HTTP sink to the logged Rustium endpoint. A non-loopback endpoint should be protected by a private network or authenticated reverse proxy.
+
+The bridge persists the complete connector-specific `source` object, stable record ID, event serial, and snapshot marker. Native JSON exposes that object in `position`; Debezium JSON, JSON Schema, Avro, and Protobuf expose it losslessly as `source.source_offset` plus `record_id` and `event_serial_no`. Snapshot-last records, transaction-end records, heartbeats, schema changes, typed before/after rows, and tombstones follow Rustium's normal durability pipeline.
+
+See [MariaDB](examples/mariadb.yaml), [Db2](examples/db2.yaml), [Cassandra](examples/cassandra.yaml), [Vitess](examples/vitess.yaml), [Spanner](examples/spanner.yaml), [Informix](examples/informix.yaml), [CockroachDB](examples/cockroachdb.yaml), and [YashanDB](examples/yashandb.yaml) configurations.
+
 ### Debezium Configuration Compatibility
 
 Rustium accepts strict native YAML and Debezium-style Java `.properties` files. Familiar names are preferred so existing deployments can migrate with smaller configuration changes.
@@ -803,7 +833,7 @@ Rustium is licensed under the [Apache License 2.0](LICENSE). Rustium is not affi
 
 ### 概述
 
-Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务。它读取数据库已提交变更，规范化为强类型内部事件，并按顺序投递到 stdout 或 Kafka，不依赖 JVM 或 Kafka Connect。
+Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务。它读取数据库已提交变更，规范化为强类型内部事件，并按顺序投递到 stdout 或 Kafka。PostgreSQL、MySQL、SQL Server、Oracle 和 MongoDB 使用原生 Rust 连接器；CDC 协议依赖专有客户端、节点本地日志或分布式 stream API 的数据库通过持久 Debezium Engine bridge 集成。
 
 连接器优先级固定如下：
 
@@ -812,8 +842,16 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 3. SQL Server
 4. Oracle
 5. MongoDB
+6. MariaDB
+7. Db2
+8. Cassandra 3/4/5
+9. Vitess
+10. Spanner
+11. Informix
+12. CockroachDB
+13. YashanDB
 
-前三个连接器完成正确性与恢复验证后，Oracle 和 MongoDB 已进入实现阶段。后续连接器仍必须遵循相同的源位点、checkpoint 和真实 CDC 验证契约。
+前五类 Source 使用原生 Rust 实现。当前 Debezium source catalog 中其余数据库全部通过相同的持久 bridge 契约接入，避免在缺少参考引擎时自行重写专有或节点本地协议。
 
 ### 当前状态
 
@@ -833,6 +871,7 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 | SQL Server CDC | 已实现；必选 Docker CI 和外部 SQL Server 2022 恢复/soak 门槛通过 |
 | Oracle LogMiner CDC | 已实现；单元/配置门槛通过；真实 ARCHIVELOG + LogMiner 门槛为显式外部测试 |
 | MongoDB Change Streams CDC | 已实现；单元/配置门槛通过；真实 replica-set Change Stream 门槛为显式外部测试 |
+| MariaDB、Db2、Cassandra 3/4/5、Vitess、Spanner、Informix、CockroachDB、YashanDB | 已通过持久 Debezium HTTP/Kafka bridge 实现；connector-class、配置和确认顺序门槛通过；真实数据库环境仍为外部测试 |
 | CLI、健康、状态、停止和 Prometheus 端点 | 已实现 |
 | 可复现的非 root 容器镜像与 Helm Chart 源码 | 已实现；CI 强制运行 packaging gate |
 | 已发布容器镜像与 Helm Chart | 尚未发布 |
@@ -1482,6 +1521,20 @@ Oracle 连接器使用纯 Rust `oracle-rs` 驱动和 LogMiner 在线字典。数
 MongoDB 连接器使用官方 Rust 驱动和 Change Streams，服务端必须是 replica set 或 sharded cluster。Rustium 在 initial snapshot 前打开 stream 并记录 `operationTime`，之后在每条事件 checkpoint 不透明 resume token；重启通过 `resume_after` 或 snapshot operation-time anchor 恢复，避免漏掉 snapshot 并发变更。
 
 原生 YAML 使用 `source.type: mongodb`，并配置 `connection_string`、可选 `databases`、`collections` include/exclude regex、`full_document: default|update_lookup`、`full_document_before_change: off|when_available|required`、`batch_size` 与 `poll_interval`。Debezium properties 支持 `MongoDbConnector`、`mongodb.connection.string`、database/collection filters、`capture.mode` 和 `max.batch.size`。`_id` 是 event key，BSON document/array/binary/ObjectId/Decimal128/date/timestamp 会保留明确的 typed representation。
+
+### 其余 Debezium 数据库 Source
+
+Rustium 已覆盖当前 Debezium source catalog 中其余全部数据库：MariaDB、Db2、Cassandra 3/4/5、Vitess、Spanner、Informix、CockroachDB 和 YashanDB。这些 Source 使用 `rustium-debezium` adapter，并继续由 Debezium 数据库引擎处理协议。这样可以正确使用 Db2/Informix 专有 CDC client、Cassandra 节点本地 commit log、Vitess VStream 和 Spanner 分区 Change Stream，而不是用普通表轮询冒充 CDC。
+
+HTTP bridge 可以由 Rustium 启动 Debezium Server command。Rustium 生成权限为 mode 0600 的临时配置，强制通过本地 HTTP sink 发送无 schema JSON，并且只有在事件已投递到 Rustium Sink、`DebeziumPosition` 已持久化后才返回 HTTP 成功。超时会返回非成功响应以触发重试；稳定 upstream ID 或缺少 ID 时的确定性内容 hash 会去除 HTTP 响应崩溃窗口中最后一条已确认请求的重复。
+
+Kafka bridge 会关闭自动 commit 与自动 offset storage，并只在 Rustium 持久确认后提交输入 topic/partition offset。该模式支持外部 Kafka Connect/Debezium Server，也用于 Debezium Cassandra，因为 Cassandra connector 是部署在每个节点上的独立 producer，而不是 Kafka Connect Source。以 `^` 开头的 topic 使用 librdkafka regex subscription，可覆盖 Cassandra 的逐表 topic。
+
+原生 YAML 的 `source.type` 可取 `mariadb`、`db2`、`cassandra`、`vitess`、`spanner`、`informix`、`cockroachdb` 或 `yashandb`。`source.properties` 原样接受对应 Debezium connector 参数；`source.bridge.type` 为 `http` 或 `kafka`。Managed HTTP 模式通过 `source.command` 指定启动程序，`command_args` 支持 `{config}` 与 `{endpoint}` placeholder；`offset_file` 与 `schema_history_file` 是稳定的 Debezium 侧恢复文件，默认位于 Rustium 工作目录。外部 HTTP 模式省略 `command`，将 Debezium HTTP sink 指向日志中的 Rustium endpoint。非 loopback endpoint 应放在私有网络或带认证的反向代理后。
+
+Bridge checkpoint 完整保存数据库特有的 `source` object、稳定 record ID、event serial 与 snapshot marker。原生 JSON 在 `position` 中暴露完整结构；Debezium JSON、JSON Schema、Avro 与 Protobuf 通过 `source.source_offset`、`record_id` 和 `event_serial_no` 无损携带。snapshot-last、transaction-end、heartbeat、schema change、typed before/after row 与 tombstone 都进入 Rustium 的正常持久性流水线。
+
+配置示例：[MariaDB](examples/mariadb.yaml)、[Db2](examples/db2.yaml)、[Cassandra](examples/cassandra.yaml)、[Vitess](examples/vitess.yaml)、[Spanner](examples/spanner.yaml)、[Informix](examples/informix.yaml)、[CockroachDB](examples/cockroachdb.yaml)、[YashanDB](examples/yashandb.yaml)。
 
 ### 格式与 Sink
 

@@ -3552,6 +3552,7 @@ dependencies = [
  "clap",
  "rustium-config",
  "rustium-core",
+ "rustium-debezium",
  "rustium-format-avro",
  "rustium-format-json",
  "rustium-format-protobuf",
@@ -3614,6 +3615,26 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rustium-debezium"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "hex",
+ "rdkafka",
+ "rustium-config",
+ "rustium-core",
+ "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-util",
  "tracing",

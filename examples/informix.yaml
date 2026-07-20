@@ -1,0 +1,28 @@
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: informix-cdc
+source:
+  type: informix
+  bridge:
+    type: http
+    listen: 127.0.0.1:18080
+    path: /events
+  command: ${DEBEZIUM_SERVER}
+  properties:
+    connector.class: io.debezium.connector.informix.InformixConnector
+    topic.prefix: inventory
+    database.hostname: ${INFORMIX_HOST}
+    database.port: "9088"
+    database.user: ${INFORMIX_USER}
+    database.password: ${INFORMIX_PASSWORD}
+    database.dbname: inventory
+    table.include.list: inventory.informix.customers
+    snapshot.mode: initial
+format:
+  kind: debezium_json
+sink:
+  type: stdout
+  topic_prefix: inventory
+state:
+  path: /var/lib/rustium/informix.db

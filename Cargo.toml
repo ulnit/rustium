@@ -5,6 +5,7 @@ members = [
     "crates/rustium-column-transform",
     "crates/rustium-config",
     "crates/rustium-core",
+    "crates/rustium-debezium",
     "crates/rustium-format-avro",
     "crates/rustium-format-json",
     "crates/rustium-format-protobuf",
@@ -60,6 +61,7 @@ rusqlite = { version = "0.37.0", features = ["bundled"] }
 rustium-config = { version = "0.1.0-alpha.1", path = "crates/rustium-config" }
 rustium-column-transform = { version = "0.1.0-alpha.1", path = "crates/rustium-column-transform" }
 rustium-core = { version = "0.1.0-alpha.1", path = "crates/rustium-core" }
+rustium-debezium = { version = "0.1.0-alpha.1", path = "crates/rustium-debezium" }
 rustium-format-avro = { version = "0.1.0-alpha.1", path = "crates/rustium-format-avro" }
 rustium-format-json = { version = "0.1.0-alpha.1", path = "crates/rustium-format-json" }
 rustium-format-protobuf = { version = "0.1.0-alpha.1", path = "crates/rustium-format-protobuf" }

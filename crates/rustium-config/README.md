@@ -1,6 +1,6 @@
 # rustium-config
 
-Versioned Rustium configuration models, validation, environment interpolation, semantic fingerprints, and Debezium-compatible `.properties` parsing for PostgreSQL, MySQL, SQL Server, sinks, formats, and runtime settings.
+Versioned Rustium configuration models, validation, environment interpolation, semantic fingerprints, and Debezium-compatible `.properties` parsing for all Rustium database sources, sinks, formats, and runtime settings.
 
 Use this crate when an embedded Rustium application needs the same strict configuration contract as the CLI. See the [project README](https://github.com/ulnit/rustium/blob/main/README.md).
 
@@ -34,9 +34,11 @@ PostgreSQL Debezium properties enable logical decoding messages by default and m
 
 PostgreSQL, MySQL, and SQL Server column transformations map Debezium's `column.truncate.to.<length>.chars`, `column.mask.with.<length>.chars`, `column.mask.hash.<algorithm>.with.salt.<salt>`, and `column.mask.hash.v2.<algorithm>.with.salt.<salt>` properties to native `source.column_transformations`. Selectors are anchored and case-insensitive: PostgreSQL uses `schema.table.column`, MySQL uses `database.table.column`, and SQL Server accepts both `database.schema.table.column` and `schema.table.column`. Category priority is truncate, fixed mask, hash V1, then hash V2. Hash salts are validated as non-empty and are represented in semantic fingerprints only by SHA-256 digest.
 
+MariaDB, Db2, Cassandra, Vitess, Spanner, Informix, CockroachDB, and YashanDB map to `DebeziumSourceConfig`. Connector properties remain under `source.properties`; secrets and command environment values are excluded from semantic fingerprints. HTTP and Kafka bridge transports reserve their durability settings so user pass-through properties cannot enable automatic acknowledgement.
+
 ## 简体中文
 
-Rustium 的版本化配置模型、校验、环境变量插值、语义指纹，以及 PostgreSQL、MySQL、SQL Server、sink、格式和 runtime 的 Debezium 兼容 `.properties` 解析。
+Rustium 的版本化配置模型、校验、环境变量插值、语义指纹，以及全部 Rustium 数据库 Source、Sink、格式和 runtime 的 Debezium 兼容 `.properties` 解析。
 
 嵌入 Rustium 的应用需要与 CLI 相同的严格配置契约时使用此 crate。详见[项目 README](https://github.com/ulnit/rustium/blob/main/README.md)。
 
@@ -69,3 +71,5 @@ PostgreSQL `schema.refresh.mode` 映射为原生 `source.schema_refresh_mode`，
 PostgreSQL Debezium properties 默认启用 logical decoding message，并把 `message.prefix.include.list` / `message.prefix.exclude.list` 映射为 anchored 原生过滤器。原生 `source.logical_decoding_messages` 默认为 false；启用捕获或增加过滤器都会进入 fingerprint。
 
 PostgreSQL、MySQL 和 SQL Server 列转换把 Debezium 的 `column.truncate.to.<length>.chars`、`column.mask.with.<length>.chars`、`column.mask.hash.<algorithm>.with.salt.<salt>` 和 `column.mask.hash.v2.<algorithm>.with.salt.<salt>` 映射为原生 `source.column_transformations`。Selector 都是 anchored、大小写不敏感正则：PostgreSQL 使用 `schema.table.column`，MySQL 使用 `database.table.column`，SQL Server 同时接受 `database.schema.table.column` 和 `schema.table.column`。类别优先级为 truncate、固定 mask、hash V1、hash V2。Hash salt 必须非空，并且在 semantic fingerprint 中只保存 SHA-256 digest。
+
+MariaDB、Db2、Cassandra、Vitess、Spanner、Informix、CockroachDB 和 YashanDB 映射为 `DebeziumSourceConfig`。Connector 参数保留在 `source.properties`，secret 与 command environment value 不进入语义 fingerprint。HTTP/Kafka bridge 的持久性参数由 Rustium 保留，透传参数不能开启自动确认。

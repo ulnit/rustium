@@ -659,7 +659,8 @@ impl SourceConnector for PostgresSource {
                 SourcePosition::MySql(_)
                 | SourcePosition::SqlServer(_)
                 | SourcePosition::Oracle(_)
-                | SourcePosition::MongoDb(_) => {
+                | SourcePosition::MongoDb(_)
+                | SourcePosition::Debezium(_) => {
                     return Err(Error::State(
                         "PostgreSQL connector cannot resume from a non-PostgreSQL checkpoint"
                             .into(),
@@ -749,7 +750,8 @@ impl SourceConnector for PostgresSource {
                 SourcePosition::MySql(_)
                 | SourcePosition::SqlServer(_)
                 | SourcePosition::Oracle(_)
-                | SourcePosition::MongoDb(_) => {
+                | SourcePosition::MongoDb(_)
+                | SourcePosition::Debezium(_) => {
                     return Err(Error::State(
                         "PostgreSQL connector cannot resume from a non-PostgreSQL checkpoint"
                             .into(),

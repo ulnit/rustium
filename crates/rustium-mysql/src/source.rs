@@ -2321,7 +2321,8 @@ fn binlog_coordinates_from_position(position: &SourcePosition) -> Option<BinlogC
         SourcePosition::Postgres(_)
         | SourcePosition::SqlServer(_)
         | SourcePosition::Oracle(_)
-        | SourcePosition::MongoDb(_) => None,
+        | SourcePosition::MongoDb(_)
+        | SourcePosition::Debezium(_) => None,
     }
 }
 

@@ -1,0 +1,29 @@
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: yashandb-cdc
+source:
+  type: yashandb
+  bridge:
+    type: http
+    listen: 127.0.0.1:18080
+    path: /events
+  command: ${DEBEZIUM_SERVER}
+  properties:
+    connector.class: io.debezium.connector.yashandb.YashanDbConnector
+    topic.prefix: server1
+    database.hostname: ${YASHANDB_HOST}
+    database.port: "1688"
+    database.user: ${YASHANDB_USER}
+    database.password: ${YASHANDB_PASSWORD}
+    database.dbname: inventory
+    database.ystream.server.name: server1
+    schema.history.internal.kafka.bootstrap.servers: ${KAFKA_BOOTSTRAP_SERVERS}
+    schema.history.internal.kafka.topic: schema-changes.inventory
+format:
+  kind: debezium_json
+sink:
+  type: stdout
+  topic_prefix: server1
+state:
+  path: /var/lib/rustium/yashandb.db

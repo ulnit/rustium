@@ -6,6 +6,7 @@ use rustium_core::{
     CheckpointStore, ConnectorIdentity, ConnectorRuntime, EventEncoder, Result, RuntimeConfig,
     RuntimeStatus, Sink, SourceConnector,
 };
+use rustium_debezium::DebeziumSource;
 use rustium_format_avro::{AvroEncoderConfig, DebeziumAvroEncoder};
 use rustium_format_json::{
     DebeziumJsonEncoder, DebeziumJsonSchemaEncoder, JsonEncoderConfig, RustiumJsonEncoder,
@@ -309,6 +310,78 @@ fn build_source(config: &Config) -> Result<Box<dyn SourceConnector>> {
             )
             .with_retry_policy(config.runtime.retry_policy()),
         )),
+        SourceConfig::Mariadb(source) => Ok(Box::new(
+            DebeziumSource::new(
+                &config.metadata.name,
+                rustium_config::DebeziumConnectorKind::Mariadb,
+                source.clone(),
+                config.snapshot.clone(),
+            )
+            .with_retry_policy(config.runtime.retry_policy()),
+        )),
+        SourceConfig::Db2(source) => Ok(Box::new(
+            DebeziumSource::new(
+                &config.metadata.name,
+                rustium_config::DebeziumConnectorKind::Db2,
+                source.clone(),
+                config.snapshot.clone(),
+            )
+            .with_retry_policy(config.runtime.retry_policy()),
+        )),
+        SourceConfig::Cassandra(source) => Ok(Box::new(
+            DebeziumSource::new(
+                &config.metadata.name,
+                rustium_config::DebeziumConnectorKind::Cassandra,
+                source.clone(),
+                config.snapshot.clone(),
+            )
+            .with_retry_policy(config.runtime.retry_policy()),
+        )),
+        SourceConfig::Vitess(source) => Ok(Box::new(
+            DebeziumSource::new(
+                &config.metadata.name,
+                rustium_config::DebeziumConnectorKind::Vitess,
+                source.clone(),
+                config.snapshot.clone(),
+            )
+            .with_retry_policy(config.runtime.retry_policy()),
+        )),
+        SourceConfig::Spanner(source) => Ok(Box::new(
+            DebeziumSource::new(
+                &config.metadata.name,
+                rustium_config::DebeziumConnectorKind::Spanner,
+                source.clone(),
+                config.snapshot.clone(),
+            )
+            .with_retry_policy(config.runtime.retry_policy()),
+        )),
+        SourceConfig::Informix(source) => Ok(Box::new(
+            DebeziumSource::new(
+                &config.metadata.name,
+                rustium_config::DebeziumConnectorKind::Informix,
+                source.clone(),
+                config.snapshot.clone(),
+            )
+            .with_retry_policy(config.runtime.retry_policy()),
+        )),
+        SourceConfig::Cockroachdb(source) => Ok(Box::new(
+            DebeziumSource::new(
+                &config.metadata.name,
+                rustium_config::DebeziumConnectorKind::CockroachDb,
+                source.clone(),
+                config.snapshot.clone(),
+            )
+            .with_retry_policy(config.runtime.retry_policy()),
+        )),
+        SourceConfig::Yashandb(source) => Ok(Box::new(
+            DebeziumSource::new(
+                &config.metadata.name,
+                rustium_config::DebeziumConnectorKind::YashanDb,
+                source.clone(),
+                config.snapshot.clone(),
+            )
+            .with_retry_policy(config.runtime.retry_policy()),
+        )),
     }
 }
 
@@ -331,6 +404,17 @@ fn build_encoder(config: &Config) -> Result<Arc<dyn EventEncoder>> {
             source.heartbeat_topic_name.clone(),
         ),
         SourceConfig::Mongodb(source) => (
+            source.heartbeat_topics_prefix.clone(),
+            source.heartbeat_topic_name.clone(),
+        ),
+        SourceConfig::Mariadb(source)
+        | SourceConfig::Db2(source)
+        | SourceConfig::Cassandra(source)
+        | SourceConfig::Vitess(source)
+        | SourceConfig::Spanner(source)
+        | SourceConfig::Informix(source)
+        | SourceConfig::Cockroachdb(source)
+        | SourceConfig::Yashandb(source) => (
             source.heartbeat_topics_prefix.clone(),
             source.heartbeat_topic_name.clone(),
         ),

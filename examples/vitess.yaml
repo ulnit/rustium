@@ -1,0 +1,27 @@
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: vitess-cdc
+source:
+  type: vitess
+  bridge:
+    type: http
+    listen: 127.0.0.1:18080
+    path: /events
+  command: ${DEBEZIUM_SERVER}
+  properties:
+    connector.class: io.debezium.connector.vitess.VitessConnector
+    topic.prefix: commerce
+    database.hostname: ${VTGATE_HOST}
+    database.port: "15991"
+    database.user: ${VITESS_USER}
+    database.password: ${VITESS_PASSWORD}
+    vitess.keyspace: commerce
+    vitess.tablet.type: MASTER
+format:
+  kind: debezium_json
+sink:
+  type: stdout
+  topic_prefix: commerce
+state:
+  path: /var/lib/rustium/vitess.db

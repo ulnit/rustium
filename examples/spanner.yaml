@@ -1,0 +1,26 @@
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: spanner-cdc
+source:
+  type: spanner
+  bridge:
+    type: http
+    listen: 127.0.0.1:18080
+    path: /events
+  command: ${DEBEZIUM_SERVER}
+  properties:
+    connector.class: io.debezium.connector.spanner.SpannerConnector
+    topic.prefix: spanner
+    gcp.spanner.change.stream: changeStreamAll
+    gcp.spanner.project.id: ${SPANNER_PROJECT}
+    gcp.spanner.instance.id: ${SPANNER_INSTANCE}
+    gcp.spanner.database.id: ${SPANNER_DATABASE}
+    gcp.spanner.credentials.json: ${SPANNER_CREDENTIALS_JSON}
+format:
+  kind: debezium_json
+sink:
+  type: stdout
+  topic_prefix: spanner
+state:
+  path: /var/lib/rustium/spanner.db

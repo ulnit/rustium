@@ -40,7 +40,7 @@ Alert on:
 Back up the checkpoint before every binary/configuration upgrade, source reset, or retention operation.
 
 1. Stop Rustium gracefully and confirm the process has exited.
-2. On a filesystem deployment, run `PRAGMA integrity_check;` and `PRAGMA wal_checkpoint(TRUNCATE);` with the `sqlite3` tool, then copy the database file to protected storage. Preserve the original file, its permissions, and the connector configuration together.
+2. On a filesystem deployment, run `PRAGMA integrity_check;` and `PRAGMA wal_checkpoint(TRUNCATE);` with the `sqlite3` tool, then copy the database file to protected storage. For a managed Debezium bridge, include `offset_file` and `schema_history_file` in the same atomic backup. Preserve the original files, permissions, and connector configuration together.
 3. On Kubernetes, prefer a CSI `VolumeSnapshot` of the retained PVC while the Pod is stopped. Record the image digest, chart values, Secret resource version, source position, and slot/binlog/CDC identifiers beside the snapshot.
 4. Encrypt backups, restrict access to the connector operators, and test a restore on an isolated path before relying on it.
 
@@ -59,6 +59,10 @@ Check `log_bin`, `binlog_format=ROW`, `binlog_row_image=FULL`, GTID mode, the ex
 #### SQL Server
 
 Check database and table CDC enablement, capture instances, SQL Agent, CDC cleanup retention, and the maximum available LSN. Rustium fails closed when a checkpoint is older than retained change rows. Preserve capture-instance names during restart. If retention has removed the required LSN, back up state, reset, and perform a new snapshot.
+
+#### Debezium bridge sources
+
+Keep the Rustium SQLite checkpoint, managed Debezium `offset_file`, and `schema_history_file` on the same durable volume and back them up as one recovery set. Do not reuse those files for another connector name. For HTTP mode, confirm the upstream sink uses unbatched JSON and does not bypass the private/authenticated Rustium endpoint. For Kafka mode, preserve the consumer group, topic partition count, and input retention; automatic commit must remain disabled. Cassandra requires a healthy standalone connector on every node and enough `cdc_raw` capacity. A lost upstream offset/history file can replay more than the final Rustium checkpoint; deterministic event IDs remain stable, but operators must deduplicate downstream or take a controlled new snapshot.
 
 ### 6. Checkpoint reset and data-loss prevention
 
@@ -114,7 +118,7 @@ Before changing state, collect the sanitized status JSON, metrics, image digest,
 每次 binary/config 升级、Source reset 或 retention 操作前都要备份 checkpoint。
 
 1. 优雅停止 Rustium，确认进程已退出。
-2. 文件系统部署使用 `sqlite3` 执行 `PRAGMA integrity_check;` 和 `PRAGMA wal_checkpoint(TRUNCATE);`，再把数据库文件复制到受保护存储，并一起保存原文件权限和 connector 配置。
+2. 文件系统部署使用 `sqlite3` 执行 `PRAGMA integrity_check;` 和 `PRAGMA wal_checkpoint(TRUNCATE);`，再把数据库文件复制到受保护存储。Managed Debezium bridge 还必须把 `offset_file` 与 `schema_history_file` 纳入同一原子备份，并一起保存原文件权限和 connector 配置。
 3. Kubernetes 优先在 Pod 停止时对保留 PVC 创建 CSI `VolumeSnapshot`。同时记录 image digest、Chart values、Secret resource version、源位点和 slot/binlog/CDC 标识。
 4. 加密备份，只允许 connector 运维人员访问，并在隔离路径测试 restore。
 
@@ -133,6 +137,10 @@ Before changing state, collect the sanitized status JSON, metrics, image digest,
 #### SQL Server
 
 检查数据库与表 CDC、capture instance、SQL Agent、CDC cleanup retention 和可用最大 LSN。checkpoint 早于保留 change rows 时 Rustium 会 fail-closed。重启时保持 capture-instance 名称；retention 已删除所需 LSN 时先备份、reset 并执行新 snapshot。
+
+#### Debezium bridge Source
+
+Rustium SQLite checkpoint、managed Debezium `offset_file` 与 `schema_history_file` 必须放在同一持久卷，并作为一个恢复集备份；不得给其他 connector name 复用。HTTP 模式要确认 upstream sink 使用 unbatched JSON，且不会绕过私有或已认证 Rustium endpoint。Kafka 模式要保持 consumer group、topic partition 数与输入 retention，自动 commit 必须保持关闭。Cassandra 要求每个节点的 standalone connector 健康且 `cdc_raw` 容量充足。Upstream offset/history 文件丢失可能重放多于最后一个 Rustium checkpoint 的事件；确定性 event ID 保持稳定，但运维方必须在下游去重或执行受控新 snapshot。
 
 ### 6. Checkpoint reset 与防止数据丢失
 

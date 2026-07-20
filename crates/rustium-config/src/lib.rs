@@ -150,6 +150,14 @@ pub enum SourceConfig {
     Sqlserver(SqlServerSourceConfig),
     Oracle(OracleSourceConfig),
     Mongodb(MongoDbSourceConfig),
+    Mariadb(DebeziumSourceConfig),
+    Db2(DebeziumSourceConfig),
+    Cassandra(DebeziumSourceConfig),
+    Vitess(DebeziumSourceConfig),
+    Spanner(DebeziumSourceConfig),
+    Informix(DebeziumSourceConfig),
+    Cockroachdb(DebeziumSourceConfig),
+    Yashandb(DebeziumSourceConfig),
 }
 
 impl SourceConfig {
@@ -160,6 +168,14 @@ impl SourceConfig {
             Self::Sqlserver(config) => config.validate(),
             Self::Oracle(config) => config.validate(),
             Self::Mongodb(config) => config.validate(),
+            Self::Mariadb(config) => config.validate(DebeziumConnectorKind::Mariadb),
+            Self::Db2(config) => config.validate(DebeziumConnectorKind::Db2),
+            Self::Cassandra(config) => config.validate(DebeziumConnectorKind::Cassandra),
+            Self::Vitess(config) => config.validate(DebeziumConnectorKind::Vitess),
+            Self::Spanner(config) => config.validate(DebeziumConnectorKind::Spanner),
+            Self::Informix(config) => config.validate(DebeziumConnectorKind::Informix),
+            Self::Cockroachdb(config) => config.validate(DebeziumConnectorKind::CockroachDb),
+            Self::Yashandb(config) => config.validate(DebeziumConnectorKind::YashanDb),
         }
     }
 
@@ -199,6 +215,21 @@ impl SourceConfig {
     pub fn as_mongodb(&self) -> Option<&MongoDbSourceConfig> {
         match self {
             Self::Mongodb(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_debezium(&self) -> Option<(DebeziumConnectorKind, &DebeziumSourceConfig)> {
+        match self {
+            Self::Mariadb(config) => Some((DebeziumConnectorKind::Mariadb, config)),
+            Self::Db2(config) => Some((DebeziumConnectorKind::Db2, config)),
+            Self::Cassandra(config) => Some((DebeziumConnectorKind::Cassandra, config)),
+            Self::Vitess(config) => Some((DebeziumConnectorKind::Vitess, config)),
+            Self::Spanner(config) => Some((DebeziumConnectorKind::Spanner, config)),
+            Self::Informix(config) => Some((DebeziumConnectorKind::Informix, config)),
+            Self::Cockroachdb(config) => Some((DebeziumConnectorKind::CockroachDb, config)),
+            Self::Yashandb(config) => Some((DebeziumConnectorKind::YashanDb, config)),
             _ => None,
         }
     }
@@ -546,6 +577,14 @@ impl SourceConfig {
                 );
                 semantic
             }
+            Self::Mariadb(config) => config.semantic_config(DebeziumConnectorKind::Mariadb),
+            Self::Db2(config) => config.semantic_config(DebeziumConnectorKind::Db2),
+            Self::Cassandra(config) => config.semantic_config(DebeziumConnectorKind::Cassandra),
+            Self::Vitess(config) => config.semantic_config(DebeziumConnectorKind::Vitess),
+            Self::Spanner(config) => config.semantic_config(DebeziumConnectorKind::Spanner),
+            Self::Informix(config) => config.semantic_config(DebeziumConnectorKind::Informix),
+            Self::Cockroachdb(config) => config.semantic_config(DebeziumConnectorKind::CockroachDb),
+            Self::Yashandb(config) => config.semantic_config(DebeziumConnectorKind::YashanDb),
         }
     }
 }
@@ -1648,6 +1687,340 @@ impl MongoDbSourceConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DebeziumConnectorKind {
+    Mariadb,
+    Db2,
+    Cassandra,
+    Vitess,
+    Spanner,
+    Informix,
+    CockroachDb,
+    YashanDb,
+}
+
+impl DebeziumConnectorKind {
+    #[must_use]
+    pub const fn source_type(self) -> &'static str {
+        match self {
+            Self::Mariadb => "mariadb",
+            Self::Db2 => "db2",
+            Self::Cassandra => "cassandra",
+            Self::Vitess => "vitess",
+            Self::Spanner => "spanner",
+            Self::Informix => "informix",
+            Self::CockroachDb => "cockroachdb",
+            Self::YashanDb => "yashandb",
+        }
+    }
+
+    #[must_use]
+    pub const fn connector_class(self) -> Option<&'static str> {
+        match self {
+            Self::Mariadb => Some("io.debezium.connector.mariadb.MariaDbConnector"),
+            Self::Db2 => Some("io.debezium.connector.db2.Db2Connector"),
+            // Cassandra is a standalone per-node process rather than a Kafka Connect source.
+            Self::Cassandra => None,
+            Self::Vitess => Some("io.debezium.connector.vitess.VitessConnector"),
+            Self::Spanner => Some("io.debezium.connector.spanner.SpannerConnector"),
+            Self::Informix => Some("io.debezium.connector.informix.InformixConnector"),
+            Self::CockroachDb => Some("io.debezium.connector.cockroachdb.CockroachDBConnector"),
+            Self::YashanDb => Some("io.debezium.connector.yashandb.YashanDbConnector"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebeziumSourceConfig {
+    #[serde(default)]
+    pub bridge: DebeziumBridgeConfig,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub command_args: Vec<String>,
+    #[serde(default)]
+    pub command_environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub properties: BTreeMap<String, String>,
+    #[serde(default = "default_debezium_offset_file")]
+    pub offset_file: String,
+    #[serde(default = "default_debezium_schema_history_file")]
+    pub schema_history_file: String,
+    #[serde(default = "default_heartbeat_topics_prefix")]
+    pub heartbeat_topics_prefix: String,
+    #[serde(default)]
+    pub heartbeat_topic_name: Option<String>,
+}
+
+impl DebeziumSourceConfig {
+    fn validate(&self, kind: DebeziumConnectorKind) -> Result<()> {
+        if self
+            .command
+            .as_deref()
+            .is_some_and(|command| command.trim().is_empty())
+        {
+            return Err(Error::Configuration(
+                "source.command must not be blank when configured".into(),
+            ));
+        }
+        if self.command.is_some()
+            && (self.offset_file.trim().is_empty() || self.schema_history_file.trim().is_empty())
+        {
+            return Err(Error::Configuration(
+                "managed Debezium offset_file and schema_history_file must not be blank".into(),
+            ));
+        }
+        if matches!(self.bridge, DebeziumBridgeConfig::Kafka { .. }) && self.command.is_some() {
+            return Err(Error::Configuration(
+                "managed Debezium command execution currently requires bridge.type=http; run Kafka-producing connectors externally"
+                    .into(),
+            ));
+        }
+        if self.command.is_some()
+            && matches!(
+                self.bridge,
+                DebeziumBridgeConfig::Http {
+                    authentication_token: Some(_),
+                    ..
+                }
+            )
+        {
+            return Err(Error::Configuration(
+                "managed Debezium HTTP mode does not support authentication_token; keep the default loopback listener or run Debezium behind an authenticated proxy"
+                    .into(),
+            ));
+        }
+        if self.command.is_some()
+            && self
+                .properties
+                .get("topic.prefix")
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(Error::Configuration(
+                "managed Debezium execution requires source.properties.topic.prefix".into(),
+            ));
+        }
+        if kind == DebeziumConnectorKind::Cassandra && self.command.is_some() {
+            return Err(Error::Configuration(
+                "the Debezium Cassandra connector is a standalone per-node process; run it externally and use bridge.type=kafka"
+                    .into(),
+            ));
+        }
+        if let Some(configured) = self.properties.get("connector.class")
+            && kind
+                .connector_class()
+                .is_some_and(|expected| configured != expected)
+        {
+            return Err(Error::Configuration(format!(
+                "source.properties connector.class {configured:?} does not match source.type={} ({:?})",
+                kind.source_type(),
+                kind.connector_class().unwrap_or_default()
+            )));
+        }
+        if self.properties.keys().any(|key| {
+            key.starts_with("debezium.sink.")
+                || key.starts_with("rustium.")
+                || key.starts_with("debezium.format.")
+        }) {
+            return Err(Error::Configuration(
+                "source.properties accepts Debezium connector properties only; bridge sink, format, and rustium.* properties are owned by Rustium"
+                    .into(),
+            ));
+        }
+        self.bridge.validate()?;
+        validate_heartbeat(
+            &self.heartbeat_topics_prefix,
+            self.heartbeat_topic_name.as_deref(),
+            None,
+        )
+    }
+
+    fn semantic_config(&self, kind: DebeziumConnectorKind) -> serde_json::Value {
+        serde_json::json!({
+            "type": kind.source_type(),
+            "bridge": self.bridge.semantic_config(),
+            "command": self.command,
+            "command_args": self.command_args,
+            "command_environment_keys": self.command_environment.keys().collect::<Vec<_>>(),
+            "properties": redacted_properties(&self.properties),
+            "offset_file": self.offset_file,
+            "schema_history_file": self.schema_history_file,
+            "heartbeat_topics_prefix": self.heartbeat_topics_prefix,
+            "heartbeat_topic_name": self.heartbeat_topic_name,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DebeziumBridgeConfig {
+    Http {
+        #[serde(default = "default_debezium_bridge_listen")]
+        listen: String,
+        #[serde(default = "default_debezium_bridge_path")]
+        path: String,
+        #[serde(default)]
+        authentication_token: Option<String>,
+        #[serde(default = "default_debezium_bridge_request_timeout")]
+        #[serde(with = "humantime_serde")]
+        request_timeout: Duration,
+        #[serde(default = "default_debezium_bridge_max_body_size")]
+        max_body_size: usize,
+    },
+    Kafka {
+        bootstrap_servers: Vec<String>,
+        topics: Vec<String>,
+        #[serde(default = "default_debezium_bridge_group_id")]
+        group_id: String,
+        #[serde(default)]
+        consumer_properties: BTreeMap<String, String>,
+        #[serde(default = "default_debezium_bridge_request_timeout")]
+        #[serde(with = "humantime_serde")]
+        poll_timeout: Duration,
+    },
+}
+
+impl Default for DebeziumBridgeConfig {
+    fn default() -> Self {
+        Self::Http {
+            listen: default_debezium_bridge_listen(),
+            path: default_debezium_bridge_path(),
+            authentication_token: None,
+            request_timeout: default_debezium_bridge_request_timeout(),
+            max_body_size: default_debezium_bridge_max_body_size(),
+        }
+    }
+}
+
+impl DebeziumBridgeConfig {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Http {
+                listen,
+                path,
+                authentication_token,
+                request_timeout,
+                max_body_size,
+            } => {
+                listen.parse::<std::net::SocketAddr>().map_err(|error| {
+                    Error::Configuration(format!(
+                        "source.bridge.listen must be a socket address: {error}"
+                    ))
+                })?;
+                if !path.starts_with('/') || path.contains(['?', '#']) {
+                    return Err(Error::Configuration(
+                        "source.bridge.path must be an absolute HTTP path without a query or fragment"
+                            .into(),
+                    ));
+                }
+                if authentication_token
+                    .as_deref()
+                    .is_some_and(|token| token.trim().is_empty())
+                {
+                    return Err(Error::Configuration(
+                        "source.bridge.authentication_token must not be blank".into(),
+                    ));
+                }
+                if request_timeout.is_zero() || *max_body_size == 0 {
+                    return Err(Error::Configuration(
+                        "source.bridge request_timeout and max_body_size must be greater than zero"
+                            .into(),
+                    ));
+                }
+            }
+            Self::Kafka {
+                bootstrap_servers,
+                topics,
+                group_id,
+                consumer_properties,
+                poll_timeout,
+            } => {
+                if bootstrap_servers.is_empty()
+                    || bootstrap_servers
+                        .iter()
+                        .any(|server| server.trim().is_empty())
+                    || topics.is_empty()
+                    || topics.iter().any(|topic| topic.trim().is_empty())
+                    || group_id.trim().is_empty()
+                    || poll_timeout.is_zero()
+                {
+                    return Err(Error::Configuration(
+                        "source.bridge Kafka bootstrap_servers, topics, group_id, and poll_timeout must be non-empty"
+                            .into(),
+                    ));
+                }
+                for protected in ["group.id", "enable.auto.commit", "enable.auto.offset.store"] {
+                    if consumer_properties.contains_key(protected) {
+                        return Err(Error::Configuration(format!(
+                            "source.bridge.consumer_properties.{protected} is owned by Rustium"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn semantic_config(&self) -> serde_json::Value {
+        match self {
+            Self::Http {
+                listen,
+                path,
+                request_timeout,
+                max_body_size,
+                ..
+            } => serde_json::json!({
+                "type": "http",
+                "listen": listen,
+                "path": path,
+                "request_timeout_ms": request_timeout.as_millis(),
+                "max_body_size": max_body_size,
+            }),
+            Self::Kafka {
+                bootstrap_servers,
+                topics,
+                group_id,
+                consumer_properties,
+                poll_timeout,
+            } => {
+                serde_json::json!({
+                    "type": "kafka",
+                    "bootstrap_servers": bootstrap_servers,
+                    "topics": topics,
+                    "group_id": group_id,
+                    "consumer_properties": redacted_properties(consumer_properties),
+                    "poll_timeout_ms": poll_timeout.as_millis(),
+                })
+            }
+        }
+    }
+}
+
+fn redacted_properties(
+    properties: &BTreeMap<String, String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    properties
+        .iter()
+        .map(|(key, value)| {
+            let value = if sensitive_property(key) {
+                serde_json::Value::Null
+            } else {
+                value.clone().into()
+            };
+            (key.clone(), value)
+        })
+        .collect()
+}
+
+fn sensitive_property(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["password", "secret", "token", "credential", "private.key"]
+        .iter()
+        .any(|marker| key.contains(marker))
+}
+
 fn validate_sqlserver_signal_collection(collection: &str, database: &str) -> Result<()> {
     let parts = collection.split('.').collect::<Vec<_>>();
     let (schema, table) = match parts.as_slice() {
@@ -2649,6 +3022,27 @@ const fn default_errors_retry_delay_max() -> Duration {
 }
 fn default_bind() -> String {
     "127.0.0.1:8080".into()
+}
+fn default_debezium_bridge_listen() -> String {
+    "127.0.0.1:18080".into()
+}
+fn default_debezium_bridge_path() -> String {
+    "/events".into()
+}
+const fn default_debezium_bridge_request_timeout() -> Duration {
+    Duration::from_secs(60)
+}
+const fn default_debezium_bridge_max_body_size() -> usize {
+    16 * 1024 * 1024
+}
+fn default_debezium_bridge_group_id() -> String {
+    "rustium-debezium-bridge".into()
+}
+fn default_debezium_offset_file() -> String {
+    "rustium-debezium.offsets".into()
+}
+fn default_debezium_schema_history_file() -> String {
+    "rustium-debezium-schema-history.dat".into()
 }
 fn default_log_level() -> String {
     "info".into()
@@ -3850,5 +4244,44 @@ sink:
         assert!(source.read_only);
         assert!(default.source.semantic_config().get("heartbeat").is_none());
         assert_ne!(default.fingerprint(), config.fingerprint());
+    }
+
+    #[test]
+    fn parses_native_debezium_bridge_and_excludes_secrets_from_fingerprint() {
+        let raw = r#"
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: db2-bridge
+source:
+  type: db2
+  bridge:
+    type: http
+    listen: 127.0.0.1:18080
+    path: /events
+  properties:
+    connector.class: io.debezium.connector.db2.Db2Connector
+    topic.prefix: inventory
+    database.hostname: db2
+    database.password: secret-one
+sink:
+  type: stdout
+  topic_prefix: inventory
+"#;
+        let config = Config::from_yaml(raw).unwrap();
+        let (kind, source) = config.source.as_debezium().unwrap();
+        assert_eq!(kind, DebeziumConnectorKind::Db2);
+        assert_eq!(source.properties["database.hostname"], "db2");
+        let rotated = Config::from_yaml(&raw.replace("secret-one", "secret-two")).unwrap();
+        assert_eq!(config.fingerprint(), rotated.fingerprint());
+
+        let kafka = raw.replace(
+            "    type: http\n    listen: 127.0.0.1:18080\n    path: /events",
+            "    type: kafka\n    bootstrap_servers: [kafka:9092]\n    topics: [inventory.DB2INST1.CUSTOMERS]\n    group_id: rustium-db2\n    consumer_properties:\n      security.protocol: SASL_SSL\n      sasl.username: rustium\n      sasl.password: kafka-secret-one",
+        );
+        let kafka_config = Config::from_yaml(&kafka).unwrap();
+        let kafka_rotated =
+            Config::from_yaml(&kafka.replace("kafka-secret-one", "kafka-secret-two")).unwrap();
+        assert_eq!(kafka_config.fingerprint(), kafka_rotated.fingerprint());
     }
 }

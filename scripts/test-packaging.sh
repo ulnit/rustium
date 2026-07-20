@@ -25,6 +25,7 @@ for package in \
   rustium-column-transform \
   rustium-config \
   rustium-core \
+  rustium-debezium \
   rustium-format-avro \
   rustium-format-json \
   rustium-format-protobuf \
