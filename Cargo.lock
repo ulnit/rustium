@@ -3547,7 +3547,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-cdc"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "clap",
  "rustium-config",
@@ -3574,7 +3574,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-column-transform"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "md-5 0.10.6",
  "md2",
@@ -3588,7 +3588,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-config"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "humantime-serde",
  "regex",
@@ -3603,7 +3603,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-core"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3623,7 +3623,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-debezium"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -3643,7 +3643,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-format-avro"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "apache-avro",
  "bytes",
@@ -3656,7 +3656,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-format-json"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3668,7 +3668,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-format-protobuf"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bytes",
  "chrono",
@@ -3684,7 +3684,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-mongodb"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3700,7 +3700,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-mysql"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3728,7 +3728,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-oracle"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3743,7 +3743,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-postgresql"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "bigdecimal",
@@ -3768,7 +3768,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-server"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "axum",
  "chrono",
@@ -3783,7 +3783,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-signal-kafka"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "rdkafka",
  "rustium-core",
@@ -3796,7 +3796,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-sink-kafka"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "apache-avro",
  "async-trait",
@@ -3819,7 +3819,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-sink-stdout"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "rustium-core",
@@ -3828,7 +3828,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-sqlserver"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3853,7 +3853,7 @@ dependencies = [
 
 [[package]]
 name = "rustium-state"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "rusqlite",

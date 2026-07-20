@@ -81,7 +81,7 @@ The workspace contains a runnable alpha service.
 | CLI and HTTP management | Implemented |
 | Reproducible non-root container image and Helm chart source | Implemented; packaging gate enforced by CI |
 | Tagged-release image, Helm OCI chart, and GitHub Release automation | Implemented; runs only for matching protected `v*` tags |
-| Published crates | Base crates and CLI are published as `0.1.0-alpha.1`; Oracle/MongoDB await the next reviewed publication |
+| Published crates | All workspace crates and the CLI are published as `0.1.0-alpha.2`, including Oracle, MongoDB, and the durable Debezium bridge |
 
 Alpha means the source and delivery contracts are functional, but configuration and persisted state are not stable yet.
 
@@ -723,7 +723,7 @@ Workspace 已包含可运行的 alpha 服务。
 | CLI 和 HTTP 管理 | 已实现 |
 | 可复现的非 root 容器镜像与 Helm Chart 源码 | 已实现；CI 强制运行 packaging gate |
 | Tagged release 镜像、Helm OCI Chart 和 GitHub Release 自动化 | 已实现；仅由匹配的受保护 `v*` tag 触发 |
-| 已发布 crates | 基础 crate 与 CLI 已发布为 `0.1.0-alpha.1`；Oracle/MongoDB 等待下一次审查发布 |
+| 已发布 crates | 全部 workspace crate 与 CLI 已发布为 `0.1.0-alpha.2`，包含 Oracle、MongoDB 和持久 Debezium bridge |
 
 Alpha 表示源端和投递契约可以运行，但配置和持久化状态尚未稳定。
 

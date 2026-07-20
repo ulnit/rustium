@@ -29,7 +29,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 FROM debian:bookworm-slim AS runtime
 
-ARG VERSION=0.1.0-alpha.1
+ARG VERSION=0.1.0-alpha.2
 ARG REVISION=unknown
 ARG CREATED=unknown
 

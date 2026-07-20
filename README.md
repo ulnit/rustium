@@ -60,7 +60,7 @@ The repository contains a runnable alpha implementation.
 | CLI, health, status, stop, and Prometheus endpoints | Implemented |
 | Reproducible non-root container image and Helm chart source | Implemented; packaging gate runs in CI |
 | Published container image and Helm chart | Not published yet |
-| crates.io base crates and CLI | Published as `0.1.0-alpha.1`; Oracle/MongoDB crates await the next reviewed publication |
+| crates.io workspace crates and CLI | Published as `0.1.0-alpha.2`, including Oracle, MongoDB, and the durable Debezium bridge |
 
 This is not a production-stable release. Persisted state and public configuration may still change before `1.0`.
 
@@ -875,7 +875,7 @@ Rustium 是一个独立运行、基于数据库日志的变更数据捕获服务
 | CLI、健康、状态、停止和 Prometheus 端点 | 已实现 |
 | 可复现的非 root 容器镜像与 Helm Chart 源码 | 已实现；CI 强制运行 packaging gate |
 | 已发布容器镜像与 Helm Chart | 尚未发布 |
-| crates.io 基础 crate 与 CLI | 已发布为 `0.1.0-alpha.1`；Oracle/MongoDB crate 等待下一次审查发布 |
+| crates.io workspace crate 与 CLI | 已发布为 `0.1.0-alpha.2`，包含 Oracle、MongoDB 和持久 Debezium bridge |
 
 当前版本尚未达到生产稳定。`1.0` 之前，持久化状态和公共配置仍可能调整。
 
