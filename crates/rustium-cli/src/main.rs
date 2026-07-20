@@ -11,7 +11,9 @@ use rustium_format_json::{
     DebeziumJsonEncoder, DebeziumJsonSchemaEncoder, JsonEncoderConfig, RustiumJsonEncoder,
 };
 use rustium_format_protobuf::{DebeziumProtobufEncoder, ProtobufEncoderConfig};
+use rustium_mongodb::MongoDbSource;
 use rustium_mysql::MySqlSource;
+use rustium_oracle::OracleSource;
 use rustium_postgresql::PostgresSource;
 use rustium_signal_kafka::KafkaSignalChannel;
 use rustium_sink_kafka::{KafkaSink, SchemaRegistrySettings};
@@ -291,6 +293,22 @@ fn build_source(config: &Config) -> Result<Box<dyn SourceConnector>> {
             )
             .with_retry_policy(config.runtime.retry_policy()),
         )),
+        SourceConfig::Oracle(source) => Ok(Box::new(
+            OracleSource::new(
+                &config.metadata.name,
+                source.clone(),
+                config.snapshot.clone(),
+            )
+            .with_retry_policy(config.runtime.retry_policy()),
+        )),
+        SourceConfig::Mongodb(source) => Ok(Box::new(
+            MongoDbSource::new(
+                &config.metadata.name,
+                source.clone(),
+                config.snapshot.clone(),
+            )
+            .with_retry_policy(config.runtime.retry_policy()),
+        )),
     }
 }
 
@@ -305,6 +323,14 @@ fn build_encoder(config: &Config) -> Result<Arc<dyn EventEncoder>> {
             source.heartbeat_topic_name.clone(),
         ),
         SourceConfig::Sqlserver(source) => (
+            source.heartbeat_topics_prefix.clone(),
+            source.heartbeat_topic_name.clone(),
+        ),
+        SourceConfig::Oracle(source) => (
+            source.heartbeat_topics_prefix.clone(),
+            source.heartbeat_topic_name.clone(),
+        ),
+        SourceConfig::Mongodb(source) => (
             source.heartbeat_topics_prefix.clone(),
             source.heartbeat_topic_name.clone(),
         ),

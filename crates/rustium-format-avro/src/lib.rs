@@ -485,6 +485,20 @@ fn source_schema(event: &ChangeEvent, namespace: &str) -> serde_json::Value {
             serde_json::json!({"name": "commit_lsn", "type": "string"}),
             serde_json::json!({"name": "event_serial_no", "type": "long"}),
         ]),
+        SourcePosition::Oracle(_) => fields.extend([
+            serde_json::json!({"name": "scn", "type": "long"}),
+            serde_json::json!({"name": "commit_scn", "type": ["null", "long"], "default": null}),
+            serde_json::json!({"name": "txId", "type": ["null", "string"], "default": null}),
+            serde_json::json!({"name": "rs_id", "type": ["null", "string"], "default": null}),
+            serde_json::json!({"name": "ssn", "type": ["null", "long"], "default": null}),
+            serde_json::json!({"name": "event_serial_no", "type": "long"}),
+        ]),
+        SourcePosition::MongoDb(_) => fields.extend([
+            serde_json::json!({"name": "resume_token", "type": ["null", "string"], "default": null}),
+            serde_json::json!({"name": "cluster_time_seconds", "type": ["null", "long"], "default": null}),
+            serde_json::json!({"name": "cluster_time_increment", "type": ["null", "long"], "default": null}),
+            serde_json::json!({"name": "event_serial_no", "type": "long"}),
+        ]),
     }
     serde_json::json!({
         "type": "record",
@@ -833,6 +847,65 @@ fn source_value(event: &ChangeEvent) -> Result<Value> {
                 (
                     "commit_lsn".into(),
                     Value::String(position.commit_lsn.clone()),
+                ),
+                (
+                    "event_serial_no".into(),
+                    Value::Long(u64_to_i64(position.event_serial, "event serial")?),
+                ),
+            ]);
+        }
+        SourcePosition::Oracle(position) => {
+            let commit_scn = position
+                .commit_scn
+                .map(|value| u64_to_i64(value, "commit_scn"))
+                .transpose()?
+                .map_or(Value::Null, Value::Long);
+            let ssn = position
+                .ssn
+                .map(|value| u64_to_i64(value, "ssn"))
+                .transpose()?
+                .map_or(Value::Null, Value::Long);
+            values.extend([
+                ("scn".into(), Value::Long(u64_to_i64(position.scn, "scn")?)),
+                ("commit_scn".into(), commit_scn),
+                (
+                    "txId".into(),
+                    position
+                        .transaction_id
+                        .clone()
+                        .map_or(Value::Null, Value::String),
+                ),
+                (
+                    "rs_id".into(),
+                    position.rs_id.clone().map_or(Value::Null, Value::String),
+                ),
+                ("ssn".into(), ssn),
+                (
+                    "event_serial_no".into(),
+                    Value::Long(u64_to_i64(position.event_serial, "event serial")?),
+                ),
+            ]);
+        }
+        SourcePosition::MongoDb(position) => {
+            values.extend([
+                (
+                    "resume_token".into(),
+                    position
+                        .resume_token
+                        .clone()
+                        .map_or(Value::Null, Value::String),
+                ),
+                (
+                    "cluster_time_seconds".into(),
+                    position
+                        .cluster_time_seconds
+                        .map_or(Value::Null, |value| Value::Long(i64::from(value))),
+                ),
+                (
+                    "cluster_time_increment".into(),
+                    position
+                        .cluster_time_increment
+                        .map_or(Value::Null, |value| Value::Long(i64::from(value))),
                 ),
                 (
                     "event_serial_no".into(),

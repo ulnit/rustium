@@ -1,0 +1,29 @@
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: oracle-cdc
+source:
+  type: oracle
+  hostname: ${ORACLE_HOST}
+  port: 1521
+  username: ${ORACLE_USER}
+  password: ${ORACLE_PASSWORD}
+  database: FREEPDB1
+  pdb_name: FREEPDB1
+  schemas: [APP]
+  tables:
+    include: [APP\.ORDERS]
+  log_mining_strategy: online_catalog
+  batch_size: 256
+  poll_interval: 250ms
+snapshot:
+  mode: initial
+format:
+  kind: debezium_json
+sink:
+  type: stdout
+  topic_prefix: app
+state:
+  path: /var/lib/rustium/oracle.db
+server:
+  bind: 127.0.0.1:8080

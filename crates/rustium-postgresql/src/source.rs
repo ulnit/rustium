@@ -656,7 +656,10 @@ impl SourceConnector for PostgresSource {
         } else if let Some(checkpoint) = checkpoint.as_ref() {
             let position = match &checkpoint.source_position {
                 SourcePosition::Postgres(position) => position,
-                SourcePosition::MySql(_) | SourcePosition::SqlServer(_) => {
+                SourcePosition::MySql(_)
+                | SourcePosition::SqlServer(_)
+                | SourcePosition::Oracle(_)
+                | SourcePosition::MongoDb(_) => {
                     return Err(Error::State(
                         "PostgreSQL connector cannot resume from a non-PostgreSQL checkpoint"
                             .into(),
@@ -743,7 +746,10 @@ impl SourceConnector for PostgresSource {
             (Some(resolution), _) => Some(resolution.start_lsn),
             (None, Some(checkpoint)) => match &checkpoint.source_position {
                 SourcePosition::Postgres(position) => Some(position.lsn),
-                SourcePosition::MySql(_) | SourcePosition::SqlServer(_) => {
+                SourcePosition::MySql(_)
+                | SourcePosition::SqlServer(_)
+                | SourcePosition::Oracle(_)
+                | SourcePosition::MongoDb(_) => {
                     return Err(Error::State(
                         "PostgreSQL connector cannot resume from a non-PostgreSQL checkpoint"
                             .into(),

@@ -10,9 +10,15 @@ pub(super) fn parse(raw: &str) -> Result<Config> {
     if connector_class.contains("SqlServerConnector") {
         return parse_sqlserver(&properties);
     }
+    if connector_class.contains("OracleConnector") {
+        return parse_oracle(&properties);
+    }
+    if connector_class.contains("MongoDbConnector") {
+        return parse_mongodb(&properties);
+    }
     if !connector_class.contains("PostgresConnector") {
         return Err(Error::Configuration(format!(
-            "unsupported Debezium connector.class {connector_class:?}; PostgreSQL, MySQL, and SQL Server are prioritized"
+            "unsupported Debezium connector.class {connector_class:?}; supported sources are PostgreSQL, MySQL, SQL Server, Oracle, and MongoDB"
         )));
     }
     if let Some(plugin) = properties.get("plugin.name")
@@ -695,6 +701,163 @@ fn parse_sqlserver(properties: &BTreeMap<String, String>) -> Result<Config> {
             include_collections: csv_property(properties.get("snapshot.include.collection.list")),
         },
         warnings,
+    )
+}
+
+fn parse_oracle(properties: &BTreeMap<String, String>) -> Result<Config> {
+    let schema_include = csv_property(properties.get("schema.include.list"));
+    let schema_exclude = csv_property(properties.get("schema.exclude.list"));
+    let table_include = csv_property(properties.get("table.include.list"));
+    let table_exclude = csv_property(properties.get("table.exclude.list"));
+    let include = if table_include.is_empty() {
+        schema_include
+            .iter()
+            .map(|schema| format!("(?:{schema})\\..+"))
+            .collect()
+    } else {
+        table_include
+    };
+    let mut exclude = table_exclude;
+    exclude.extend(
+        schema_exclude
+            .iter()
+            .map(|schema| format!("(?:{schema})\\..+")),
+    );
+
+    let strategy = properties
+        .get("log.mining.strategy")
+        .map_or("online_catalog", String::as_str);
+    if strategy != "online_catalog" {
+        return Err(Error::Configuration(format!(
+            "Oracle log.mining.strategy={strategy:?} is not implemented; use online_catalog"
+        )));
+    }
+
+    assemble_config(
+        properties,
+        SourceConfig::Oracle(OracleSourceConfig {
+            hostname: properties
+                .get("database.hostname")
+                .cloned()
+                .unwrap_or_else(default_hostname),
+            port: u16_value(properties, "database.port", default_oracle_port())?,
+            username: required(properties, "database.user")?.to_string(),
+            password: required(properties, "database.password")?.to_string(),
+            database: required(properties, "database.dbname")?.to_string(),
+            pdb_name: properties.get("pdb.name").cloned(),
+            schemas: schema_include,
+            tables: TableSelection { include, exclude },
+            connect_timeout: duration_ms(
+                properties,
+                "connection.timeout.ms",
+                default_connect_timeout(),
+            )?,
+            poll_interval: duration_ms(properties, "poll.interval.ms", default_poll_interval())?,
+            batch_size: usize_value(
+                properties,
+                "log.mining.batch.size.default",
+                default_streaming_fetch_size(),
+            )?,
+            log_mining_strategy: strategy.into(),
+            archive_log_only_mode: bool_value(properties, "archive.log.only.mode", false)?,
+            heartbeat_interval: duration_ms(properties, "heartbeat.interval.ms", Duration::ZERO)?,
+            heartbeat_action_query: properties
+                .get("heartbeat.action.query")
+                .filter(|query| !query.trim().is_empty())
+                .cloned(),
+            heartbeat_topics_prefix: properties
+                .get("topic.heartbeat.prefix")
+                .or_else(|| properties.get("heartbeat.topics.prefix"))
+                .cloned()
+                .unwrap_or_else(default_heartbeat_topics_prefix),
+            heartbeat_topic_name: properties.get("topic.heartbeat.name").cloned(),
+        }),
+        SnapshotConfig {
+            mode: snapshot_mode(
+                properties
+                    .get("snapshot.mode")
+                    .map_or("initial", String::as_str),
+            )?,
+            fetch_size: usize_value(
+                properties,
+                "snapshot.fetch.size",
+                default_snapshot_fetch_size(),
+            )?,
+            include_collections: csv_property(properties.get("snapshot.include.collection.list")),
+        },
+        Vec::new(),
+    )
+}
+
+fn parse_mongodb(properties: &BTreeMap<String, String>) -> Result<Config> {
+    let database_include = csv_property(properties.get("database.include.list"));
+    let database_exclude = csv_property(properties.get("database.exclude.list"));
+    if !database_include.is_empty() && !database_exclude.is_empty() {
+        return Err(Error::Configuration(
+            "database.include.list and database.exclude.list cannot both be configured for MongoDB"
+                .into(),
+        ));
+    }
+    if !database_exclude.is_empty() {
+        return Err(Error::Configuration(
+            "MongoDB database.exclude.list requires a cluster-wide watch and is not yet supported; use database.include.list"
+                .into(),
+        ));
+    }
+    let capture_mode = properties
+        .get("capture.mode")
+        .map_or("change_streams_update_full", String::as_str);
+    let (full_document, full_document_before_change) = match capture_mode {
+        "change_streams" => ("default", "off"),
+        "change_streams_update_full" => ("update_lookup", "off"),
+        "change_streams_with_pre_image" => ("update_lookup", "when_available"),
+        mode => {
+            return Err(Error::Configuration(format!(
+                "MongoDB capture.mode={mode:?} is unsupported"
+            )));
+        }
+    };
+
+    assemble_config(
+        properties,
+        SourceConfig::Mongodb(MongoDbSourceConfig {
+            connection_string: required(properties, "mongodb.connection.string")?.to_string(),
+            databases: database_include,
+            collections: TableSelection {
+                include: csv_property(properties.get("collection.include.list")),
+                exclude: csv_property(properties.get("collection.exclude.list")),
+            },
+            connect_timeout: duration_ms(
+                properties,
+                "connect.timeout.ms",
+                default_connect_timeout(),
+            )?,
+            poll_interval: duration_ms(properties, "poll.interval.ms", default_poll_interval())?,
+            batch_size: usize_value(properties, "max.batch.size", default_streaming_fetch_size())?,
+            full_document: full_document.into(),
+            full_document_before_change: full_document_before_change.into(),
+            heartbeat_interval: duration_ms(properties, "heartbeat.interval.ms", Duration::ZERO)?,
+            heartbeat_topics_prefix: properties
+                .get("topic.heartbeat.prefix")
+                .or_else(|| properties.get("heartbeat.topics.prefix"))
+                .cloned()
+                .unwrap_or_else(default_heartbeat_topics_prefix),
+            heartbeat_topic_name: properties.get("topic.heartbeat.name").cloned(),
+        }),
+        SnapshotConfig {
+            mode: snapshot_mode(
+                properties
+                    .get("snapshot.mode")
+                    .map_or("initial", String::as_str),
+            )?,
+            fetch_size: usize_value(
+                properties,
+                "snapshot.fetch.size",
+                default_snapshot_fetch_size(),
+            )?,
+            include_collections: csv_property(properties.get("snapshot.include.collection.list")),
+        },
+        Vec::new(),
     )
 }
 
@@ -1545,6 +1708,8 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "database.user",
         "database.password",
         "database.dbname",
+        "pdb.name",
+        "mongodb.connection.string",
         "database.sslmode",
         "database.sslrootcert",
         "database.sslcert",
@@ -1593,6 +1758,13 @@ fn unsupported_warnings(properties: &BTreeMap<String, String>) -> Vec<String> {
         "snapshot.include.collection.list",
         "table.include.list",
         "table.exclude.list",
+        "collection.include.list",
+        "collection.exclude.list",
+        "capture.mode",
+        "connection.timeout.ms",
+        "log.mining.strategy",
+        "log.mining.batch.size.default",
+        "archive.log.only.mode",
         "schema.include.list",
         "schema.exclude.list",
         "max.queue.size",
@@ -3500,5 +3672,72 @@ topic.prefix=app
                 .to_string()
                 .contains("selector")
         );
+    }
+
+    #[test]
+    fn parses_oracle_logminer_properties() {
+        let config = parse(
+            r#"
+name=oracle-cdc
+connector.class=io.debezium.connector.oracle.OracleConnector
+database.hostname=oracle
+database.port=1521
+database.user=rustium
+database.password=secret
+database.dbname=FREEPDB1
+pdb.name=FREEPDB1
+schema.include.list=APP
+table.include.list=APP\.ORDERS
+log.mining.strategy=online_catalog
+log.mining.batch.size.default=256
+topic.prefix=app
+"#,
+        )
+        .unwrap();
+        let source = config.source.as_oracle().unwrap();
+        assert_eq!(source.database, "FREEPDB1");
+        assert_eq!(source.pdb_name.as_deref(), Some("FREEPDB1"));
+        assert_eq!(source.batch_size, 256);
+        assert_eq!(source.tables.include, vec!["APP.ORDERS"]);
+    }
+
+    #[test]
+    fn parses_mongodb_change_stream_properties() {
+        let config = parse(
+            r#"
+name=mongo-cdc
+connector.class=io.debezium.connector.mongodb.MongoDbConnector
+mongodb.connection.string=mongodb://mongo:27017/?replicaSet=rs0
+database.include.list=app
+collection.include.list=app\.orders
+capture.mode=change_streams_with_pre_image
+max.batch.size=128
+topic.prefix=app
+"#,
+        )
+        .unwrap();
+        let source = config.source.as_mongodb().unwrap();
+        assert_eq!(source.databases, vec!["app"]);
+        assert_eq!(source.batch_size, 128);
+        assert_eq!(source.full_document, "update_lookup");
+        assert_eq!(source.full_document_before_change, "when_available");
+    }
+
+    #[test]
+    fn rejects_oracle_redo_log_catalog_until_supported() {
+        let error = parse(
+            r#"
+name=oracle-cdc
+connector.class=io.debezium.connector.oracle.OracleConnector
+database.hostname=oracle
+database.user=rustium
+database.password=secret
+database.dbname=FREEPDB1
+log.mining.strategy=redo_log_catalog
+topic.prefix=app
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("online_catalog"));
     }
 }

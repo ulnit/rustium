@@ -2318,7 +2318,10 @@ fn binlog_coordinates_from_position(position: &SourcePosition) -> Option<BinlogC
             gtid_set_is_complete: position.snapshot,
             source_server_id: position.server_id,
         }),
-        SourcePosition::Postgres(_) | SourcePosition::SqlServer(_) => None,
+        SourcePosition::Postgres(_)
+        | SourcePosition::SqlServer(_)
+        | SourcePosition::Oracle(_)
+        | SourcePosition::MongoDb(_) => None,
     }
 }
 

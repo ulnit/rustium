@@ -1,0 +1,25 @@
+[package]
+name = "rustium-mongodb"
+description = "MongoDB Change Streams source connector for Rustium"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+mongodb.workspace = true
+regex.workspace = true
+rustium-config.workspace = true
+rustium-core.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+api_version: rustium.io/v1alpha1
+kind: Connector
+metadata:
+  name: mongodb-cdc
+source:
+  type: mongodb
+  connection_string: ${MONGODB_URI}
+  databases: [cdc_demo]
+  collections:
+    include: [cdc_demo\.orders]
+  full_document: update_lookup
+  full_document_before_change: when_available
+  batch_size: 256
+  poll_interval: 250ms
+snapshot:
+  mode: initial
+format:
+  kind: debezium_json
+sink:
+  type: stdout
+  topic_prefix: cdc_demo
+state:
+  path: /var/lib/rustium/mongodb.db
+server:
+  bind: 127.0.0.1:8080

@@ -105,6 +105,8 @@ pub enum SourcePosition {
     Postgres(PostgresPosition),
     MySql(MySqlPosition),
     SqlServer(SqlServerPosition),
+    Oracle(OraclePosition),
+    MongoDb(MongoDbPosition),
 }
 
 impl SourcePosition {
@@ -114,6 +116,8 @@ impl SourcePosition {
             (Self::Postgres(left), Self::Postgres(right)) => left.sort_key() > right.sort_key(),
             (Self::MySql(left), Self::MySql(right)) => left.sort_key() > right.sort_key(),
             (Self::SqlServer(left), Self::SqlServer(right)) => left.sort_key() > right.sort_key(),
+            (Self::Oracle(left), Self::Oracle(right)) => left.sort_key() > right.sort_key(),
+            (Self::MongoDb(left), Self::MongoDb(right)) => left.sort_key() > right.sort_key(),
             _ => false,
         }
     }
@@ -177,6 +181,52 @@ impl SqlServerPosition {
             &self.database,
             &self.commit_lsn,
             &self.change_lsn,
+            u8::from(!self.snapshot),
+            self.event_serial,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OraclePosition {
+    pub scn: u64,
+    pub commit_scn: Option<u64>,
+    pub transaction_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rs_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssn: Option<u64>,
+    pub event_serial: u64,
+    pub snapshot: bool,
+}
+
+impl OraclePosition {
+    fn sort_key(&self) -> (u64, u8, u64) {
+        (
+            self.commit_scn.unwrap_or(self.scn),
+            u8::from(!self.snapshot),
+            self.event_serial,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MongoDbPosition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_time_seconds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_time_increment: Option<u32>,
+    pub event_serial: u64,
+    pub snapshot: bool,
+}
+
+impl MongoDbPosition {
+    fn sort_key(&self) -> (u32, u32, u8, u64) {
+        (
+            self.cluster_time_seconds.unwrap_or_default(),
+            self.cluster_time_increment.unwrap_or_default(),
             u8::from(!self.snapshot),
             self.event_serial,
         )

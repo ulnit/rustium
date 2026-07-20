@@ -148,6 +148,8 @@ pub enum SourceConfig {
     Postgresql(Box<PostgresSourceConfig>),
     Mysql(MySqlSourceConfig),
     Sqlserver(SqlServerSourceConfig),
+    Oracle(OracleSourceConfig),
+    Mongodb(MongoDbSourceConfig),
 }
 
 impl SourceConfig {
@@ -156,6 +158,8 @@ impl SourceConfig {
             Self::Postgresql(config) => config.validate(),
             Self::Mysql(config) => config.validate(),
             Self::Sqlserver(config) => config.validate(),
+            Self::Oracle(config) => config.validate(),
+            Self::Mongodb(config) => config.validate(),
         }
     }
 
@@ -179,6 +183,22 @@ impl SourceConfig {
     pub fn as_sqlserver(&self) -> Option<&SqlServerSourceConfig> {
         match self {
             Self::Sqlserver(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_oracle(&self) -> Option<&OracleSourceConfig> {
+        match self {
+            Self::Oracle(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_mongodb(&self) -> Option<&MongoDbSourceConfig> {
+        match self {
+            Self::Mongodb(config) => Some(config),
             _ => None,
         }
     }
@@ -485,6 +505,45 @@ impl SourceConfig {
                             )),
                         );
                 }
+                semantic
+            }
+            Self::Oracle(config) => {
+                let mut semantic = serde_json::json!({
+                    "type": "oracle",
+                    "hostname": config.hostname,
+                    "port": config.port,
+                    "database": config.database,
+                    "pdb_name": config.pdb_name,
+                    "schemas": config.schemas,
+                    "tables": config.tables,
+                    "log_mining_strategy": config.log_mining_strategy,
+                    "archive_log_only_mode": config.archive_log_only_mode,
+                });
+                add_heartbeat_semantics(
+                    &mut semantic,
+                    config.heartbeat_interval,
+                    config.heartbeat_action_query.as_deref(),
+                    &config.heartbeat_topics_prefix,
+                    config.heartbeat_topic_name.as_deref(),
+                );
+                semantic
+            }
+            Self::Mongodb(config) => {
+                let mut semantic = serde_json::json!({
+                    "type": "mongodb",
+                    "connection_string": config.connection_string,
+                    "databases": config.databases,
+                    "collections": config.collections,
+                    "full_document": config.full_document,
+                    "full_document_before_change": config.full_document_before_change,
+                });
+                add_heartbeat_semantics(
+                    &mut semantic,
+                    config.heartbeat_interval,
+                    None,
+                    &config.heartbeat_topics_prefix,
+                    config.heartbeat_topic_name.as_deref(),
+                );
                 semantic
             }
         }
@@ -1426,6 +1485,169 @@ impl SqlServerSourceConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OracleSourceConfig {
+    #[serde(default = "default_hostname")]
+    pub hostname: String,
+    #[serde(default = "default_oracle_port")]
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    pub database: String,
+    #[serde(default)]
+    pub pdb_name: Option<String>,
+    #[serde(default)]
+    pub schemas: Vec<String>,
+    #[serde(default)]
+    pub tables: TableSelection,
+    #[serde(default = "default_connect_timeout")]
+    #[serde(with = "humantime_serde")]
+    pub connect_timeout: Duration,
+    #[serde(default = "default_poll_interval")]
+    #[serde(with = "humantime_serde")]
+    pub poll_interval: Duration,
+    #[serde(default = "default_streaming_fetch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_oracle_log_mining_strategy")]
+    pub log_mining_strategy: String,
+    #[serde(default)]
+    pub archive_log_only_mode: bool,
+    #[serde(default)]
+    #[serde(with = "humantime_serde")]
+    pub heartbeat_interval: Duration,
+    #[serde(default)]
+    pub heartbeat_action_query: Option<String>,
+    #[serde(default = "default_heartbeat_topics_prefix")]
+    pub heartbeat_topics_prefix: String,
+    #[serde(default)]
+    pub heartbeat_topic_name: Option<String>,
+}
+
+impl OracleSourceConfig {
+    fn validate(&self) -> Result<()> {
+        for (value, field) in [
+            (&self.username, "source.username"),
+            (&self.database, "source.database"),
+        ] {
+            if value.trim().is_empty() {
+                return Err(Error::Configuration(format!("{field} must not be empty")));
+            }
+        }
+        if self
+            .pdb_name
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(Error::Configuration(
+                "source.pdb_name must not be blank when configured".into(),
+            ));
+        }
+        if self.connect_timeout.is_zero() || self.poll_interval.is_zero() {
+            return Err(Error::Configuration(
+                "Oracle connect_timeout and poll_interval must be greater than zero".into(),
+            ));
+        }
+        if self.batch_size == 0 {
+            return Err(Error::Configuration(
+                "source.batch_size must be greater than zero".into(),
+            ));
+        }
+        if self.log_mining_strategy != "online_catalog" {
+            return Err(Error::Configuration(
+                "source.log_mining_strategy currently supports only online_catalog".into(),
+            ));
+        }
+        if self.schemas.iter().any(|schema| schema.trim().is_empty()) {
+            return Err(Error::Configuration(
+                "source.schemas must not contain blank schema names".into(),
+            ));
+        }
+        validate_heartbeat(
+            &self.heartbeat_topics_prefix,
+            self.heartbeat_topic_name.as_deref(),
+            self.heartbeat_action_query.as_deref(),
+        )?;
+        validate_table_patterns(&self.tables)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MongoDbSourceConfig {
+    pub connection_string: String,
+    #[serde(default)]
+    pub databases: Vec<String>,
+    #[serde(default)]
+    pub collections: TableSelection,
+    #[serde(default = "default_connect_timeout")]
+    #[serde(with = "humantime_serde")]
+    pub connect_timeout: Duration,
+    #[serde(default = "default_poll_interval")]
+    #[serde(with = "humantime_serde")]
+    pub poll_interval: Duration,
+    #[serde(default = "default_streaming_fetch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_mongodb_full_document")]
+    pub full_document: String,
+    #[serde(default = "default_mongodb_full_document_before_change")]
+    pub full_document_before_change: String,
+    #[serde(default)]
+    #[serde(with = "humantime_serde")]
+    pub heartbeat_interval: Duration,
+    #[serde(default = "default_heartbeat_topics_prefix")]
+    pub heartbeat_topics_prefix: String,
+    #[serde(default)]
+    pub heartbeat_topic_name: Option<String>,
+}
+
+impl MongoDbSourceConfig {
+    fn validate(&self) -> Result<()> {
+        let uri = Url::parse(&self.connection_string).map_err(|error| {
+            Error::Configuration(format!("invalid MongoDB connection string: {error}"))
+        })?;
+        if !matches!(uri.scheme(), "mongodb" | "mongodb+srv") {
+            return Err(Error::Configuration(
+                "source.connection_string must use mongodb:// or mongodb+srv://".into(),
+            ));
+        }
+        if self.connect_timeout.is_zero() || self.poll_interval.is_zero() {
+            return Err(Error::Configuration(
+                "MongoDB connect_timeout and poll_interval must be greater than zero".into(),
+            ));
+        }
+        if self.batch_size == 0 {
+            return Err(Error::Configuration(
+                "source.batch_size must be greater than zero".into(),
+            ));
+        }
+        if self
+            .databases
+            .iter()
+            .any(|database| database.trim().is_empty())
+        {
+            return Err(Error::Configuration(
+                "source.databases must not contain blank database names".into(),
+            ));
+        }
+        if !matches!(self.full_document.as_str(), "default" | "update_lookup") {
+            return Err(Error::Configuration(
+                "source.full_document must be default or update_lookup".into(),
+            ));
+        }
+        if !matches!(
+            self.full_document_before_change.as_str(),
+            "off" | "when_available" | "required"
+        ) {
+            return Err(Error::Configuration(
+                "source.full_document_before_change must be off, when_available, or required"
+                    .into(),
+            ));
+        }
+        validate_table_patterns(&self.collections)
+    }
+}
+
 fn validate_sqlserver_signal_collection(collection: &str, database: &str) -> Result<()> {
     let parts = collection.split('.').collect::<Vec<_>>();
     let (schema, table) = match parts.as_slice() {
@@ -2288,6 +2510,9 @@ const fn default_mysql_port() -> u16 {
 const fn default_sqlserver_port() -> u16 {
     1433
 }
+const fn default_oracle_port() -> u16 {
+    1521
+}
 const fn default_mysql_server_id() -> u32 {
     5_401
 }
@@ -2311,6 +2536,15 @@ const fn default_streaming_fetch_size() -> usize {
 }
 fn default_sqlserver_snapshot_isolation() -> String {
     "repeatable_read".into()
+}
+fn default_oracle_log_mining_strategy() -> String {
+    "online_catalog".into()
+}
+fn default_mongodb_full_document() -> String {
+    "update_lookup".into()
+}
+fn default_mongodb_full_document_before_change() -> String {
+    "when_available".into()
 }
 fn default_slot_name() -> String {
     "rustium".into()

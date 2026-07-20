@@ -29,6 +29,8 @@ for package in \
   rustium-format-json \
   rustium-format-protobuf \
   rustium-mysql \
+  rustium-mongodb \
+  rustium-oracle \
   rustium-postgresql \
   rustium-server \
   rustium-signal-kafka \

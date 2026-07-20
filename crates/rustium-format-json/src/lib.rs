@@ -320,6 +320,26 @@ fn debezium_source(event: &ChangeEvent, source_ts: Option<i64>) -> Result<serde_
             source.insert("commit_lsn".into(), position.commit_lsn.clone().into());
             source.insert("event_serial_no".into(), position.event_serial.into());
         }
+        SourcePosition::Oracle(position) => {
+            source.insert("scn".into(), position.scn.into());
+            source.insert("commit_scn".into(), position.commit_scn.into());
+            source.insert("txId".into(), position.transaction_id.clone().into());
+            source.insert("rs_id".into(), position.rs_id.clone().into());
+            source.insert("ssn".into(), position.ssn.into());
+            source.insert("event_serial_no".into(), position.event_serial.into());
+        }
+        SourcePosition::MongoDb(position) => {
+            source.insert("resume_token".into(), position.resume_token.clone().into());
+            source.insert(
+                "cluster_time_seconds".into(),
+                position.cluster_time_seconds.map(u64::from).into(),
+            );
+            source.insert(
+                "cluster_time_increment".into(),
+                position.cluster_time_increment.map(u64::from).into(),
+            );
+            source.insert("event_serial_no".into(), position.event_serial.into());
+        }
     }
     Ok(source.into())
 }
@@ -389,6 +409,32 @@ fn json_source_schema(event: &ChangeEvent) -> serde_json::Value {
         SourcePosition::SqlServer(_) => vec![
             ("change_lsn", serde_json::json!({"type": "string"})),
             ("commit_lsn", serde_json::json!({"type": "string"})),
+            ("event_serial_no", serde_json::json!({"type": "integer"})),
+        ],
+        SourcePosition::Oracle(_) => vec![
+            ("scn", serde_json::json!({"type": "integer"})),
+            (
+                "commit_scn",
+                serde_json::json!({"type": ["integer", "null"]}),
+            ),
+            ("txId", serde_json::json!({"type": ["string", "null"]})),
+            ("rs_id", serde_json::json!({"type": ["string", "null"]})),
+            ("ssn", serde_json::json!({"type": ["integer", "null"]})),
+            ("event_serial_no", serde_json::json!({"type": "integer"})),
+        ],
+        SourcePosition::MongoDb(_) => vec![
+            (
+                "resume_token",
+                serde_json::json!({"type": ["string", "null"]}),
+            ),
+            (
+                "cluster_time_seconds",
+                serde_json::json!({"type": ["integer", "null"]}),
+            ),
+            (
+                "cluster_time_increment",
+                serde_json::json!({"type": ["integer", "null"]}),
+            ),
             ("event_serial_no", serde_json::json!({"type": "integer"})),
         ],
     };

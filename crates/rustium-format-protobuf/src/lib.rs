@@ -579,6 +579,20 @@ fn push_source_schema(output: &mut String, event: &ChangeEvent, indent: usize) {
             "string commit_lsn = 21;",
             "uint64 event_serial_no = 22;",
         ],
+        SourcePosition::Oracle(_) => &[
+            "uint64 scn = 20;",
+            "optional uint64 commit_scn = 21;",
+            "optional string txId = 22;",
+            "optional string rs_id = 23;",
+            "optional uint64 ssn = 24;",
+            "uint64 event_serial_no = 25;",
+        ],
+        SourcePosition::MongoDb(_) => &[
+            "optional string resume_token = 20;",
+            "optional uint64 cluster_time_seconds = 21;",
+            "optional uint32 cluster_time_increment = 22;",
+            "uint64 event_serial_no = 23;",
+        ],
     };
     for field in connector_fields {
         push_line(output, indent + 1, field);
@@ -1152,6 +1166,58 @@ fn build_source_message(
                 "commit_lsn",
                 ProtoValue::String(position.commit_lsn.clone()),
             )?;
+            set_field(
+                &mut source,
+                "event_serial_no",
+                ProtoValue::U64(position.event_serial),
+            )?;
+        }
+        SourcePosition::Oracle(position) => {
+            set_field(&mut source, "scn", ProtoValue::U64(position.scn))?;
+            if let Some(commit_scn) = position.commit_scn {
+                set_field(&mut source, "commit_scn", ProtoValue::U64(commit_scn))?;
+            }
+            if let Some(transaction_id) = &position.transaction_id {
+                set_field(
+                    &mut source,
+                    "txId",
+                    ProtoValue::String(transaction_id.clone()),
+                )?;
+            }
+            if let Some(rs_id) = &position.rs_id {
+                set_field(&mut source, "rs_id", ProtoValue::String(rs_id.clone()))?;
+            }
+            if let Some(ssn) = position.ssn {
+                set_field(&mut source, "ssn", ProtoValue::U64(ssn))?;
+            }
+            set_field(
+                &mut source,
+                "event_serial_no",
+                ProtoValue::U64(position.event_serial),
+            )?;
+        }
+        SourcePosition::MongoDb(position) => {
+            if let Some(token) = &position.resume_token {
+                set_field(
+                    &mut source,
+                    "resume_token",
+                    ProtoValue::String(token.clone()),
+                )?;
+            }
+            if let Some(seconds) = position.cluster_time_seconds {
+                set_field(
+                    &mut source,
+                    "cluster_time_seconds",
+                    ProtoValue::U64(u64::from(seconds)),
+                )?;
+            }
+            if let Some(increment) = position.cluster_time_increment {
+                set_field(
+                    &mut source,
+                    "cluster_time_increment",
+                    ProtoValue::U32(increment),
+                )?;
+            }
             set_field(
                 &mut source,
                 "event_serial_no",

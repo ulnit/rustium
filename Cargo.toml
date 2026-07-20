@@ -9,6 +9,8 @@ members = [
     "crates/rustium-format-json",
     "crates/rustium-format-protobuf",
     "crates/rustium-mysql",
+    "crates/rustium-mongodb",
+    "crates/rustium-oracle",
     "crates/rustium-postgresql",
     "crates/rustium-server",
     "crates/rustium-signal-kafka",
@@ -42,9 +44,11 @@ indexmap = { version = "2.10.0", features = ["serde"] }
 jks = { version = "0.3.3", default-features = false, features = ["rand"] }
 md-5 = "0.10.6"
 md2 = "0.10.2"
+mongodb = "3.8.0"
 mysql_async = { version = "0.37.0", default-features = false, features = ["binlog", "chrono", "default-rustls"] }
 mockito = "1.7.0"
 p12-keystore = "0.3.1"
+oracle-rs = "0.1.7"
 pg_walstream = "0.8.0"
 prometheus = "0.14.0"
 prost = "0.14.4"
@@ -60,6 +64,8 @@ rustium-format-avro = { version = "0.1.0-alpha.1", path = "crates/rustium-format
 rustium-format-json = { version = "0.1.0-alpha.1", path = "crates/rustium-format-json" }
 rustium-format-protobuf = { version = "0.1.0-alpha.1", path = "crates/rustium-format-protobuf" }
 rustium-mysql = { version = "0.1.0-alpha.1", path = "crates/rustium-mysql" }
+rustium-mongodb = { version = "0.1.0-alpha.1", path = "crates/rustium-mongodb" }
+rustium-oracle = { version = "0.1.0-alpha.1", path = "crates/rustium-oracle" }
 rustium-postgresql = { version = "0.1.0-alpha.1", path = "crates/rustium-postgresql" }
 rustium-server = { version = "0.1.0-alpha.1", path = "crates/rustium-server" }
 rustium-signal-kafka = { version = "0.1.0-alpha.1", path = "crates/rustium-signal-kafka" }
